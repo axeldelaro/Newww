@@ -19,8 +19,8 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Repères normalisés (0..1) détectés par MediaPipe Face Landmarker (478 points 3D)
- * utilisés pour piloter la déformation temps réel 60 FPS d'une photo importée.
+ * Repères 3D normalisés (0..1) + couleurs échantillonnées directement dans la photo
+ * (paupières droite/gauche, teinte des lèvres) pour une animation LivePortrait ultra-vivante.
  */
 data class FaceRigLandmarks(
     val detectedByAi: Boolean,
@@ -38,7 +38,10 @@ data class FaceRigLandmarks(
     val chinBottom: PointF,
     val leftCheek: PointF,
     val rightCheek: PointF,
-    val faceBounds: RectF
+    val faceBounds: RectF,
+    val leftEyelidSkinColor: Int = Color.rgb(225, 185, 165),
+    val rightEyelidSkinColor: Int = Color.rgb(225, 185, 165),
+    val lipShadeColor: Int = Color.rgb(170, 75, 92)
 ) {
     companion object {
         fun fallbackPortrait(): FaceRigLandmarks = FaceRigLandmarks(
@@ -68,13 +71,6 @@ data class AnalyzedPhotoAvatar(
     val rig: FaceRigLandmarks
 )
 
-/**
- * Moteur IA Vision 100 % hors-ligne :
- * 1. Normalise & centre n'importe quelle photo fournie par l'utilisateur
- * 2. Extrait les 478 repères faciaux via MediaPipe Face Landmarker (`face_landmarker.task`)
- * 3. Segmente la silhouette via MediaPipe Selfie Segmenter (`selfie_segmenter.tflite`)
- *    pour permettre le changement de décor en temps réel derrière la vraie photo !
- */
 class PhotoFaceRigAnalyzer(private val context: Context) {
 
     private var faceLandmarker: FaceLandmarker? = null
@@ -83,23 +79,19 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
     private fun ensureModels() {
         if (faceLandmarker == null) {
             runCatching {
-                val base = BaseOptions.builder()
-                    .setModelAssetPath("vision/face_landmarker.task")
-                    .build()
+                val base = BaseOptions.builder().setModelAssetPath("vision/face_landmarker.task").build()
                 val options = FaceLandmarker.FaceLandmarkerOptions.builder()
                     .setBaseOptions(base)
                     .setRunningMode(RunningMode.IMAGE)
                     .setNumFaces(1)
-                    .setMinFaceDetectionConfidence(0.3f)
+                    .setMinFaceDetectionConfidence(0.25f)
                     .build()
                 faceLandmarker = FaceLandmarker.createFromOptions(context, options)
             }
         }
         if (imageSegmenter == null) {
             runCatching {
-                val base = BaseOptions.builder()
-                    .setModelAssetPath("vision/selfie_segmenter.tflite")
-                    .build()
+                val base = BaseOptions.builder().setModelAssetPath("vision/selfie_segmenter.tflite").build()
                 val options = ImageSegmenter.ImageSegmenterOptions.builder()
                     .setBaseOptions(base)
                     .setRunningMode(RunningMode.IMAGE)
@@ -115,7 +107,7 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
         val outFile = File(dir, "avatar_${characterId}_${System.currentTimeMillis()}.jpg")
         runCatching {
             val raw = decodeOrientedBitmap(uri) ?: return@withContext null
-            val portrait = centerCropPortrait(raw, 768, 960)
+            val portrait = centerCropPortrait(raw, 768, 1024)
             if (portrait !== raw) raw.recycle()
             FileOutputStream(outFile).use { fos ->
                 portrait.compress(Bitmap.CompressFormat.JPEG, 92, fos)
@@ -134,26 +126,21 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
         ensureModels()
         val mpImage = BitmapImageBuilder(bitmap).build()
 
-        // 1. Détection IA des 478 repères du visage
         val rig = runCatching {
             val res = faceLandmarker?.detect(mpImage)
             val pts = res?.faceLandmarks()?.firstOrNull()
             if (pts != null && pts.size >= 468) {
                 fun pt(i: Int) = PointF(pts[i].x().coerceIn(0.02f, 0.98f), pts[i].y().coerceIn(0.02f, 0.98f))
                 fun avg(vararg idx: Int): PointF {
-                    var sx = 0f
-                    var sy = 0f
-                    for (k in idx) {
-                        sx += pts[k].x()
-                        sy += pts[k].y()
-                    }
+                    var sx = 0f; var sy = 0f
+                    for (k in idx) { sx += pts[k].x(); sy += pts[k].y() }
                     return PointF(sx / idx.size, sy / idx.size)
                 }
 
-                // Indices standards MediaPipe 478 Face Mesh
                 val leftEye = avg(33, 133, 159, 145)
                 val rightEye = avg(362, 263, 386, 374)
                 val eyeSpan = max(abs(pts[133].x() - pts[33].x()), abs(pts[263].x() - pts[362].x()))
+                val eyeR = (eyeSpan * 0.62f).coerceIn(0.025f, 0.11f)
                 val leftBrow = avg(70, 105, 107)
                 val rightBrow = avg(300, 334, 336)
                 val nose = pt(1)
@@ -168,17 +155,20 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
 
                 var minX = 1f; var maxX = 0f; var minY = 1f; var maxY = 0f
                 for (lm in pts) {
-                    minX = min(minX, lm.x())
-                    maxX = max(maxX, lm.x())
-                    minY = min(minY, lm.y())
-                    maxY = max(maxY, lm.y())
+                    minX = min(minX, lm.x()); maxX = max(maxX, lm.x())
+                    minY = min(minY, lm.y()); maxY = max(maxY, lm.y())
                 }
+
+                // Échantillonne la teinte exacte de peau des paupières supérieures dans la photo !
+                val lLidCol = sampleAverageColor(bitmap, leftEye.x, (leftEye.y - eyeR * 0.65f).coerceIn(0.02f, 0.98f))
+                val rLidCol = sampleAverageColor(bitmap, rightEye.x, (rightEye.y - eyeR * 0.65f).coerceIn(0.02f, 0.98f))
+                val lipCol = sampleAverageColor(bitmap, lowerLip.x, (lowerLip.y + 0.008f).coerceIn(0.02f, 0.98f))
 
                 FaceRigLandmarks(
                     detectedByAi = true,
                     leftEyeCenter = leftEye,
                     rightEyeCenter = rightEye,
-                    eyeRadius = (eyeSpan * 0.62f).coerceIn(0.025f, 0.11f),
+                    eyeRadius = eyeR,
                     leftBrowCenter = leftBrow,
                     rightBrowCenter = rightBrow,
                     noseTip = nose,
@@ -190,14 +180,20 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
                     chinBottom = chin,
                     leftCheek = leftCheek,
                     rightCheek = rightCheek,
-                    faceBounds = RectF(minX, minY, maxX, maxY)
+                    faceBounds = RectF(minX, minY, maxX, maxY),
+                    leftEyelidSkinColor = lLidCol,
+                    rightEyelidSkinColor = rLidCol,
+                    lipShadeColor = lipCol
                 )
             } else {
-                FaceRigLandmarks.fallbackPortrait()
+                val fb = FaceRigLandmarks.fallbackPortrait()
+                fb.copy(
+                    leftEyelidSkinColor = sampleAverageColor(bitmap, fb.leftEyeCenter.x, fb.leftEyeCenter.y - 0.035f),
+                    rightEyelidSkinColor = sampleAverageColor(bitmap, fb.rightEyeCenter.x, fb.rightEyeCenter.y - 0.035f)
+                )
             }
         }.getOrElse { FaceRigLandmarks.fallbackPortrait() }
 
-        // 2. Segmentation IA de la silhouette (pour changement de décor en direct)
         val cutout = runCatching {
             val segRes = imageSegmenter?.segment(mpImage)
             val masks = segRes?.confidenceMasks()
@@ -220,7 +216,7 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
                     for (x in 0 until w) {
                         val mx = ((x * mw) / w).coerceIn(0, mw - 1)
                         val conf = maskVals[mRow + mx]
-                        val alpha = ((conf - 0.25f) / 0.55f).coerceIn(0f, 1f)
+                        val alpha = ((conf - 0.25f) / 0.52f).coerceIn(0f, 1f)
                         val px = pixels[rowOff + x]
                         val a = (alpha * 255f).toInt().coerceIn(0, 255)
                         pixels[rowOff + x] = (px and 0x00FFFFFF) or (a shl 24)
@@ -240,6 +236,19 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
         runCatching { imageSegmenter?.close() }
         faceLandmarker = null
         imageSegmenter = null
+    }
+
+    private fun sampleAverageColor(bmp: Bitmap, nx: Float, ny: Float): Int {
+        val cx = (nx * bmp.width).toInt().coerceIn(4, bmp.width - 5)
+        val cy = (ny * bmp.height).toInt().coerceIn(4, bmp.height - 5)
+        var r = 0; var g = 0; var b = 0; var c = 0
+        for (dy in -3..3 step 2) {
+            for (dx in -3..3 step 2) {
+                val px = bmp.getPixel(cx + dx, cy + dy)
+                r += Color.red(px); g += Color.green(px); b += Color.blue(px); c++
+            }
+        }
+        return if (c > 0) Color.rgb(r / c, g / c, b / c) else Color.rgb(225, 185, 165)
     }
 
     private fun decodeOrientedBitmap(uri: Uri): Bitmap? {
@@ -280,7 +289,7 @@ class PhotoFaceRigAnalyzer(private val context: Context) {
             Rect(left, 0, left + newW, src.height)
         } else {
             val newH = (src.width / targetAspect).toInt()
-            val top = ((src.height - newH) * 0.25f).toInt().coerceAtLeast(0)
+            val top = ((src.height - newH) * 0.22f).toInt().coerceAtLeast(0)
             Rect(0, top, src.width, (top + newH).coerceAtMost(src.height))
         }
         val out = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)

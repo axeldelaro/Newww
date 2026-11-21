@@ -8,6 +8,7 @@ import com.newww.auracompanion.ai.AuraLlamaEngine
 import com.newww.auracompanion.ai.EngineInitState
 import com.newww.auracompanion.ai.OfflineVoicePipeline
 import com.newww.auracompanion.data.AuraRepository
+import com.newww.auracompanion.engine.AutoProfileLearner
 import com.newww.auracompanion.engine.CompanionBrainEngine
 import com.newww.auracompanion.model.*
 import com.newww.auracompanion.notifications.AuraReminderWorker
@@ -38,6 +39,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val isListening: StateFlow<Boolean> = voice.isListening
     val isSpeaking: StateFlow<Boolean> = voice.isSpeaking
     val lipSyncLevel: StateFlow<Float> = voice.lipSyncLevel
+    val lipSyncWide: StateFlow<Float> = voice.lipSyncWide
     val micLevel: StateFlow<Float> = voice.micLevel
 
     private val _isThinking = MutableStateFlow(false)
@@ -55,13 +57,21 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val _callActive = MutableStateFlow(false)
     val callActive: StateFlow<Boolean> = _callActive.asStateFlow()
 
+    private val _autoLearnNotice = MutableStateFlow<String?>(null)
+    val autoLearnNotice: StateFlow<String?> = _autoLearnNotice.asStateFlow()
+
     private var callJob: Job? = null
+    private var noticeJob: Job? = null
 
     init {
         AuraReminderWorker.schedule(application)
+        // Voix initialisée en premier (< 0,5 s grâce à espeak-ng-data.zip !), puis LLM 3B sans contention I/O !
         viewModelScope.launch {
-            launch { llm.ensureLoaded() }
-            launch { voice.initialize() }
+            voice.initialize()
+            voice.setAmbientSound(_state.value.ambientSound)
+            llm.ensureLoaded()
+        }
+        viewModelScope.launch {
             loadPhotoForActiveCharacter()
         }
     }
@@ -89,24 +99,19 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             name = cleanName,
             tagline = "Personnage personnalisé créé par toi",
             relationRole = relation.trim().ifEmpty { "Petite amie personnalisée" },
-            backstory = "$cleanName a été imaginée sur mesure pour t'accompagner chaque jour hors-ligne.",
-            interests = "Discussions complices, musique, cinéma, moments cosy",
+            backstory = "$cleanName a été créée sur mesure pour t'accompagner chaque jour hors-ligne.",
+            interests = "Discussions complices, musique, cinéma, voyages",
             studio = StudioAppearance(artStyle = artStyle),
             chatHistory = listOf(
                 AuraChatMessage(
                     id = "${id}_hi",
                     fromUser = false,
-                    text = "Bonjour ! Je suis $cleanName. Tu peux personnaliser mon caractère, ma voix, mon style ou même me donner une photo à animer !",
+                    text = "Bonjour ! Je suis $cleanName. Parle-moi de toi ou importe une photo pour m'animer en direct !",
                     emotion = AvatarEmotion.HAPPY
                 )
             )
         )
-        commit(
-            _state.value.copy(
-                activeCharacterId = id,
-                characters = _state.value.characters + newChar
-            )
-        )
+        commit(_state.value.copy(activeCharacterId = id, characters = _state.value.characters + newChar))
         _analyzedPhoto.value = null
     }
 
@@ -120,9 +125,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateActiveCharacter(transform: (CompanionCharacter) -> CompanionCharacter) {
         val activeId = _state.value.activeCharacter.id
-        val updatedList = _state.value.characters.map { ch ->
-            if (ch.id == activeId) transform(ch) else ch
-        }
+        val updatedList = _state.value.characters.map { ch -> if (ch.id == activeId) transform(ch) else ch }
         commit(_state.value.copy(characters = updatedList))
     }
 
@@ -132,14 +135,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val savedPath = photoAnalyzer.importAndSavePhoto(uri, charId)
             if (savedPath != null) {
-                updateActiveCharacter {
-                    it.copy(
-                        avatarMode = AvatarSourceMode.PHOTO_AI,
-                        photoPath = savedPath
-                    )
-                }
-                val analyzed = photoAnalyzer.analyzePhotoFile(savedPath)
-                _analyzedPhoto.value = analyzed
+                updateActiveCharacter { it.copy(avatarMode = AvatarSourceMode.PHOTO_AI, photoPath = savedPath) }
+                _analyzedPhoto.value = photoAnalyzer.analyzePhotoFile(savedPath)
             }
             _photoProcessing.value = false
         }
@@ -147,33 +144,30 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setAvatarMode(mode: AvatarSourceMode) {
         updateActiveCharacter { it.copy(avatarMode = mode) }
-        if (mode == AvatarSourceMode.PHOTO_AI) {
-            viewModelScope.launch { loadPhotoForActiveCharacter() }
-        }
+        if (mode == AvatarSourceMode.PHOTO_AI) viewModelScope.launch { loadPhotoForActiveCharacter() }
     }
 
-    fun setThemePreset(preset: AppThemePreset) {
-        commit(_state.value.copy(themePreset = preset))
+    fun setThemePreset(preset: AppThemePreset) = commit(_state.value.copy(themePreset = preset))
+    fun setBubbleStyle(style: ChatBubbleStyle) = commit(_state.value.copy(bubbleStyle = style))
+    fun setAutoSpeak(enabled: Boolean) = commit(_state.value.copy(autoSpeakReplies = enabled))
+    fun setContinuousCall(enabled: Boolean) = commit(_state.value.copy(continuousCallMode = enabled))
+    fun setAutoLearnSettings(enabled: Boolean) = commit(_state.value.copy(autoLearnSettings = enabled))
+    fun setRemindersEnabled(enabled: Boolean) = commit(_state.value.copy(remindersEnabled = enabled))
+
+    fun setAmbientSound(sound: AuraAmbientSound) {
+        commit(_state.value.copy(ambientSound = sound))
+        voice.setAmbientSound(sound)
     }
 
-    fun setAutoSpeak(enabled: Boolean) {
-        commit(_state.value.copy(autoSpeakReplies = enabled))
-    }
-
-    fun setContinuousCall(enabled: Boolean) {
-        commit(_state.value.copy(continuousCallMode = enabled))
-    }
-
-    fun setRemindersEnabled(enabled: Boolean) {
-        commit(_state.value.copy(remindersEnabled = enabled))
+    fun setScenario(scenario: RoleplayScenario) {
+        updateActiveCharacter { it.copy(scenario = scenario) }
+        showNotice("Scénario actif : ${scenario.emoji} ${scenario.labelFr}")
     }
 
     fun addMemory(fact: String) {
         val clean = fact.trim()
         if (clean.isEmpty()) return
-        updateActiveCharacter { ch ->
-            ch.copy(memories = (ch.memories + clean).distinct().takeLast(20))
-        }
+        updateActiveCharacter { ch -> ch.copy(memories = (ch.memories + clean).distinct().takeLast(30)) }
     }
 
     fun removeMemory(fact: String) {
@@ -199,7 +193,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val ch = _state.value.activeCharacter
         viewModelScope.launch {
             voice.speak(
-                text = "Coucou ${ch.userNickname}, c'est ${ch.name} ! Ma voix tourne à cent pour cent hors ligne sur ton téléphone.",
+                text = "Coucou ${ch.userNickname}, c'est ${ch.name} ! Ma voix française fonctionne à cent pour cent hors ligne et mes lèvres suivent chaque mot.",
                 voicePack = ch.voicePack,
                 speed = ch.voiceSpeed,
                 pitch = ch.voicePitch
@@ -210,9 +204,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun sendUserMessage(rawText: String, speakReply: Boolean = _state.value.autoSpeakReplies) {
         val text = rawText.trim()
         if (text.isEmpty() || _isThinking.value) return
-        viewModelScope.launch {
-            processUserTurn(text, speakReply)
-        }
+        viewModelScope.launch { processUserTurn(text, speakReply) }
     }
 
     fun toggleVoiceTurnOrCall() {
@@ -249,28 +241,44 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun processUserTurn(userText: String, speakReply: Boolean) {
         voice.stopSpeaking()
-        val chBefore = _state.value.activeCharacter
-        val newMem = CompanionBrainEngine.extractMemoryFactIfRelevant(userText)
+
+        // 1. Auto-apprentissage immédiat des réglages et souvenirs depuis le message utilisateur !
+        val learnedFromUser = AutoProfileLearner.learnFromUserMessage(
+            character = _state.value.activeCharacter,
+            rawMessage = userText,
+            enabled = _state.value.autoLearnSettings
+        )
+        if (learnedFromUser.learnedBadges.isNotEmpty()) {
+            showNotice("✨ Réglages adaptés : ${learnedFromUser.learnedBadges.joinToString(" • ")}")
+        }
+
+        // Garde l'historique AVANT d'ajouter le message courant pour construire un vrai prompt multi-tours sans doublon
+        val historySnapshotChar = learnedFromUser.updatedCharacter
         val userMsg = AuraChatMessage(UUID.randomUUID().toString(), fromUser = true, text = userText)
 
-        updateActiveCharacter { ch ->
-            ch.copy(
-                chatHistory = (ch.chatHistory + userMsg).takeLast(50),
-                memories = if (newMem != null) (ch.memories + newMem).distinct().takeLast(20) else ch.memories,
-                affinityXp = ch.affinityXp + 5
+        updateActiveCharacter {
+            historySnapshotChar.copy(
+                chatHistory = (historySnapshotChar.chatHistory + userMsg).takeLast(60),
+                affinityXp = historySnapshotChar.affinityXp + 5
             )
         }
 
         _isThinking.value = true
         _streamingReply.value = ""
 
-        val chSnapshot = _state.value.activeCharacter
-        val prompt = CompanionBrainEngine.buildPrompt(chSnapshot, userText)
+        // 2. Attend proprement que le modèle Llama-3.2 3B soit prêt si premier chargement en cours
+        if (llm.state.value != EngineInitState.READY) {
+            _streamingReply.value = "Préparation du cerveau IA 3B…"
+            llm.ensureLoaded()
+            _streamingReply.value = ""
+        }
+
+        val prompt = CompanionBrainEngine.buildPrompt(historySnapshotChar, userText)
         val buf = StringBuilder()
         val rawReply = llm.generate(
             prompt = prompt,
-            maxTokens = chSnapshot.responseLength.maxTokens,
-            temperature = 0.78f
+            maxTokens = historySnapshotChar.responseLength.maxTokens,
+            temperature = 0.65f
         ) { piece ->
             buf.append(piece)
             _streamingReply.value = CompanionBrainEngine.parseReply(buf.toString()).cleanText
@@ -279,7 +287,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val parsed = if (rawReply.isNotBlank()) {
             CompanionBrainEngine.parseReply(rawReply)
         } else {
-            CompanionBrainEngine.buildFallbackReply(chBefore, userText)
+            CompanionBrainEngine.buildFallbackReply(historySnapshotChar, userText)
+        }
+
+        // 3. Enregistre aussi les éventuels souvenirs [MEM: ...] détectés par l'IA
+        if (_state.value.autoLearnSettings && !parsed.memoryNote.isNullOrBlank()) {
+            val merged = AutoProfileLearner.mergeLlmMemoryNote(_state.value.activeCharacter, parsed.memoryNote)
+            if (merged.learnedBadges.isNotEmpty()) {
+                updateActiveCharacter { merged.updatedCharacter }
+                showNotice("🧠 ${merged.learnedBadges.first()}")
+            }
         }
 
         val botMsg = AuraChatMessage(
@@ -292,7 +309,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         updateActiveCharacter { ch ->
             ch.copy(
                 currentEmotion = parsed.emotion,
-                chatHistory = (ch.chatHistory + botMsg).takeLast(50),
+                chatHistory = (ch.chatHistory + botMsg).takeLast(60),
                 affinityXp = ch.affinityXp + 4
             )
         }
@@ -308,6 +325,15 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 speed = active.voiceSpeed,
                 pitch = active.voicePitch
             )
+        }
+    }
+
+    private fun showNotice(msg: String) {
+        noticeJob?.cancel()
+        _autoLearnNotice.value = msg
+        noticeJob = viewModelScope.launch {
+            delay(4500L)
+            _autoLearnNotice.value = null
         }
     }
 

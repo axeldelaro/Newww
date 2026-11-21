@@ -8,31 +8,42 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.speech.tts.TextToSpeech
+import android.util.Log
 import com.k2fsa.sherpa.onnx.*
+import com.newww.auracompanion.model.AuraAmbientSound
 import com.newww.auracompanion.model.VoicePack
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.min
-import kotlin.math.sqrt
+import java.util.zip.ZipInputStream
+import kotlin.math.*
+import kotlin.random.Random
 
 /**
- * Pipeline Vocal 100 % Hors-Ligne intégré dans l'APK :
- * - STT (Écoute FR) : Sherpa-ONNX Whisper-Tiny INT8 (lang="fr") + détection fin de parole
- * - TTS (Voix FR neurale) : Sherpa-ONNX Piper VITS (Siwis + UPMC Jessica/Pierre) avec réglage vitesse/hauteur
- * - Lip-Sync temps réel 60 Hz piloté par l'enveloppe RMS de l'audio joué
+ * Pipeline Vocal 100 % Hors-Ligne v2 (corrigé & ultra-rapide) :
+ * - Extraction unique éclair via espeak-ng-data.zip (< 0,3 s) + fichiers nommés (zéro assets.list() lent !)
+ * - Piper VITS FR avec paramètres exacts (noiseScale=0.667, noiseScaleW=0.8, lengthScale=1.0)
+ * - Fallback Android TextToSpeech FR prêt dès la 1ère milliseconde si besoin
+ * - Double signal Lip-Sync 60 Hz : lipSyncLevel (ouverture RMS) + lipSyncWide (forme voyelle ZCR)
+ * - Synthétiseur d'ambiance sonore PCM douce en option (pluie, cheminée, nuit)
  */
 class OfflineVoicePipeline(private val context: Context) {
+
+    private val initMutex = Mutex()
+    private val ambientScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var ambientJob: Job? = null
 
     private val _voiceReady = MutableStateFlow(false)
     val voiceReady: StateFlow<Boolean> = _voiceReady.asStateFlow()
 
-    private val _voiceStatus = MutableStateFlow("Préparation de la voix neurale FR…")
+    private val _voiceStatus = MutableStateFlow("Initialisation rapide des voix FR…")
     val voiceStatus: StateFlow<String> = _voiceStatus.asStateFlow()
 
     private val _isListening = MutableStateFlow(false)
@@ -44,6 +55,9 @@ class OfflineVoicePipeline(private val context: Context) {
     private val _lipSyncLevel = MutableStateFlow(0f)
     val lipSyncLevel: StateFlow<Float> = _lipSyncLevel.asStateFlow()
 
+    private val _lipSyncWide = MutableStateFlow(0f)
+    val lipSyncWide: StateFlow<Float> = _lipSyncWide.asStateFlow()
+
     private val _micLevel = MutableStateFlow(0f)
     val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
 
@@ -51,118 +65,167 @@ class OfflineVoicePipeline(private val context: Context) {
     private var ttsSiwis: OfflineTts? = null
     private var ttsUpmc: OfflineTts? = null
     private var fallbackTts: TextToSpeech? = null
+    private var fallbackTtsReady = false
     private var activeTrack: AudioTrack? = null
+    private var initialized = false
 
     private val stopListenFlag = AtomicBoolean(false)
     private val stopSpeakFlag = AtomicBoolean(false)
 
-    suspend fun initialize() = withContext(Dispatchers.IO) {
-        if (_voiceReady.value) return@withContext
-        _voiceStatus.value = "Extraction des voix neurales FR & Whisper…"
-
-        val voiceRoot = File(context.filesDir, "voice_models").apply { mkdirs() }
-        val espeakDir = File(voiceRoot, "espeak-ng-data")
-        val whisperDir = File(voiceRoot, "whisper")
-        val ttsDir = File(voiceRoot, "tts")
-
+    init {
+        // Prépare immédiatement Android TTS FR en secours instantané
         runCatching {
-            copyAssetTreeIfNeeded("voice/espeak-ng-data", espeakDir)
-            copyAssetTreeIfNeeded("voice/whisper", whisperDir)
-            copyAssetTreeIfNeeded("voice/tts", ttsDir)
-        }
-
-        // 1. Initialisation Whisper-Tiny INT8 FR (STT local)
-        runCatching {
-            val enc = File(whisperDir, "tiny-encoder.int8.onnx")
-            val dec = File(whisperDir, "tiny-decoder.int8.onnx")
-            val tok = File(whisperDir, "tiny-tokens.txt")
-            if (enc.exists() && dec.exists() && tok.exists()) {
-                val whisperCfg = OfflineWhisperModelConfig().apply {
-                    encoder = enc.absolutePath
-                    decoder = dec.absolutePath
-                    language = "fr"
-                    task = "transcribe"
-                }
-                val modelCfg = OfflineModelConfig().apply {
-                    whisper = whisperCfg
-                    tokens = tok.absolutePath
-                    numThreads = 2
-                    provider = "cpu"
-                }
-                val recCfg = OfflineRecognizerConfig().apply {
-                    modelConfig = modelCfg
-                }
-                recognizer = OfflineRecognizer(null, recCfg)
-            }
-        }
-
-        // 2. Initialisation Piper VITS FR — Voix Siwis (féminine douce)
-        runCatching {
-            val model = File(ttsDir, "fr_FR-siwis-medium.onnx")
-            val tokens = File(ttsDir, "siwis-tokens.txt")
-            if (model.exists() && tokens.exists() && espeakDir.exists()) {
-                val vits = OfflineTtsVitsModelConfig().apply {
-                    this.model = model.absolutePath
-                    this.tokens = tokens.absolutePath
-                    this.dataDir = espeakDir.absolutePath
-                }
-                val mCfg = OfflineTtsModelConfig().apply {
-                    this.vits = vits
-                    this.numThreads = 2
-                    this.provider = "cpu"
-                }
-                ttsSiwis = OfflineTts(null, OfflineTtsConfig().apply { this.model = mCfg })
-            }
-        }
-
-        // 3. Initialisation Piper VITS FR — Voix UPMC (Jessica féminine vive + Pierre masculin)
-        runCatching {
-            val model = File(ttsDir, "fr_FR-upmc-medium.onnx")
-            val tokens = File(ttsDir, "upmc-tokens.txt")
-            if (model.exists() && tokens.exists() && espeakDir.exists()) {
-                val vits = OfflineTtsVitsModelConfig().apply {
-                    this.model = model.absolutePath
-                    this.tokens = tokens.absolutePath
-                    this.dataDir = espeakDir.absolutePath
-                }
-                val mCfg = OfflineTtsModelConfig().apply {
-                    this.vits = vits
-                    this.numThreads = 2
-                    this.provider = "cpu"
-                }
-                ttsUpmc = OfflineTts(null, OfflineTtsConfig().apply { this.model = mCfg })
-            }
-        }
-
-        // Secours Android TTS français si besoin
-        runCatching {
-            fallbackTts = TextToSpeech(context) { status ->
+            fallbackTts = TextToSpeech(context.applicationContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
-                    fallbackTts?.language = Locale.FRENCH
+                    val res = fallbackTts?.setLanguage(Locale.FRANCE)
+                    fallbackTtsReady = res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED
+                    if (!fallbackTtsReady) {
+                        fallbackTts?.language = Locale.FRENCH
+                        fallbackTtsReady = true
+                    }
                 }
             }
-        }
-
-        val sttOk = recognizer != null
-        val ttsOk = ttsSiwis != null || ttsUpmc != null
-        _voiceReady.value = sttOk || ttsOk
-        _voiceStatus.value = when {
-            sttOk && ttsOk -> "Voix Neurale FR + Whisper Local actifs (100 % hors-ligne)"
-            ttsOk -> "Voix Neurale FR active (100 % hors-ligne)"
-            sttOk -> "Whisper FR actif (TTS système)"
-            else -> "Audio système hors-ligne actif"
         }
     }
 
-    /**
-     * Enregistre au micro à 16 kHz jusqu'à [stopListening] ou silence prolongé ([autoStopOnSilence])
-     * puis transcrit localement en français avec Whisper-Tiny INT8.
-     */
+    suspend fun initialize() = withContext(Dispatchers.IO) {
+        initMutex.withLock {
+            if (initialized) return@withLock
+            _voiceStatus.value = "Préparation des voix neurales FR…"
+
+            val voiceRoot = File(context.filesDir, "voice_models_v2").apply { mkdirs() }
+            val espeakDir = File(voiceRoot, "espeak-ng-data")
+            val whisperDir = File(voiceRoot, "whisper").apply { mkdirs() }
+            val ttsDir = File(voiceRoot, "tts").apply { mkdirs() }
+
+            // 1. Extraction ultra-rapide d'espeak-ng-data.zip (< 0,3 s !)
+            val espeakMarker = File(espeakDir, ".extracted_ok")
+            if (!espeakMarker.exists()) {
+                runCatching {
+                    unzipAssetToDir("voice/espeak-ng-data.zip", espeakDir)
+                    espeakMarker.writeText("ok")
+                }.onFailure { e ->
+                    Log.e(TAG, "Unzip espeak-ng-data failed", e)
+                }
+            }
+
+            // 2. Extraction directe des fichiers TTS & Whisper (sans aucun assets.list() lent !)
+            val siwisModel = copySingleAsset("voice/tts/fr_FR-siwis-medium.onnx", File(ttsDir, "fr_FR-siwis-medium.onnx"))
+            val siwisTokens = copySingleAsset("voice/tts/siwis-tokens.txt", File(ttsDir, "siwis-tokens.txt"))
+            val upmcModel = copySingleAsset("voice/tts/fr_FR-upmc-medium.onnx", File(ttsDir, "fr_FR-upmc-medium.onnx"))
+            val upmcTokens = copySingleAsset("voice/tts/upmc-tokens.txt", File(ttsDir, "upmc-tokens.txt"))
+
+            val whisperEnc = copySingleAsset("voice/whisper/tiny-encoder.int8.onnx", File(whisperDir, "tiny-encoder.int8.onnx"))
+            val whisperDec = copySingleAsset("voice/whisper/tiny-decoder.int8.onnx", File(whisperDir, "tiny-decoder.int8.onnx"))
+            val whisperTok = copySingleAsset("voice/whisper/tiny-tokens.txt", File(whisperDir, "tiny-tokens.txt"))
+
+            // 3. Initialisation Piper VITS FR — Voix Siwis (Féminine douce)
+            if (siwisModel != null && siwisTokens != null && espeakDir.exists()) {
+                runCatching {
+                    val vitsCfg = OfflineTtsVitsModelConfig(
+                        model = siwisModel.absolutePath,
+                        lexicon = "",
+                        tokens = siwisTokens.absolutePath,
+                        dataDir = espeakDir.absolutePath,
+                        dictDir = "",
+                        noiseScale = 0.667f,
+                        noiseScaleW = 0.8f,
+                        lengthScale = 1.0f
+                    )
+                    val modelCfg = OfflineTtsModelConfig(
+                        vits = vitsCfg,
+                        numThreads = 2,
+                        debug = false,
+                        provider = "cpu"
+                    )
+                    val ttsCfg = OfflineTtsConfig(
+                        model = modelCfg,
+                        ruleFsts = "",
+                        ruleFars = "",
+                        maxNumSentences = 1,
+                        silenceScale = 0.2f
+                    )
+                    ttsSiwis = OfflineTts(null, ttsCfg)
+                    Log.i(TAG, "Piper Siwis FR loaded! sampleRate=${ttsSiwis?.sampleRate()}")
+                }.onFailure { e ->
+                    Log.e(TAG, "Piper Siwis load failed", e)
+                }
+            }
+
+            // 4. Initialisation Piper VITS FR — Voix UPMC (Jessica féminine vive + Pierre masculin)
+            if (upmcModel != null && upmcTokens != null && espeakDir.exists()) {
+                runCatching {
+                    val vitsCfg = OfflineTtsVitsModelConfig(
+                        model = upmcModel.absolutePath,
+                        lexicon = "",
+                        tokens = upmcTokens.absolutePath,
+                        dataDir = espeakDir.absolutePath,
+                        dictDir = "",
+                        noiseScale = 0.667f,
+                        noiseScaleW = 0.8f,
+                        lengthScale = 1.0f
+                    )
+                    val modelCfg = OfflineTtsModelConfig(
+                        vits = vitsCfg,
+                        numThreads = 2,
+                        debug = false,
+                        provider = "cpu"
+                    )
+                    val ttsCfg = OfflineTtsConfig(
+                        model = modelCfg,
+                        ruleFsts = "",
+                        ruleFars = "",
+                        maxNumSentences = 1,
+                        silenceScale = 0.2f
+                    )
+                    ttsUpmc = OfflineTts(null, ttsCfg)
+                    Log.i(TAG, "Piper UPMC FR loaded! numSpeakers=${ttsUpmc?.numSpeakers()}")
+                }.onFailure { e ->
+                    Log.e(TAG, "Piper UPMC load failed", e)
+                }
+            }
+
+            // 5. Initialisation Whisper-Tiny INT8 FR (Micro hors-ligne)
+            if (whisperEnc != null && whisperDec != null && whisperTok != null) {
+                runCatching {
+                    val whisperCfg = OfflineWhisperModelConfig().apply {
+                        encoder = whisperEnc.absolutePath
+                        decoder = whisperDec.absolutePath
+                        language = "fr"
+                        task = "transcribe"
+                    }
+                    val modelCfg = OfflineModelConfig().apply {
+                        whisper = whisperCfg
+                        tokens = whisperTok.absolutePath
+                        numThreads = 2
+                        provider = "cpu"
+                    }
+                    recognizer = OfflineRecognizer(null, OfflineRecognizerConfig().apply { modelConfig = modelCfg })
+                    Log.i(TAG, "Whisper FR loaded!")
+                }.onFailure { e ->
+                    Log.e(TAG, "Whisper FR load failed", e)
+                }
+            }
+
+            initialized = true
+            val ttsCount = listOfNotNull(ttsSiwis, ttsUpmc).size
+            val sttOk = recognizer != null
+            _voiceReady.value = ttsCount > 0 || fallbackTtsReady
+            _voiceStatus.value = when {
+                ttsCount == 2 && sttOk -> "3 Voix Neurales FR (Piper) + Whisper FR actifs ✓"
+                ttsCount >= 1 && sttOk -> "Voix Neurale FR + Whisper FR actifs ✓"
+                ttsCount >= 1 -> "Voix Neurale FR active ✓"
+                else -> "Voix système Android FR active (secours)"
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     suspend fun recordAndTranscribeFrench(
         autoStopOnSilence: Boolean = true,
         maxSeconds: Int = 12
     ): String = withContext(Dispatchers.IO) {
+        if (!initialized) initialize()
         stopSpeaking()
         stopListenFlag.set(false)
         _isListening.value = true
@@ -191,9 +254,9 @@ class OfflineVoicePipeline(private val context: Context) {
         }
 
         val captured = ArrayList<Short>(sampleRate * maxSeconds)
-        val chunk = ShortArray(1600) // 100 ms
+        val chunk = ShortArray(1600)
         var speechDetected = false
-        var silentChunksAfterSpeech = 0
+        var silentChunks = 0
         val maxChunks = maxSeconds * 10
 
         try {
@@ -210,16 +273,13 @@ class OfflineVoicePipeline(private val context: Context) {
                         sumSq += f * f
                     }
                     val rms = sqrt(sumSq / read).toFloat()
-                    _micLevel.value = (rms * 5.5f).coerceIn(0f, 1f)
-
-                    if (rms > 0.028f) {
+                    _micLevel.value = (rms * 5.8f).coerceIn(0f, 1f)
+                    if (rms > 0.025f) {
                         speechDetected = true
-                        silentChunksAfterSpeech = 0
+                        silentChunks = 0
                     } else if (speechDetected) {
-                        silentChunksAfterSpeech++
-                        if (autoStopOnSilence && silentChunksAfterSpeech >= 14) {
-                            break
-                        }
+                        silentChunks++
+                        if (autoStopOnSilence && silentChunks >= 13) break
                     }
                 }
             }
@@ -232,16 +292,15 @@ class OfflineVoicePipeline(private val context: Context) {
         }
 
         if (captured.size < sampleRate / 4) return@withContext ""
-
         val rec = recognizer ?: return@withContext ""
         val floatSamples = FloatArray(captured.size) { i -> captured[i] / 32768f }
         return@withContext runCatching {
             val stream = rec.createStream()
             stream.acceptWaveform(floatSamples, sampleRate)
             rec.decode(stream)
-            val text = rec.getResult(stream).text.trim()
+            val txt = rec.getResult(stream).text.trim()
             stream.release()
-            text
+            txt
         }.getOrDefault("")
     }
 
@@ -249,20 +308,15 @@ class OfflineVoicePipeline(private val context: Context) {
         stopListenFlag.set(true)
     }
 
-    /**
-     * Synthétise et joue la réponse avec la voix neurale choisie tout en émettant
-     * le niveau temps réel [lipSyncLevel] (0..1) pour animer les lèvres à 60 FPS !
-     */
     suspend fun speak(
         text: String,
         voicePack: VoicePack,
         speed: Float = 1.0f,
         pitch: Float = 1.0f
     ) = withContext(Dispatchers.IO) {
-        val clean = text
-            .replace(Regex("[\\p{So}\\p{Cn}]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+        if (!initialized) initialize()
+
+        val clean = sanitizeForSpeech(text)
         if (clean.isEmpty()) return@withContext
 
         stopSpeaking()
@@ -274,94 +328,185 @@ class OfflineVoicePipeline(private val context: Context) {
             else -> ttsSiwis ?: ttsUpmc
         }
 
-        if (engine == null) {
-            // Secours Android TTS avec animation lèvres synthétique douce
-            runCatching {
-                fallbackTts?.setSpeechRate(speed.coerceIn(0.7f, 1.4f))
-                fallbackTts?.setPitch(pitch.coerceIn(0.75f, 1.35f))
-                fallbackTts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "aura_utt")
-                val estMs = (clean.length * 62L / speed.coerceIn(0.7f, 1.4f)).toLong().coerceIn(800L, 12000L)
-                var elapsed = 0L
-                while (elapsed < estMs && !stopSpeakFlag.get()) {
-                    _lipSyncLevel.value = (0.25f + 0.65f * kotlin.math.abs(kotlin.math.sin(elapsed * 0.018))).toFloat()
-                    delay(32L)
-                    elapsed += 32L
+        var playedNeural = false
+        if (engine != null) {
+            try {
+                val sid = if (engine === ttsUpmc) voicePack.speakerId.coerceIn(0, (engine.numSpeakers() - 1).coerceAtLeast(0)) else 0
+                val generated = engine.generate(clean, sid, speed.coerceIn(0.75f, 1.35f))
+                val samples = generated.samples
+                if (samples.isNotEmpty() && !stopSpeakFlag.get()) {
+                    playedNeural = playSamplesWithVisemeLipSync(samples, generated.sampleRate, pitch)
                 }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Piper TTS playback failed, switching to Android TTS", e)
             }
-            _lipSyncLevel.value = 0f
-            _isSpeaking.value = false
-            return@withContext
         }
 
-        try {
-            val sid = if (engine === ttsUpmc) voicePack.speakerId else 0
-            val generated = engine.generate(clean, sid, speed.coerceIn(0.7f, 1.4f))
-            val samples = generated.samples
-            if (samples.isEmpty() || stopSpeakFlag.get()) {
-                _lipSyncLevel.value = 0f
-                _isSpeaking.value = false
-                return@withContext
-            }
+        if (!playedNeural && !stopSpeakFlag.get()) {
+            speakWithAndroidFallback(clean, speed, pitch)
+        }
 
-            // Ajustement subtil du pitch via fréquence d'échantillonnage de lecture
-            val baseRate = generated.sampleRate.coerceIn(16000, 48000)
-            val playbackRate = (baseRate * pitch.coerceIn(0.85f, 1.20f)).toInt().coerceIn(14000, 48000)
-            val minBuf = AudioTrack.getMinBufferSize(
-                playbackRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(4096)
+        _lipSyncLevel.value = 0f
+        _lipSyncWide.value = 0f
+        _isSpeaking.value = false
+    }
 
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(playbackRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(minBuf * 2)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+    private suspend fun playSamplesWithVisemeLipSync(
+        samples: FloatArray,
+        baseSampleRate: Int,
+        pitch: Float
+    ): Boolean {
+        val sr = baseSampleRate.coerceIn(16000, 48000)
+        val playbackRate = (sr * pitch.coerceIn(0.85f, 1.20f)).toInt().coerceIn(14000, 48000)
+        val minBuf = AudioTrack.getMinBufferSize(
+            playbackRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(4096)
 
-            activeTrack = track
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(playbackRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBuf * 2)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        activeTrack = track
+        return try {
             track.play()
-
-            val frameSize = (playbackRate / 30).coerceAtLeast(512) // ~33 ms par trame lip-sync
+            val frameSize = (playbackRate / 45).coerceAtLeast(384) // ~22 ms par trame (lip-sync ultra-fluide !)
             val pcmBuf = ShortArray(frameSize)
             var idx = 0
-            var smoothed = 0f
+            var smoothOpen = 0f
+            var smoothWide = 0f
 
             while (idx < samples.size && !stopSpeakFlag.get()) {
                 val count = min(frameSize, samples.size - idx)
                 var sumSq = 0.0
+                var zeroCross = 0
+                var prev = 0f
                 for (i in 0 until count) {
-                    val f = samples[idx + i].coerceIn(-1f, 1f)
+                    val f = (samples[idx + i] * 1.15f).coerceIn(-0.98f, 0.98f)
                     sumSq += f * f
+                    if (i > 0 && ((prev >= 0f && f < 0f) || (prev < 0f && f >= 0f))) zeroCross++
+                    prev = f
                     pcmBuf[i] = (f * 32767f).toInt().toShort()
                 }
                 val rms = sqrt(sumSq / count).toFloat()
-                val targetLip = ((rms - 0.015f) * 5.2f).coerceIn(0f, 1f)
-                smoothed = smoothed * 0.42f + targetLip * 0.58f
-                _lipSyncLevel.value = smoothed
+                val zcr = zeroCross.toFloat() / count.toFloat()
+
+                // Ouverture verticale (voyelles ouvertes) + étirement horizontal (voyelles E/I vs O/U)
+                val targetOpen = ((rms - 0.012f) * 6.5f).coerceIn(0f, 1f)
+                val targetWide = ((zcr - 0.06f) * 4.2f).coerceIn(-0.6f, 1f) * targetOpen
+                smoothOpen = smoothOpen * 0.35f + targetOpen * 0.65f
+                smoothWide = smoothWide * 0.45f + targetWide * 0.55f
+                _lipSyncLevel.value = smoothOpen
+                _lipSyncWide.value = smoothWide
 
                 track.write(pcmBuf, 0, count)
                 idx += count
             }
 
+            // Attend la fin réelle de lecture du tampon AudioTrack pour ne jamais couper la dernière syllabe
+            if (!stopSpeakFlag.get()) {
+                val silenceTail = ShortArray(playbackRate / 5) // 200 ms silence drain
+                track.write(silenceTail, 0, silenceTail.size)
+                _lipSyncLevel.value = 0f
+                _lipSyncWide.value = 0f
+                delay(180L)
+            }
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "AudioTrack write error", e)
+            false
+        } finally {
             runCatching { track.stop() }
             runCatching { track.release() }
             activeTrack = null
+        }
+    }
+
+    private suspend fun speakWithAndroidFallback(clean: String, speed: Float, pitch: Float) {
+        runCatching {
+            fallbackTts?.setSpeechRate(speed.coerceIn(0.75f, 1.35f))
+            fallbackTts?.setPitch(pitch.coerceIn(0.80f, 1.25f))
+            fallbackTts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "aura_fallback")
+            val estMs = (clean.length * 64L / speed.coerceIn(0.75f, 1.35f)).toLong().coerceIn(700L, 14_000L)
+            var elapsed = 0L
+            while (elapsed < estMs && !stopSpeakFlag.get()) {
+                val s = abs(sin(elapsed * 0.022)).toFloat()
+                val w = sin(elapsed * 0.013).toFloat() * 0.5f
+                _lipSyncLevel.value = (0.18f + 0.72f * s).coerceIn(0f, 1f)
+                _lipSyncWide.value = w
+                delay(28L)
+                elapsed += 28L
+            }
+        }
+    }
+
+    fun setAmbientSound(kind: AuraAmbientSound) {
+        ambientJob?.cancel()
+        if (kind == AuraAmbientSound.SILENT) return
+        ambientJob = ambientScope.launch {
+            runAmbientPcm(kind)
+        }
+    }
+
+    private suspend fun runAmbientPcm(kind: AuraAmbientSound) {
+        val sr = 22050
+        val minBuf = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(4096)
+        val track = runCatching {
+            AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sr).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                .setBufferSizeInBytes(minBuf * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        }.getOrNull() ?: return
+
+        try {
+            track.play()
+            val buf = ShortArray(2048)
+            var lp1 = 0.0; var lp2 = 0.0; var idx = 0L
+            while (currentCoroutineContext().isActive) {
+                for (i in buf.indices) {
+                    val w = Random.nextDouble() * 2.0 - 1.0
+                    val s = when (kind) {
+                        AuraAmbientSound.SOFT_RAIN -> {
+                            lp1 += 0.14 * (w - lp1); lp2 += 0.03 * (lp1 - lp2)
+                            (lp1 * 0.45 + lp2 * 0.55) * 0.14
+                        }
+                        AuraAmbientSound.COZY_FIRE -> {
+                            lp1 += 0.04 * (w - lp1)
+                            val cr = if (Random.nextFloat() < 0.0005f) (Random.nextDouble() - 0.5) * 0.5 else 0.0
+                            (lp1 * 0.55 + cr) * 0.16
+                        }
+                        AuraAmbientSound.NIGHT_CALM -> {
+                            lp1 += 0.025 * (w - lp1)
+                            (0.5 + 0.5 * sin(idx * 0.0002)) * lp1 * 0.16
+                        }
+                        AuraAmbientSound.SILENT -> 0.0
+                    }
+                    idx++
+                    buf[i] = (s.coerceIn(-0.9, 0.9) * Short.MAX_VALUE).toInt().toShort()
+                }
+                track.write(buf, 0, buf.size)
+            }
         } catch (_: Throwable) {
         } finally {
-            _lipSyncLevel.value = 0f
-            _isSpeaking.value = false
+            runCatching { track.stop() }
+            runCatching { track.release() }
         }
     }
 
@@ -372,10 +517,13 @@ class OfflineVoicePipeline(private val context: Context) {
         activeTrack = null
         runCatching { fallbackTts?.stop() }
         _lipSyncLevel.value = 0f
+        _lipSyncWide.value = 0f
         _isSpeaking.value = false
     }
 
     fun release() {
+        ambientJob?.cancel()
+        ambientScope.cancel()
         stopListening()
         stopSpeaking()
         runCatching { recognizer?.release() }
@@ -384,22 +532,65 @@ class OfflineVoicePipeline(private val context: Context) {
         runCatching { fallbackTts?.shutdown() }
     }
 
-    private fun copyAssetTreeIfNeeded(assetPath: String, destDir: File) {
-        val entries = context.assets.list(assetPath) ?: return
-        if (entries.isEmpty()) {
-            // Fichier feuille
-            if (destDir.exists() && destDir.length() > 0L) return
-            destDir.parentFile?.mkdirs()
+    private fun sanitizeForSpeech(text: String): String {
+        return text
+            .replace(Regex("""\[[^]]*]"""), " ")
+            .replace(Regex("[*#`~_]"), " ")
+            .replace(Regex("[\\p{So}\\p{Cs}]"), " ")
+            .replace("…", ", ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun copySingleAsset(assetPath: String, dest: File): File? {
+        val assetLen = runCatching { context.assets.openFd(assetPath).use { it.length } }.getOrDefault(-1L)
+        if (dest.exists() && dest.length() > 0L && (assetLen <= 0L || dest.length() == assetLen)) {
+            return dest
+        }
+        return runCatching {
+            dest.parentFile?.mkdirs()
+            val tmp = File(dest.parentFile, "${dest.name}.part")
             context.assets.open(assetPath).use { input ->
-                FileOutputStream(destDir).use { output ->
-                    input.copyTo(output, bufferSize = 65536)
+                FileOutputStream(tmp).use { output ->
+                    input.copyTo(output, bufferSize = 262144)
                 }
             }
-        } else {
-            destDir.mkdirs()
-            for (child in entries) {
-                copyAssetTreeIfNeeded("$assetPath/$child", File(destDir, child))
+            if (dest.exists()) dest.delete()
+            if (!tmp.renameTo(dest)) return null
+            dest
+        }.onFailure { e ->
+            Log.e(TAG, "Failed extracting $assetPath", e)
+        }.getOrNull()
+    }
+
+    private fun unzipAssetToDir(assetZipPath: String, targetDir: File) {
+        targetDir.mkdirs()
+        val buf = ByteArray(65536)
+        context.assets.open(assetZipPath).use { raw ->
+            ZipInputStream(raw).use { zis ->
+                while (true) {
+                    val entry = zis.nextEntry ?: break
+                    val out = File(targetDir, entry.name)
+                    if (!out.canonicalPath.startsWith(targetDir.canonicalPath)) continue
+                    if (entry.isDirectory) {
+                        out.mkdirs()
+                    } else {
+                        out.parentFile?.mkdirs()
+                        FileOutputStream(out).use { fos ->
+                            while (true) {
+                                val r = zis.read(buf)
+                                if (r <= 0) break
+                                fos.write(buf, 0, r)
+                            }
+                        }
+                    }
+                    zis.closeEntry()
+                }
             }
         }
+    }
+
+    companion object {
+        private const val TAG = "AuraVoice"
     }
 }

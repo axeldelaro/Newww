@@ -21,9 +21,7 @@ class TerrariumSimulationEngineTest {
     @Test
     fun chargingRestoresEnergyOverTime() {
         val base = TerrariumAppState(
-            spirits = mapOf(
-                SpiritElement.MOSS to SpiritProfile(SpiritElement.MOSS, energy = 40f)
-            ),
+            spirits = mapOf(SpiritElement.MOSS to SpiritProfile(SpiritElement.MOSS, energy = 40f)),
             lastTickTimestampMs = 1_000_000L
         )
         val later = TerrariumSimulationEngine.applyTimeTick(
@@ -35,32 +33,31 @@ class TerrariumSimulationEngineTest {
     }
 
     @Test
-    fun stepsConvertToDewAndXp() {
+    fun stepsConvertToDewAndRecordWeeklyStats() {
         val base = TerrariumAppState(dewCurrency = 10, totalStepsConverted = 0)
         val after = TerrariumSimulationEngine.recordStepsDelta(base, stepsDelta = 250, nowMs = 10_000L)
         assertEquals(20, after.dewCurrency)
         assertEquals(250, after.totalStepsConverted)
-        assertTrue(after.activeSpirit.xp > 0)
+        assertEquals(250, after.dailyQuest.stepsToday)
+        assertTrue(after.weeklySteps.values.any { it == 250 })
     }
 
     @Test
-    fun feedingFavoriteGivesBonusXpAndEvolution() {
-        val nearEvo = SpiritProfile(SpiritElement.MOSS, xp = 95, hunger = 50f)
-        val base = TerrariumAppState(
-            activeElement = SpiritElement.MOSS,
-            spirits = mapOf(SpiritElement.MOSS to nearEvo)
-        )
-        val after = TerrariumSimulationEngine.feedSpirit(base, FoodType.LUMINA_BERRY, nowMs = 50_000L)
-        assertEquals(EvolutionStage.SPROUT, after.activeSpirit.stage)
-        assertTrue(after.activeSpirit.hunger > 85f)
+    fun wipingGlassFogClearsCondensationAndAwardsXp() {
+        val foggy = SpiritProfile(SpiritElement.MOSS, glassFog = 0.6f, xp = 10)
+        val base = TerrariumAppState(spirits = mapOf(SpiritElement.MOSS to foggy))
+        val after = TerrariumSimulationEngine.wipeGlassFog(base, nowMs = 5_000L)
+        assertTrue(after.activeSpirit.glassFog < 0.3f)
+        assertTrue(after.activeSpirit.xp > 10)
     }
 
     @Test
-    fun decorUnlockConsumesDewAndPlacesItem() {
-        val base = TerrariumAppState(dewCurrency = 50)
-        val after = TerrariumSimulationEngine.unlockOrToggleDecor(base, DecorItem.GLOW_MUSHROOMS, nowMs = 5_000L)
-        assertEquals(30, after.dewCurrency)
-        assertTrue(DecorItem.GLOW_MUSHROOMS.id in after.unlockedDecorIds)
-        assertTrue(DecorItem.GLOW_MUSHROOMS.id in after.activeSpirit.activeDecorIds)
+    fun movingDecorClampsAndPersistsNormalizedPosition() {
+        val base = TerrariumAppState()
+        val after = TerrariumSimulationEngine.setDecorPosition(base, DecorItem.GLOW_MUSHROOMS.id, 0.99f, 0.01f)
+        val pos = after.activeSpirit.decorPositions[DecorItem.GLOW_MUSHROOMS.id]
+        assertNotNull(pos)
+        assertEquals(0.82f, pos!!.x, 0.001f)
+        assertEquals(0.24f, pos.y, 0.001f)
     }
 }

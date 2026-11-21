@@ -10,9 +10,11 @@ import com.newww.luminaterrarium.model.*
 import com.newww.luminaterrarium.notifications.CareReminderWorker
 import com.newww.luminaterrarium.sensors.DeviceSensorsManager
 import com.newww.luminaterrarium.widget.TerrariumWidgetProvider
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 data class VisualPulseEvent(
     val id: Long = System.nanoTime(),
@@ -22,7 +24,7 @@ data class VisualPulseEvent(
     val yNorm: Float = 0.5f
 )
 
-enum class PulseKind { PET, TAP, FEED, MIST, EVOLVE, LULLABY, ORB_CAUGHT }
+enum class PulseKind { PET, TAP, FEED, MIST, WIPE, EVOLVE, LULLABY, ORB_CAUGHT }
 
 class TerrariumViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -37,6 +39,7 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
 
     val battery: StateFlow<BatterySnapshot> = sensors.battery
     val tilt: StateFlow<TiltSnapshot> = sensors.tilt
+    val pedometerHealth: StateFlow<PedometerHealth> = sensors.pedometerHealth
 
     private val _dayPhase = MutableStateFlow(DayPhase.fromHour(TerrariumSimulationEngine.currentHour()))
     val dayPhase: StateFlow<DayPhase> = _dayPhase.asStateFlow()
@@ -44,14 +47,28 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
     private val _visualPulse = MutableStateFlow<VisualPulseEvent?>(null)
     val visualPulse: StateFlow<VisualPulseEvent?> = _visualPulse.asStateFlow()
 
-    private val _miniGameActive = MutableStateFlow(false)
-    val miniGameActive: StateFlow<Boolean> = _miniGameActive.asStateFlow()
+    private val _miniGameMode = MutableStateFlow(MiniGameMode.NONE)
+    val miniGameMode: StateFlow<MiniGameMode> = _miniGameMode.asStateFlow()
 
     private val _miniGameScore = MutableStateFlow(0)
     val miniGameScore: StateFlow<Int> = _miniGameScore.asStateFlow()
 
     private val _miniGameSecondsLeft = MutableStateFlow(20)
     val miniGameSecondsLeft: StateFlow<Int> = _miniGameSecondsLeft.asStateFlow()
+
+    // État du mini-jeu Carillon Mémoire (4 cristaux musicaux)
+    private val _melodySequence = MutableStateFlow<List<Int>>(emptyList())
+    val melodySequence: StateFlow<List<Int>> = _melodySequence.asStateFlow()
+    private val _melodyHighlightPad = MutableStateFlow(-1)
+    val melodyHighlightPad: StateFlow<Int> = _melodyHighlightPad.asStateFlow()
+    private val _melodyUserStep = MutableStateFlow(0)
+    private val _melodyShowingDemo = MutableStateFlow(false)
+    val melodyShowingDemo: StateFlow<Boolean> = _melodyShowingDemo.asStateFlow()
+
+    private val _decorEditMode = MutableStateFlow(false)
+    val decorEditMode: StateFlow<Boolean> = _decorEditMode.asStateFlow()
+
+    private var gameJob: Job? = null
 
     init {
         CareReminderWorker.schedule(application)
@@ -61,7 +78,7 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
 
         viewModelScope.launch {
             while (true) {
-                delay(30_000L)
+                delay(25_000L)
                 _dayPhase.value = DayPhase.fromHour(TerrariumSimulationEngine.currentHour())
                 applyTickAndPersist()
             }
@@ -70,9 +87,14 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun onResume() {
         sensors.start()
+        sensors.rebindStepSensor()
         _dayPhase.value = DayPhase.fromHour(TerrariumSimulationEngine.currentHour())
         applyTickAndPersist()
         audioEngine.setSoundscape(_state.value.soundscape)
+    }
+
+    fun onPermissionResult() {
+        sensors.rebindStepSensor()
     }
 
     fun onPause() {
@@ -85,6 +107,14 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         sensors.stop()
         audioEngine.release()
         super.onCleared()
+    }
+
+    fun toggleDecorEditMode() {
+        _decorEditMode.value = !_decorEditMode.value
+    }
+
+    fun moveDecor(decorId: String, xNorm: Float, yNorm: Float) {
+        commit(TerrariumSimulationEngine.setDecorPosition(_state.value, decorId, xNorm, yNorm))
     }
 
     fun petSpirit(xNorm: Float = 0.5f, yNorm: Float = 0.55f) {
@@ -103,6 +133,15 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    fun wipeGlassFog(xNorm: Float, yNorm: Float) {
+        val before = _state.value.activeSpirit.glassFog
+        if (before <= 0.03f) return
+        val next = TerrariumSimulationEngine.wipeGlassFog(_state.value)
+        commit(next)
+        audioEngine.playSfx(AmbientSoundEngine.SfxKind.PET, next.sfxEnabled)
+        _visualPulse.value = VisualPulseEvent(kind = PulseKind.WIPE, xNorm = xNorm, yNorm = yNorm)
+    }
+
     fun tapGlass(xNorm: Float, yNorm: Float) {
         val next = TerrariumSimulationEngine.tapGlass(_state.value, battery.value)
         commit(next)
@@ -110,7 +149,7 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         _visualPulse.value = VisualPulseEvent(kind = PulseKind.TAP, xNorm = xNorm, yNorm = yNorm)
     }
 
-    fun feedSpirit(food: FoodType) {
+    fun feedSpirit(food: FoodType, dropX: Float = 0.5f) {
         val prevStage = _state.value.activeSpirit.stage
         val next = TerrariumSimulationEngine.feedSpirit(_state.value, food)
         commit(next)
@@ -121,7 +160,8 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         )
         _visualPulse.value = VisualPulseEvent(
             kind = if (evolved) PulseKind.EVOLVE else PulseKind.FEED,
-            food = food
+            food = food,
+            xNorm = dropX
         )
     }
 
@@ -141,6 +181,10 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         commit(TerrariumSimulationEngine.setLightLevel(_state.value, level))
     }
 
+    fun setLampTint(tint: LampTint) {
+        commit(TerrariumSimulationEngine.setLampTint(_state.value, tint))
+    }
+
     fun toggleLullaby() {
         val next = TerrariumSimulationEngine.toggleLullabySleep(_state.value)
         commit(next)
@@ -148,34 +192,97 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
         _visualPulse.value = VisualPulseEvent(kind = PulseKind.LULLABY)
     }
 
-    fun startMiniGame() {
-        if (_miniGameActive.value) return
+    fun startMiniGame(mode: MiniGameMode) {
+        if (mode == MiniGameMode.NONE) return
+        stopMiniGameWithoutReward()
+        _decorEditMode.value = false
         _miniGameScore.value = 0
-        _miniGameSecondsLeft.value = 20
-        _miniGameActive.value = true
-        viewModelScope.launch {
-            for (sec in 20 downTo 1) {
-                if (!_miniGameActive.value) return@launch
-                _miniGameSecondsLeft.value = sec
-                delay(1000L)
+        _miniGameSecondsLeft.value = 22
+        _miniGameMode.value = mode
+
+        if (mode == MiniGameMode.MELODY) {
+            _melodySequence.value = listOf(Random.nextInt(4), Random.nextInt(4), Random.nextInt(4))
+            _melodyUserStep.value = 0
+            playMelodyDemo()
+        } else {
+            gameJob = viewModelScope.launch {
+                for (sec in 22 downTo 1) {
+                    if (_miniGameMode.value != mode) return@launch
+                    _miniGameSecondsLeft.value = sec
+                    delay(1000L)
+                }
+                finishMiniGame()
             }
+        }
+    }
+
+    private fun playMelodyDemo() {
+        gameJob?.cancel()
+        gameJob = viewModelScope.launch {
+            _melodyShowingDemo.value = true
+            delay(450L)
+            for (pad in _melodySequence.value) {
+                _melodyHighlightPad.value = pad
+                audioEngine.playSfx(AmbientSoundEngine.SfxKind.CATCH_ORB, _state.value.sfxEnabled)
+                delay(480L)
+                _melodyHighlightPad.value = -1
+                delay(180L)
+            }
+            _melodyShowingDemo.value = false
+        }
+    }
+
+    fun onMelodyPadTap(padIndex: Int) {
+        if (_miniGameMode.value != MiniGameMode.MELODY || _melodyShowingDemo.value) return
+        audioEngine.playSfx(AmbientSoundEngine.SfxKind.CATCH_ORB, _state.value.sfxEnabled)
+        val seq = _melodySequence.value
+        val step = _melodyUserStep.value
+        if (step < seq.size && seq[step] == padIndex) {
+            _miniGameScore.value += 2
+            if (step + 1 >= seq.size) {
+                if (seq.size >= 6) {
+                    finishMiniGame()
+                } else {
+                    _melodySequence.value = seq + Random.nextInt(4)
+                    _melodyUserStep.value = 0
+                    playMelodyDemo()
+                }
+            } else {
+                _melodyUserStep.value = step + 1
+            }
+        } else {
             finishMiniGame()
         }
     }
 
-    fun onOrbCaught(xNorm: Float, yNorm: Float) {
-        if (!_miniGameActive.value) return
-        _miniGameScore.value += 1
-        audioEngine.playSfx(AmbientSoundEngine.SfxKind.CATCH_ORB, _state.value.sfxEnabled)
-        _visualPulse.value = VisualPulseEvent(kind = PulseKind.ORB_CAUGHT, xNorm = xNorm, yNorm = yNorm)
+    fun onMiniGameScorePoint(points: Int = 1, xNorm: Float = 0.5f, yNorm: Float = 0.5f) {
+        if (_miniGameMode.value == MiniGameMode.NONE) return
+        _miniGameScore.value = (_miniGameScore.value + points).coerceAtLeast(0)
+        audioEngine.playSfx(
+            if (points > 0) AmbientSoundEngine.SfxKind.CATCH_ORB else AmbientSoundEngine.SfxKind.GLASS_TAP,
+            _state.value.sfxEnabled
+        )
+        if (points > 0) {
+            _visualPulse.value = VisualPulseEvent(kind = PulseKind.ORB_CAUGHT, xNorm = xNorm, yNorm = yNorm)
+        }
     }
 
     fun finishMiniGame() {
-        if (!_miniGameActive.value) return
-        _miniGameActive.value = false
-        val score = _miniGameScore.value
-        val next = TerrariumSimulationEngine.completeMiniGame(_state.value, score)
+        val mode = _miniGameMode.value
+        if (mode == MiniGameMode.NONE) return
+        gameJob?.cancel()
+        _miniGameMode.value = MiniGameMode.NONE
+        _melodyHighlightPad.value = -1
+        _melodyShowingDemo.value = false
+        val next = TerrariumSimulationEngine.completeMiniGame(_state.value, mode, _miniGameScore.value)
         commit(next)
+    }
+
+    fun stopMiniGameWithoutReward() {
+        gameJob?.cancel()
+        _miniGameMode.value = MiniGameMode.NONE
+        _melodyHighlightPad.value = -1
+        _melodyShowingDemo.value = false
     }
 
     fun onStepsRecorded(delta: Int) {
@@ -217,8 +324,7 @@ class TerrariumViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun applyTickAndPersist() {
-        val ticked = TerrariumSimulationEngine.applyTimeTick(_state.value, battery.value)
-        commit(ticked)
+        commit(TerrariumSimulationEngine.applyTimeTick(_state.value, battery.value))
     }
 
     private fun commit(next: TerrariumAppState) {

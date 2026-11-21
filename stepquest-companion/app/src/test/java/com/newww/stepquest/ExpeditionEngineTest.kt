@@ -8,50 +8,42 @@ import org.junit.Test
 class ExpeditionEngineTest {
 
     @Test
-    fun stepsAdvanceBiomeAndAwardXpAndCoins() {
-        val start = StepQuestState(totalSteps = 2_800, todaySteps = 200, coins = 10)
-        val after = ExpeditionEngine.advanceSteps(start, 600, nowMs = 50_000L)
+    fun stepsAdvanceBiomeRecordWeeklyAndTriggerEncounter() {
+        val now = 50_000L
+        val start = StepQuestState(
+            totalSteps = 2_800,
+            todaySteps = 200,
+            todayDayKey = ExpeditionEngine.dayKey(now),
+            coins = 10,
+            lastEncounterStepMark = 2_600
+        )
+        val after = ExpeditionEngine.advanceSteps(start, 600, nowMs = now)
         assertEquals(3_400, after.totalSteps)
         assertEquals("Forêt des Lanternes Suspendues", ExpeditionEngine.biomeForSteps(after.totalSteps).nameFr)
-        assertTrue(after.coins > 10)
-        assertTrue(after.xp > 0)
+        assertTrue(after.weeklySteps.values.any { it == 800 })
+        assertNotNull(after.activeEncounter)
     }
 
     @Test
-    fun morningPackCapsAtThreeGearItems() {
-        var s = StepQuestState(packedGearIds = emptyList())
-        s = ExpeditionEngine.togglePackGear(s, GearItem.RUNIC_LANTERN)
-        s = ExpeditionEngine.togglePackGear(s, GearItem.COPPER_COMPASS)
-        s = ExpeditionEngine.togglePackGear(s, GearItem.RAIN_CLOAK)
-        s = ExpeditionEngine.togglePackGear(s, GearItem.MAGIC_FLASK)
-        assertEquals(3, s.packedGearIds.size)
-        assertTrue(GearItem.MAGIC_FLASK.id in s.packedGearIds)
-        assertFalse(GearItem.RUNIC_LANTERN.id in s.packedGearIds)
-    }
-
-    @Test
-    fun feedingProvisionRestoresEnergyAndDeductsCoins() {
-        val start = StepQuestState(coins = 30, energy = 40f, morale = 50f)
-        val after = ExpeditionEngine.feedProvision(start, ProvisionItem.FOREST_SOUP, nowMs = 80_000L)
-        assertEquals(18, after.coins)
-        assertTrue(after.energy > 60f)
-        assertTrue(after.morale > 60f)
-        assertTrue(after.mealsFedToday.contains(ProvisionItem.FOREST_SOUP.labelFr))
-    }
-
-    @Test
-    fun letterPromptContainsRealActivityContext() {
-        val state = StepQuestState(
-            adventurerName = "Lyra",
-            adventurerClass = AdventurerClass.RANGER,
-            todaySteps = 4_200,
-            totalSteps = 4_200,
-            packedGearIds = listOf(GearItem.RUNIC_LANTERN.id)
+    fun craftingConsumesIngredientsAndRewardsHero() {
+        val start = StepQuestState(
+            health = 50f,
+            energy = 40f,
+            ingredients = mapOf(IngredientType.HERB to 3, IngredientType.HONEY to 2)
         )
-        val prompt = ExpeditionEngine.buildLetterPrompt(state)
-        assertTrue(prompt.contains("Lyra"))
-        assertTrue(prompt.contains("4200"))
-        assertTrue(prompt.contains("Forêt des Lanternes Suspendues"))
-        assertTrue(prompt.contains("Lanterne Runique"))
+        val after = ExpeditionEngine.craftRecipe(start, CraftRecipe.VITAL_ELIXIR, nowMs = 90_000L)
+        assertEquals(1, after.ingredients[IngredientType.HERB])
+        assertEquals(1, after.ingredients[IngredientType.HONEY])
+        assertTrue(after.health >= 95f)
+        assertTrue(after.energy >= 85f)
+    }
+
+    @Test
+    fun chatPromptUsesMultiTurnAndDirectUserQuestion() {
+        val state = StepQuestState(adventurerName = "Élio", todaySteps = 3200)
+        val prompt = ExpeditionEngine.buildChatPrompt(state, "Combien de pas avons-nous fait ?")
+        assertTrue(prompt.contains("<start_of_turn>user"))
+        assertTrue(prompt.contains("3200"))
+        assertTrue(prompt.contains("<start_of_turn>user\nCombien de pas avons-nous fait ?<end_of_turn>"))
     }
 }

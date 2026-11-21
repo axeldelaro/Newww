@@ -20,32 +20,36 @@ class MainActivity : ComponentActivity() {
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        viewModel.onResume()
+        viewModel.onPermissionResult()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val toRequest = buildList {
-            if (Build.VERSION.SDK_INT >= 29) add(Manifest.permission.ACTIVITY_RECOGNITION)
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-        if (toRequest.isNotEmpty()) {
-            permissionsLauncher.launch(toRequest.toTypedArray())
-        }
+        requestRuntimePermissions()
 
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
                     primary = Color(0xFFF6C768),
                     secondary = Color(0xFF6CF0B5),
-                    background = Color(0xFF12101A),
-                    surface = Color(0xFF1E1B2B)
+                    background = Color(0xFF0E0C17),
+                    surface = Color(0xFF1A1629)
                 )
             ) {
-                StepQuestApp(viewModel = viewModel)
+                StepQuestApp(
+                    viewModel = viewModel,
+                    onRequestStepPermission = { requestRuntimePermissions() }
+                )
             }
         }
+    }
+
+    private fun requestRuntimePermissions() {
+        val toRequest = buildList {
+            if (Build.VERSION.SDK_INT >= 29) add(Manifest.permission.ACTIVITY_RECOGNITION)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (toRequest.isNotEmpty()) permissionsLauncher.launch(toRequest.toTypedArray())
     }
 
     override fun onResume() {

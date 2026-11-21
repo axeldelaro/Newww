@@ -20,31 +20,37 @@ class MainActivity : ComponentActivity() {
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        viewModel.onResume()
+        viewModel.onPermissionResult()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val toRequest = buildList {
-            if (Build.VERSION.SDK_INT >= 29) add(Manifest.permission.ACTIVITY_RECOGNITION)
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-        if (toRequest.isNotEmpty()) {
-            permissionsLauncher.launch(toRequest.toTypedArray())
-        }
+        requestRuntimePermissions()
 
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
                     primary = Color(0xFF7CF7B4),
                     secondary = Color(0xFF66DCFF),
-                    background = Color(0xFF0A141A),
-                    surface = Color(0xFF13242D)
+                    background = Color(0xFF071117),
+                    surface = Color(0xFF11222C)
                 )
             ) {
-                LuminaTerrariumApp(viewModel = viewModel)
+                LuminaTerrariumApp(
+                    viewModel = viewModel,
+                    onRequestStepPermission = { requestRuntimePermissions() }
+                )
             }
+        }
+    }
+
+    private fun requestRuntimePermissions() {
+        val toRequest = buildList {
+            if (Build.VERSION.SDK_INT >= 29) add(Manifest.permission.ACTIVITY_RECOGNITION)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (toRequest.isNotEmpty()) {
+            permissionsLauncher.launch(toRequest.toTypedArray())
         }
     }
 

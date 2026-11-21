@@ -1,25 +1,19 @@
-# Suite de 3 Compagnons Virtuels Android 100 % Hors-Ligne (v1.0.0)
+# Suite de 3 Compagnons Virtuels Android 100 % Hors-Ligne (v2.0.0)
 
-Trois applications Android totalement indépendantes, fonctionnelles dès l'installation **sans aucun téléchargement ultérieur** (tous les modèles IA, voix neurales et moteurs de vision sont directement intégrés dans chaque APK).
+Trois applications Android indépendantes, fonctionnelles dès l'installation **sans aucun téléchargement ultérieur** (tous les modèles IA, voix neurales et moteurs de vision sont directement intégrés dans chaque APK).
 
-## 1. Lumina Terrarium (`lumina-terrarium/`)
-- **Concept** : Terrarium de poche vivant abritant 4 esprits élémentaires (**Sylva** mousse, **Ondine** goutte, **Braise** flammèche, **Nimbo** nuage) évolutifs sur 4 stades.
-- **Interactivité 60 FPS** : caresses tactiles avec cœurs et déformation douce, tapotements sur la vitre, suivi du regard, inclinaison via accéléromètre, mini-jeu *Chasse aux Lucioles*.
-- **Capteurs locaux** : batterie réelle (sieste < 20 %, aura d'énergie en charge), podomètre matériel/accéléromètre convertissant tes pas en *Rosée*, cycle ciel jour/nuit synchronisé sur l'horloge locale.
-- **Audio & Widget** : synthétiseur PCM 100 % hors-ligne (pluie, forêt, cheminée, carillon zen + effets tactiles), **Widget Android d'écran d'accueil** interactif (Caresser / Nourrir / Brume) et rappels locaux doux (`WorkManager`).
+## 1. Lumina Terrarium v2.0 (`lumina-terrarium/`)
+- **Podomètre automatique de toute la journée** : persistance du compteur matériel + epoch de boot + `flush()` FIFO + ré-enregistrement automatique après autorisation (récupère tes pas même app fermée) + graphique 7 jours.
+- **Design & interactivité 60 FPS** : verre multi-couches + strates botaniques, 4 esprits élémentaires évolutifs qui se promènent librement, **buée interactive à essuyer au doigt**, **16 décorations déplaçables au doigt**, **6 styles de bocaux**, **4 teintes de lampe**, **3 mini-jeux jouables** (*Chasse aux Lucioles*, *Pluie d'Étoiles*, *Carillon Mémoire*), audio PCM hors-ligne et **Widget Android** interactif.
 
-## 2. StepQuest Companion (`stepquest-companion/`)
-- **Concept** : Compagnon d'expédition RPG qui voyage dans un monde fantastique en 7 biomes au rythme de tes vrais pas hors-ligne.
-- **Routine quotidienne** : préparation du sac le matin (3 objets sur 8 influençant les découvertes), ravitaillement et soins au feu de camp à midi, et **lettre de voyage du soir générée par IA locale**.
-- **IA locale intégrée** : `llama.cpp` ARM64 + **`Gemma-3 1B Instruct (Q4_K_M)`** embarqué dans l'APK (~769 Mo) pour rédiger des lettres personnalisées et discuter librement au feu de camp.
-- **Personnalisation** : 4 classes d'aventuriers (Cartographe, Rôdeuse, Barde, Alchimiste), nom & couleur de cape modifiables, 14 reliques à collectionner, carte animée 60 FPS.
+## 2. StepQuest Companion v2.0 (`stepquest-companion/`)
+- **Podomètre automatique de toute la journée** + objectifs journaliers (1k/3k/6k/10k pas) + graphique 7 jours.
+- **RPG vivant** : carte 60 FPS interactive avec **coffres/trésors cliquables**, **4 familiers animaux** (*Renard, Hibou, Luciole, Louveteau*), **Rencontres Interactives RPG à 3 choix**, **Atelier de fabrication (Craft)**, 7 biomes et 14 reliques.
+- **IA locale multi-tours** : `llama.cpp` ARM64 + `Gemma-3 1B Q4_K_M` en vrai format multi-tours pour des discussions précises et des lettres d'expédition sur mesure.
 
-## 3. Aura Live Companion (`aura-companion/`)
-- **Concept** : Compagne/partenaire virtuel(le) 100 % hors-ligne avec appel vocal temps réel, **animation de photo par IA locale**, **Studio de création de modèles animés** et **multi-personnages illimités**.
-- **Animation de Photo par IA** : importe n'importe quelle photo de ta galerie → **MediaPipe Face Landmarker (478 repères faciaux)** + **MediaPipe Selfie Segmenter** construisent un maillage déformable 60 FPS (clignement des yeux, expressions émotionnelles, rougissement, respiration 2.5D, changement de décor IA et **Lip-Sync exact** sur la voix).
-- **Studio Avatar au Chargement** : 4 styles artistiques (Anime Live2D, Semi-Réaliste, Chibi, Cyber Néon), 8 coiffures avec physique de mouvement, 6 tenues, 6 accessoires, couleurs & décors animés + 5 thèmes d'interface.
-- **Multi-caractères & Personnalité 100 % configurable** : 5 profils prêts dès la v1 (*Clara, Sora, Élena, Mina, Kira*) + création illimitée, 8 curseurs de personnalité, histoire libre, consignes personnalisées, mémoire long-terme éditable.
-- **Suite Vocale & Cerveau IA 100 % intégrée** :
-  - **Cerveau** : `llama.cpp` ARM64 + `Gemma-3 1B Instruct Q4_K_M`
-  - **Écoute FR (STT)** : `Sherpa-ONNX Whisper-Tiny INT8` (Push-to-Talk & mode Appel Continu)
-  - **Voix Neurales FR (TTS)** : `Sherpa-ONNX Piper VITS` (3 voix françaises : *Siwis*, *Jessica*, *Pierre* + vitesse & pitch réglables) avec synchronisation labiale RMS temps réel.
+## 3. Aura Live Companion v2.0 — Édition Mimico (`aura-companion/`)
+- **Voix Neurales FR instantanées & Lip-Sync Visème** : extraction éclair via `espeak-ng-data.zip` (< 0,3 s), 3 voix Piper VITS FR (*Siwis*, *Jessica*, *Pierre*) + drain AudioTrack complet + secours Android TTS immédiat + double signal Lip-Sync (ouverture RMS + largeur voyelles ZCR).
+- **Cerveau IA 3 Milliards de paramètres (`Llama-3.2-3B-Instruct-IQ3_M`)** : format multi-tours natif, réponses françaises précises, intelligentes et fidèles à tes questions.
+- **Auto-Adaptation & Auto-Mémoire Mimico** (`AutoProfileLearner`) : ton prénom, surnom, tutoiement/vouvoiement, curseurs de personnalité, longueur des réponses et faits personnels dits dans le chat mettent automatiquement à jour tes réglages et ta mémoire !
+- **Photo Animée par IA (LivePortrait v2)** : maillage 32×32 sur 478 repères MediaPipe, **paupières échantillonnées sur la vraie peau de ta photo**, micro-saccades du regard, Lip-Sync prononcé avec lueur dentaire, mouvements 2.5D, curseurs d'intensité en direct, **10 filtres cinéma** et **10 décors IA** (Selfie Segmenter).
+- **Design plein écran façon Mimico** : portrait edge-to-edge + chat verre givré flottant + mode Plein Écran 1-tap, **8 personnages prêts** (+ création illimitée), **10 thèmes**, **4 styles de bulles**, **7 scénarios / jeux de rôle**, et ambiances sonores PCM.

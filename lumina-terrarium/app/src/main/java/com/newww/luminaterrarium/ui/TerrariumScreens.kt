@@ -30,8 +30,9 @@ import com.newww.luminaterrarium.viewmodel.TerrariumViewModel
 import java.text.SimpleDateFormat
 import java.util.*
 
-private val BgDark = Color(0xFF0A141A)
-private val CardDark = Color(0xFF13242D)
+private val BgDark = Color(0xFF071117)
+private val CardDark = Color(0xFF11222C)
+private val GlassCard = Color(0xCC0D1E28)
 private val AccentMint = Color(0xFF7CF7B4)
 private val TextMain = Color(0xFFF1FFF8)
 private val TextMuted = Color(0xFF9AC2B7)
@@ -44,18 +45,26 @@ private enum class TerrariumTab(val label: String, val icon: ImageVector) {
 }
 
 @Composable
-fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
+fun LuminaTerrariumApp(
+    viewModel: TerrariumViewModel,
+    onRequestStepPermission: () -> Unit
+) {
     val state by viewModel.state.collectAsState()
     val battery by viewModel.battery.collectAsState()
     val tilt by viewModel.tilt.collectAsState()
+    val pedometerHealth by viewModel.pedometerHealth.collectAsState()
     val dayPhase by viewModel.dayPhase.collectAsState()
     val pulse by viewModel.visualPulse.collectAsState()
-    val miniGameActive by viewModel.miniGameActive.collectAsState()
+    val miniGameMode by viewModel.miniGameMode.collectAsState()
     val miniGameScore by viewModel.miniGameScore.collectAsState()
     val miniGameSec by viewModel.miniGameSecondsLeft.collectAsState()
+    val melodyHighlight by viewModel.melodyHighlightPad.collectAsState()
+    val melodyDemo by viewModel.melodyShowingDemo.collectAsState()
+    val decorEditMode by viewModel.decorEditMode.collectAsState()
 
     var currentTab by remember { mutableStateOf(TerrariumTab.HOME) }
     var showFoodDialog by remember { mutableStateOf(false) }
+    var showGamesDialog by remember { mutableStateOf(false) }
     var showCustomizeDialog by remember { mutableStateOf(false) }
 
     val spirit = state.activeSpirit
@@ -64,10 +73,7 @@ fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
     Scaffold(
         containerColor = BgDark,
         bottomBar = {
-            NavigationBar(
-                containerColor = Color(0xFF0E1C24),
-                tonalElevation = 4.dp
-            ) {
+            NavigationBar(containerColor = Color(0xFF0B1820), tonalElevation = 4.dp) {
                 TerrariumTab.entries.forEach { tab ->
                     NavigationBarItem(
                         selected = currentTab == tab,
@@ -86,11 +92,7 @@ fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
             }
         }
     ) { padding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when (currentTab) {
                 TerrariumTab.HOME -> TerrariumMainTab(
                     state = state,
@@ -99,19 +101,29 @@ fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
                     dayPhase = dayPhase,
                     battery = battery,
                     tilt = tilt,
+                    pedometerHealth = pedometerHealth,
                     pulse = pulse,
-                    miniGameActive = miniGameActive,
+                    miniGameMode = miniGameMode,
                     miniGameScore = miniGameScore,
                     miniGameSec = miniGameSec,
+                    melodyHighlight = melodyHighlight,
+                    melodyDemo = melodyDemo,
+                    decorEditMode = decorEditMode,
+                    onRequestStepPermission = onRequestStepPermission,
                     onPet = viewModel::petSpirit,
+                    onWipeFog = viewModel::wipeGlassFog,
                     onTapGlass = viewModel::tapGlass,
-                    onCatchOrb = viewModel::onOrbCaught,
+                    onMoveDecor = viewModel::moveDecor,
+                    onToggleDecorEdit = viewModel::toggleDecorEditMode,
+                    onMiniGamePoint = viewModel::onMiniGameScorePoint,
+                    onMelodyPadTap = viewModel::onMelodyPadTap,
+                    onStopMiniGame = viewModel::finishMiniGame,
                     onOpenFood = { showFoodDialog = true },
                     onMist = viewModel::mistTerrarium,
                     onToggleLullaby = viewModel::toggleLullaby,
-                    onStartMiniGame = viewModel::startMiniGame,
+                    onOpenGames = { showGamesDialog = true },
                     onLightChange = viewModel::setLightLevel,
-                    onAddManualWalk = { viewModel.onStepsRecorded(250) }
+                    onSelectLampTint = viewModel::setLampTint
                 )
                 TerrariumTab.SPIRITS -> SpiritsTab(
                     state = state,
@@ -127,6 +139,8 @@ fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
                 )
                 TerrariumTab.JOURNAL -> JournalTab(
                     state = state,
+                    pedometerHealth = pedometerHealth,
+                    onRequestStepPermission = onRequestStepPermission,
                     onClaimQuest = viewModel::claimDailyQuest,
                     onToggleReminders = viewModel::setRemindersEnabled,
                     onAddWalkSteps = { viewModel.onStepsRecorded(500) }
@@ -142,6 +156,16 @@ fun LuminaTerrariumApp(viewModel: TerrariumViewModel) {
             onSelect = { food ->
                 showFoodDialog = false
                 viewModel.feedSpirit(food)
+            }
+        )
+    }
+
+    if (showGamesDialog) {
+        MiniGamesPickerDialog(
+            onDismiss = { showGamesDialog = false },
+            onPick = { mode ->
+                showGamesDialog = false
+                viewModel.startMiniGame(mode)
             }
         )
     }
@@ -166,84 +190,55 @@ private fun TerrariumMainTab(
     dayPhase: DayPhase,
     battery: BatterySnapshot,
     tilt: TiltSnapshot,
+    pedometerHealth: PedometerHealth,
     pulse: com.newww.luminaterrarium.viewmodel.VisualPulseEvent?,
-    miniGameActive: Boolean,
+    miniGameMode: MiniGameMode,
     miniGameScore: Int,
     miniGameSec: Int,
+    melodyHighlight: Int,
+    melodyDemo: Boolean,
+    decorEditMode: Boolean,
+    onRequestStepPermission: () -> Unit,
     onPet: (Float, Float) -> Unit,
+    onWipeFog: (Float, Float) -> Unit,
     onTapGlass: (Float, Float) -> Unit,
-    onCatchOrb: (Float, Float) -> Unit,
+    onMoveDecor: (String, Float, Float) -> Unit,
+    onToggleDecorEdit: () -> Unit,
+    onMiniGamePoint: (Int, Float, Float) -> Unit,
+    onMelodyPadTap: (Int) -> Unit,
+    onStopMiniGame: () -> Unit,
     onOpenFood: () -> Unit,
     onMist: () -> Unit,
     onToggleLullaby: () -> Unit,
-    onStartMiniGame: () -> Unit,
+    onOpenGames: () -> Unit,
     onLightChange: (Float) -> Unit,
-    onAddManualWalk: () -> Unit
+    onSelectLampTint: (LampTint) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
-        // Barre d'état capteurs réels + monnaie Rosée
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column {
-                Text(
-                    text = "${spirit.name} • ${spirit.stage.labelFr}",
-                    color = TextMain,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "${mood.emoji} ${mood.labelFr} • ${dayPhase.labelFr} • Niv.${spirit.stage.level} (${spirit.xp} XP)",
-                    color = TextMuted,
-                    fontSize = 12.sp
-                )
-            }
+        // Bandeau permission podomètre si pas encore accordée
+        if (!pedometerHealth.permissionGranted) {
             Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = CardDark
+                color = Color(0xFF2B2214),
+                modifier = Modifier.fillMaxWidth().clickable { onRequestStepPermission() }
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("💧 ${state.dewCurrency} Rosée", color = AccentMint, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        "👣 Autorise « Activité physique » pour récupérer tes pas auto toute la journée",
+                        color = Color(0xFFFFD56B),
+                        fontSize = 11.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text("Autoriser", color = AccentMint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 }
             }
         }
 
-        // Pilules capteurs temps réel : Batterie, Pas, Ambiance
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            StatusChip(
-                text = if (battery.isCharging) "⚡ ${battery.levelPercent}%" else "🔋 ${battery.levelPercent}%",
-                accent = if (battery.levelPercent <= 20 && !battery.isCharging) Color(0xFFFF8A80) else AccentMint
-            )
-            StatusChip(
-                text = "👣 ${state.dailyQuest.stepsToday} pas",
-                accent = Color(0xFF7CE8FF),
-                onClick = onAddManualWalk
-            )
-            StatusChip(
-                text = "❤️ ${spirit.affection.toInt()}%",
-                accent = Color(0xFFFF8FB8)
-            )
-        }
-
-        // Zone interactive du Terrarium 60 FPS
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(top = 6.dp)
-        ) {
+        // Scène plein-écran interactive 60 FPS avec HUD glassmorphism superposé
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             TerrariumCanvas(
                 spirit = spirit,
                 mood = mood,
@@ -251,82 +246,168 @@ private fun TerrariumMainTab(
                 battery = battery,
                 tilt = tilt,
                 pulseEvent = pulse,
-                miniGameActive = miniGameActive,
+                miniGameMode = miniGameMode,
+                decorEditMode = decorEditMode,
+                melodyHighlightPad = melodyHighlight,
                 onPet = onPet,
+                onWipeFog = onWipeFog,
                 onTapGlass = onTapGlass,
-                onCatchOrb = onCatchOrb
+                onMoveDecor = onMoveDecor,
+                onMiniGamePoint = onMiniGamePoint,
+                onMelodyPadTap = onMelodyPadTap
             )
 
-            // Bulle de dialogue vivante
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(horizontal = 20.dp, vertical = 8.dp),
-                shape = RoundedCornerShape(18.dp),
-                color = Color(0xCC0D1E27),
-                border = androidx.compose.foundation.BorderStroke(1.dp, AccentMint.copy(alpha = 0.35f))
-            ) {
-                Text(
-                    text = if (miniGameActive) {
-                        "✨ Chasse aux Lucioles : $miniGameScore attrapées • ${miniGameSec}s"
-                    } else {
-                        spirit.lastSpeech
-                    },
-                    color = TextMain,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)
-                )
-            }
-        }
-
-        // Jauges de besoins + curseur de lumière + boutons de soins
-        Surface(
-            color = Color(0xFF0E1D25),
-            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
-        ) {
+            // En-tête Glassmorphism flottant
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = GlassCard) {
+                        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                            Text(
+                                "${spirit.name} • ${spirit.stage.labelFr}",
+                                color = TextMain,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                "${mood.emoji} ${mood.labelFr} • ${dayPhase.labelFr} • ${spirit.xp} XP",
+                                color = TextMuted,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (decorEditMode) AccentMint else GlassCard,
+                            modifier = Modifier.clickable { onToggleDecorEdit() }
+                        ) {
+                            Text(
+                                if (decorEditMode) "✓ Fini" else "✋ Décors",
+                                color = if (decorEditMode) BgDark else TextMain,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp)
+                            )
+                        }
+                        Surface(shape = RoundedCornerShape(14.dp), color = GlassCard) {
+                            Text(
+                                "💧 ${state.dewCurrency}",
+                                color = AccentMint,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Pilules temps réel : Batterie, Pas auto du jour, Buée
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    StatusChip(
+                        if (battery.isCharging) "⚡ ${battery.levelPercent}%" else "🔋 ${battery.levelPercent}%",
+                        if (battery.levelPercent <= 20 && !battery.isCharging) Color(0xFFFF8A80) else AccentMint
+                    )
+                    StatusChip("👣 ${state.dailyQuest.stepsToday} pas auto", Color(0xFF7CE8FF))
+                    StatusChip("❤️ ${spirit.affection.toInt()}%", Color(0xFFFF8FB8))
+                    if (spirit.glassFog > 0.25f) {
+                        StatusChip("🫧 Essuie la vitre !", Color(0xFFD6FCFF))
+                    }
+                }
+
+                // Bulle de dialogue vivante ou HUD de mini-jeu
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = GlassCard,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, AccentMint.copy(alpha = 0.35f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = when {
+                                decorEditMode -> "✋ Glisse tes décorations où tu veux dans le bocal !"
+                                miniGameMode == MiniGameMode.MELODY ->
+                                    if (melodyDemo) "🎵 Écoute la mélodie lumineuse…" else "🎵 À toi ! Score : $miniGameScore"
+                                miniGameMode != MiniGameMode.NONE ->
+                                    "${miniGameMode.emoji} ${miniGameMode.labelFr} : $miniGameScore pts • ${miniGameSec}s"
+                                else -> spirit.lastSpeech
+                            },
+                            color = TextMain,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (miniGameMode != MiniGameMode.NONE) {
+                            Text(
+                                "Stop",
+                                color = Color(0xFFFF8A80),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(start = 8.dp).clickable { onStopMiniGame() }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Panneau inférieur de soins + lampe couleur
+        Surface(
+            color = Color(0xFF0C1A22),
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     VitalBar("Faim", spirit.hunger, Color(0xFFFFB74D), Modifier.weight(1f))
                     VitalBar("Brume", spirit.hydration, Color(0xFF4FC3F7), Modifier.weight(1f))
                     VitalBar("Énergie", spirit.energy, Color(0xFFAED581), Modifier.weight(1f))
                     VitalBar("Joie", spirit.happiness, Color(0xFFF48FB1), Modifier.weight(1f))
                 }
 
-                Spacer(Modifier.height(6.dp))
-
-                // Contrôle de la lampe lumineuse du bocal
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("☀️ Lumière", color = TextMuted, fontSize = 12.sp)
+                // Lampe + 4 teintes lumineuses
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("☀️", fontSize = 14.sp)
                     Slider(
                         value = spirit.lightLevel,
                         onValueChange = onLightChange,
                         valueRange = 5f..100f,
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 8.dp),
+                        modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
                         colors = SliderDefaults.colors(
-                            thumbColor = Color(0xFFFFE082),
-                            activeTrackColor = Color(0xFFFFE082)
+                            thumbColor = Color(spirit.lampTint.colorHex),
+                            activeTrackColor = Color(spirit.lampTint.colorHex)
                         )
                     )
-                    Text("${spirit.lightLevel.toInt()}%", color = TextMain, fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        LampTint.entries.forEach { tint ->
+                            Box(
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(tint.colorHex))
+                                    .border(if (spirit.lampTint == tint) 2.5.dp else 0.dp, Color.White, CircleShape)
+                                    .clickable { onSelectLampTint(tint) }
+                            )
+                        }
+                    }
                 }
 
-                // Boutons de soins quotidiens
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     CareActionButton("🍓", "Nourrir", onOpenFood, Modifier.weight(1f))
                     CareActionButton("💧", "Brume", onMist, Modifier.weight(1f))
                     CareActionButton(
@@ -335,7 +416,7 @@ private fun TerrariumMainTab(
                         onToggleLullaby,
                         Modifier.weight(1f)
                     )
-                    CareActionButton("✨", "Lucioles", onStartMiniGame, Modifier.weight(1f))
+                    CareActionButton("🎮", "3 Jeux", onOpenGames, Modifier.weight(1f))
                 }
             }
         }
@@ -343,18 +424,14 @@ private fun TerrariumMainTab(
 }
 
 @Composable
-private fun StatusChip(text: String, accent: Color, onClick: (() -> Unit)? = null) {
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = CardDark,
-        modifier = if (onClick != null) Modifier.clickable { onClick() } else Modifier
-    ) {
+private fun StatusChip(text: String, accent: Color) {
+    Surface(shape = RoundedCornerShape(12.dp), color = GlassCard) {
         Text(
             text = text,
             color = accent,
-            fontSize = 12.sp,
+            fontSize = 11.sp,
             fontWeight = FontWeight.Medium,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }
 }
@@ -362,22 +439,16 @@ private fun StatusChip(text: String, accent: Color, onClick: (() -> Unit)? = nul
 @Composable
 private fun VitalBar(label: String, value: Float, color: Color, modifier: Modifier = Modifier) {
     Column(modifier = modifier) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(label, color = TextMuted, fontSize = 11.sp)
-            Text("${value.toInt()}%", color = TextMain, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, color = TextMuted, fontSize = 10.sp)
+            Text("${value.toInt()}%", color = TextMain, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
         }
         Spacer(Modifier.height(3.dp))
         LinearProgressIndicator(
             progress = { (value / 100f).coerceIn(0f, 1f) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp)
-                .clip(RoundedCornerShape(4.dp)),
+            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(4.dp)),
             color = color,
-            trackColor = Color(0xFF1F3845)
+            trackColor = Color(0xFF1D3440)
         )
     }
 }
@@ -386,13 +457,13 @@ private fun VitalBar(label: String, value: Float, color: Color, modifier: Modifi
 private fun CareActionButton(emoji: String, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     Button(
         onClick = onClick,
-        modifier = modifier.height(50.dp),
+        modifier = modifier.height(48.dp),
         shape = RoundedCornerShape(14.dp),
         contentPadding = PaddingValues(4.dp),
         colors = ButtonDefaults.buttonColors(containerColor = CardDark, contentColor = TextMain)
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(emoji, fontSize = 16.sp)
+            Text(emoji, fontSize = 15.sp)
             Text(label, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
@@ -417,14 +488,11 @@ private fun SpiritsTab(
             ) {
                 Column {
                     Text("Tes 4 Esprits Élémentaires", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                    Text("Change de bocal à tout moment, chacun évolue à son rythme", color = TextMuted, fontSize = 12.sp)
+                    Text("Chacun possède son propre bocal et son évolution", color = TextMuted, fontSize = 12.sp)
                 }
-                FilledTonalButton(onClick = onOpenCustomize) {
-                    Text("Personnaliser")
-                }
+                FilledTonalButton(onClick = onOpenCustomize) { Text("Personnaliser") }
             }
         }
-
         items(SpiritElement.entries) { element ->
             val sp = state.spirits[element] ?: SpiritProfile(element)
             val isSelected = state.activeElement == element
@@ -433,23 +501,16 @@ private fun SpiritsTab(
                 shape = RoundedCornerShape(18.dp),
                 color = CardDark,
                 border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, accent) else null,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onSelectElement(element) }
+                modifier = Modifier.fillMaxWidth().clickable { onSelectElement(element) }
             ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
-                        modifier = Modifier
-                            .size(54.dp)
-                            .clip(CircleShape)
+                        modifier = Modifier.size(54.dp).clip(CircleShape)
                             .background(Brush.radialGradient(listOf(accent, Color(element.secondaryColorHex)))),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = when (element) {
+                            when (element) {
                                 SpiritElement.MOSS -> "🌿"
                                 SpiritElement.WATER -> "💧"
                                 SpiritElement.EMBER -> "🔥"
@@ -460,24 +521,9 @@ private fun SpiritsTab(
                     }
                     Spacer(Modifier.width(14.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(sp.name, color = TextMain, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                            Spacer(Modifier.width(8.dp))
-                            if (isSelected) {
-                                Text("ACTIF", color = BgDark, fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(accent)
-                                        .padding(horizontal = 6.dp, vertical = 2.dp))
-                            }
-                        }
+                        Text("${sp.name} ${if (isSelected) "• ACTIF" else ""}", color = TextMain, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                         Text("${element.titleFr} • ${sp.stage.labelFr} (${sp.xp} XP)", color = accent, fontSize = 12.sp)
                         Text(element.subtitleFr, color = TextMuted, fontSize = 12.sp)
-                        Text(
-                            "Favori : ${element.favoriteFood.labelFr} • Affection ${sp.affection.toInt()}%",
-                            color = TextMuted,
-                            fontSize = 11.sp
-                        )
                     }
                 }
             }
@@ -497,46 +543,28 @@ private fun WorkshopTab(
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Atelier du Terrarium", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Text("💧 ${state.dewCurrency} Rosée", color = AccentMint, fontWeight = FontWeight.Bold)
             }
         }
-
-        // Ambiances sonores PCM hors-ligne
         item {
-            Text("Ambiance sonore 100 % hors-ligne", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text("Ambiance sonore PCM hors-ligne", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(AmbientSoundscape.entries) { sc ->
-                    FilterChip(
-                        selected = state.soundscape == sc,
-                        onClick = { onSelectSoundscape(sc) },
-                        label = { Text(sc.labelFr) }
-                    )
+                    FilterChip(selected = state.soundscape == sc, onClick = { onSelectSoundscape(sc) }, label = { Text(sc.labelFr) })
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("Effets sonores tactiles", color = TextMain, fontSize = 13.sp)
                 Switch(checked = state.sfxEnabled, onCheckedChange = onToggleSfx)
             }
         }
-
-        // Styles de bocaux
-        item {
-            Text("Styles de Bocaux", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-        }
+        item { Text("6 Styles de Bocaux", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
         items(JarStyle.entries) { jar ->
             val unlocked = jar in state.unlockedJarStyles
             val selected = active.jarStyle == jar
@@ -544,35 +572,24 @@ private fun WorkshopTab(
                 shape = RoundedCornerShape(14.dp),
                 color = CardDark,
                 border = if (selected) androidx.compose.foundation.BorderStroke(1.5.dp, AccentMint) else null,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onSelectJar(jar) }
+                modifier = Modifier.fillMaxWidth().clickable { onSelectJar(jar) }
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(jar.labelFr, color = TextMain, fontWeight = FontWeight.Bold)
                         Text(jar.descriptionFr, color = TextMuted, fontSize = 12.sp)
                     }
                     Text(
-                        text = when {
-                            selected -> "Équipé"
-                            unlocked -> "Choisir"
-                            else -> "💧 ${jar.costDew}"
-                        },
+                        when { selected -> "Équipé"; unlocked -> "Choisir"; else -> "💧 ${jar.costDew}" },
                         color = if (selected || unlocked) AccentMint else Color(0xFFFFD54F),
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
         }
-
-        // Décorations
         item {
-            Text("Décorations du bocal (${active.activeDecorIds.size} placées)", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text("16 Décorations déplaçables (${active.activeDecorIds.size} placées)", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text("Astuce : appuie sur « ✋ Décors » dans le Terrarium pour déplacer tes objets au doigt.", color = TextMuted, fontSize = 11.sp)
         }
         items(DecorItem.entries) { item ->
             val unlocked = item.id in state.unlockedDecorIds
@@ -581,25 +598,15 @@ private fun WorkshopTab(
                 shape = RoundedCornerShape(14.dp),
                 color = CardDark,
                 border = if (placed) androidx.compose.foundation.BorderStroke(1.dp, AccentMint) else null,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onToggleDecor(item) }
+                modifier = Modifier.fillMaxWidth().clickable { onToggleDecor(item) }
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column {
                         Text(item.labelFr, color = TextMain, fontWeight = FontWeight.SemiBold)
-                        Text(item.categoryFr, color = TextMuted, fontSize = 12.sp)
+                        Text(item.categoryFr, color = TextMuted, fontSize = 11.sp)
                     }
                     Text(
-                        text = when {
-                            placed -> "Placé ✓"
-                            unlocked -> "Placer"
-                            else -> "💧 ${item.costDew}"
-                        },
+                        when { placed -> "Placé ✓"; unlocked -> "Placer"; else -> "💧 ${item.costDew}" },
                         color = when {
                             placed -> AccentMint
                             unlocked -> TextMain
@@ -617,6 +624,8 @@ private fun WorkshopTab(
 @Composable
 private fun JournalTab(
     state: TerrariumAppState,
+    pedometerHealth: PedometerHealth,
+    onRequestStepPermission: () -> Unit,
     onClaimQuest: (String, Int) -> Unit,
     onToggleReminders: (Boolean) -> Unit,
     onAddWalkSteps: () -> Unit
@@ -629,8 +638,43 @@ private fun JournalTab(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        item { Text("Podomètre Auto, Rituels & Journal", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+
+        // Graphique 7 jours des pas récupérés automatiquement
         item {
-            Text("Rituels du Jour & Journal", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Surface(shape = RoundedCornerShape(16.dp), color = CardDark, modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("👣 Activité & Synchro Automatique", color = AccentMint, fontWeight = FontWeight.Bold)
+                    Text(pedometerHealth.statusText, color = TextMain, fontSize = 12.sp)
+                    Text("Aujourd'hui : ${q.stepsToday} pas • Total converti : ${state.totalStepsConverted} pas", color = TextMuted, fontSize = 12.sp)
+                    if (!pedometerHealth.permissionGranted) {
+                        Button(onClick = onRequestStepPermission) { Text("Autoriser le podomètre automatique") }
+                    }
+                    val entries = state.weeklySteps.entries.sortedBy { it.key }.takeLast(7)
+                    if (entries.isNotEmpty()) {
+                        val maxVal = entries.maxOf { it.value }.coerceAtLeast(1000)
+                        Row(
+                            modifier = Modifier.fillMaxWidth().height(74.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.Bottom
+                        ) {
+                            entries.forEach { (day, steps) ->
+                                Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth(0.7f)
+                                            .height((52f * (steps.toFloat() / maxVal)).dp.coerceAtLeast(6.dp))
+                                            .clip(RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp))
+                                            .background(AccentMint)
+                                    )
+                                    Text(day.takeLast(2), color = TextMuted, fontSize = 10.sp)
+                                }
+                            }
+                        }
+                    }
+                    OutlinedButton(onClick = onAddWalkSteps) { Text("Ajouter manuellement +500 pas") }
+                }
+            }
         }
 
         item {
@@ -638,40 +682,26 @@ private fun JournalTab(
             Spacer(Modifier.height(8.dp))
             QuestCard("Nourrir & vaporiser (2 soins)", q.feedsCount + q.mistsCount, 2, 25, "q_care", q.claimedIds, onClaimQuest)
             Spacer(Modifier.height(8.dp))
-            QuestCard("Marcher 500 pas aujourd'hui", q.stepsToday, 500, 35, "q_steps", q.claimedIds, onClaimQuest)
+            QuestCard("Essuyer la buée du bocal", q.wipesCount, 1, 20, "q_wipe", q.claimedIds, onClaimQuest)
             Spacer(Modifier.height(8.dp))
-            QuestCard("Jouer aux Lucioles", q.miniGamesWon, 1, 30, "q_game", q.claimedIds, onClaimQuest)
+            QuestCard("Marcher 1 000 pas dans la journée", q.stepsToday, 1000, 45, "q_steps", q.claimedIds, onClaimQuest)
+            Spacer(Modifier.height(8.dp))
+            QuestCard("Gagner 1 mini-jeu", q.miniGamesWon, 1, 35, "q_game", q.claimedIds, onClaimQuest)
         }
 
         item {
             Surface(shape = RoundedCornerShape(16.dp), color = CardDark, modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Rappels locaux doux", color = TextMain, fontWeight = FontWeight.SemiBold)
-                            Text("Notifications hors-ligne si ton esprit a faim ou soif", color = TextMuted, fontSize = 12.sp)
-                        }
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("Rappels locaux doux", color = TextMain, fontWeight = FontWeight.SemiBold)
                         Switch(checked = state.remindersEnabled, onCheckedChange = onToggleReminders)
                     }
-                    Text(
-                        "Widget écran d'accueil : appui long sur ton écran d'accueil Android → Widgets → Lumina Terrarium.",
-                        color = AccentMint,
-                        fontSize = 12.sp
-                    )
-                    OutlinedButton(onClick = onAddWalkSteps) {
-                        Text("Enregistrer une petite marche (+500 pas)")
-                    }
+                    Text("Widget écran d'accueil : appui long sur l'écran Android → Widgets → Lumina Terrarium.", color = AccentMint, fontSize = 11.sp)
                 }
             }
         }
 
-        item {
-            Text("Souvenirs du Terrarium", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-        }
+        item { Text("Souvenirs du Terrarium", color = AccentMint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
         items(state.journal) { entry ->
             Surface(shape = RoundedCornerShape(14.dp), color = CardDark, modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -689,26 +719,14 @@ private fun JournalTab(
 }
 
 @Composable
-private fun QuestCard(
-    title: String,
-    current: Int,
-    target: Int,
-    rewardDew: Int,
-    id: String,
-    claimed: List<String>,
-    onClaim: (String, Int) -> Unit
-) {
+private fun QuestCard(title: String, current: Int, target: Int, rewardDew: Int, id: String, claimed: List<String>, onClaim: (String, Int) -> Unit) {
     val isClaimed = id in claimed
     val isDone = current >= target
     Surface(shape = RoundedCornerShape(14.dp), color = CardDark, modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(title, color = TextMain, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                Text("${current.coerceAtMost(target)} / $target • Récompense : +$rewardDew Rosée", color = TextMuted, fontSize = 12.sp)
+                Text("${current.coerceAtMost(target)} / $target • +$rewardDew Rosée", color = TextMuted, fontSize = 12.sp)
             }
             when {
                 isClaimed -> Text("Reçu ✓", color = AccentMint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
@@ -720,67 +738,66 @@ private fun QuestCard(
 }
 
 @Composable
-private fun FoodPickerDialog(
-    favorite: FoodType,
-    onDismiss: () -> Unit,
-    onSelect: (FoodType) -> Unit
-) {
+private fun MiniGamesPickerDialog(onDismiss: () -> Unit, onPick: (MiniGameMode) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = CardDark,
-        title = { Text("Choisir une friandise", color = TextMain) },
+        title = { Text("Choisir un mini-jeu interactif", color = TextMain) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                FoodType.entries.forEach { food ->
-                    val isFav = food == favorite
+                listOf(MiniGameMode.FIREFLIES, MiniGameMode.STAR_RAIN, MiniGameMode.MELODY).forEach { mode ->
                     Surface(
-                        shape = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(14.dp),
                         color = BgDark,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelect(food) }
+                        modifier = Modifier.fillMaxWidth().clickable { onPick(mode) }
                     ) {
-                        Row(
-                            modifier = Modifier.padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column {
-                                Text(
-                                    text = if (isFav) "${food.labelFr} ★ Favori" else food.labelFr,
-                                    color = Color(food.colorHex),
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    "+${food.hungerGain.toInt()} Faim • +${food.xpGain} XP",
-                                    color = TextMuted,
-                                    fontSize = 12.sp
-                                )
+                        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(mode.emoji, fontSize = 24.sp)
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(mode.labelFr, color = AccentMint, fontWeight = FontWeight.Bold)
+                                Text(mode.descFr, color = TextMuted, fontSize = 12.sp)
                             }
-                            Text("Donner", color = AccentMint, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
             }
         },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Fermer", color = TextMuted) }
-        }
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Fermer", color = TextMuted) } }
     )
 }
 
 @Composable
-private fun CustomizeSpiritDialog(
-    spirit: SpiritProfile,
-    onDismiss: () -> Unit,
-    onSave: (String, Long) -> Unit
-) {
+private fun FoodPickerDialog(favorite: FoodType, onDismiss: () -> Unit, onSelect: (FoodType) -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CardDark,
+        title = { Text("Lancer une friandise", color = TextMain) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                FoodType.entries.forEach { food ->
+                    val isFav = food == favorite
+                    Surface(shape = RoundedCornerShape(12.dp), color = BgDark, modifier = Modifier.fillMaxWidth().clickable { onSelect(food) }) {
+                        Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column {
+                                Text("${food.emoji} ${food.labelFr}${if (isFav) " ★" else ""}", color = Color(food.colorHex), fontWeight = FontWeight.Bold)
+                                Text("+${food.hungerGain.toInt()} Faim • +${food.xpGain} XP", color = TextMuted, fontSize = 12.sp)
+                            }
+                            Text("Lancer", color = AccentMint, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Fermer", color = TextMuted) } }
+    )
+}
+
+@Composable
+private fun CustomizeSpiritDialog(spirit: SpiritProfile, onDismiss: () -> Unit, onSave: (String, Long) -> Unit) {
     var name by remember { mutableStateOf(spirit.name) }
     var selectedHex by remember { mutableLongStateOf(spirit.customAuraHex) }
-    val palette = listOf(
-        0xFF6EF5A8L, 0xFF66DCFFL, 0xFFFFA552L, 0xFFE3ECFFL,
-        0xFFFF8FB8L, 0xFFC59BFFL, 0xFFFFE57FL, 0xFF80CBC4L
-    )
+    val palette = listOf(0xFF6EF5A8L, 0xFF66DCFFL, 0xFFFFA552L, 0xFFE3ECFFL, 0xFFFF8FB8L, 0xFFC59BFFL, 0xFFFFE57FL, 0xFF80CBC4L)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -788,36 +805,20 @@ private fun CustomizeSpiritDialog(
         title = { Text("Personnaliser ${spirit.element.titleFr}", color = TextMain) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Nom de ton esprit") },
-                    singleLine = true
-                )
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Nom de ton esprit") }, singleLine = true)
                 Text("Couleur de l'aura", color = TextMuted, fontSize = 13.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     palette.forEach { hex ->
                         Box(
-                            modifier = Modifier
-                                .size(30.dp)
-                                .clip(CircleShape)
-                                .background(Color(hex))
-                                .border(
-                                    width = if (selectedHex == hex) 3.dp else 0.dp,
-                                    color = Color.White,
-                                    shape = CircleShape
-                                )
+                            modifier = Modifier.size(30.dp).clip(CircleShape).background(Color(hex))
+                                .border(if (selectedHex == hex) 3.dp else 0.dp, Color.White, CircleShape)
                                 .clickable { selectedHex = hex }
                         )
                     }
                 }
             }
         },
-        confirmButton = {
-            Button(onClick = { onSave(name, selectedHex) }) { Text("Enregistrer") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Annuler", color = TextMuted) }
-        }
+        confirmButton = { Button(onClick = { onSave(name, selectedHex) }) { Text("Enregistrer") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler", color = TextMuted) } }
     )
 }

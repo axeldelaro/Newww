@@ -11,18 +11,25 @@ if [ ! -d "$CACHE_DIR/llama.cpp" ]; then
   git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$CACHE_DIR/llama.cpp"
 fi
 
-if [ ! -f "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" ]; then
-  curl -fSL -o "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" \
-    "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"
-fi
-
 if [ "$TARGET" = "all" ] || [ "$TARGET" = "stepquest" ]; then
+  if [ ! -f "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" ]; then
+    curl -fSL -o "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" \
+      "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"
+  fi
   mkdir -p "$ROOT_DIR/stepquest-companion/app/src/main/assets/models"
+  rm -f "$ROOT_DIR/stepquest-companion/app/src/main/assets/models/"*.gguf
+  cp -fl "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" \
+    "$ROOT_DIR/stepquest-companion/app/src/main/assets/models/gemma-3-1b-it-Q4_K_M.gguf" 2>/dev/null || \
   cp -f "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" \
     "$ROOT_DIR/stepquest-companion/app/src/main/assets/models/gemma-3-1b-it-Q4_K_M.gguf"
 fi
 
 if [ "$TARGET" = "all" ] || [ "$TARGET" = "aura" ]; then
+  if [ ! -f "$CACHE_DIR/Llama-3.2-3B-Instruct-IQ3_M.gguf" ]; then
+    curl -fSL -o "$CACHE_DIR/Llama-3.2-3B-Instruct-IQ3_M.gguf" \
+      "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-IQ3_M.gguf"
+  fi
+
   if [ ! -f "$CACHE_DIR/face_landmarker.task" ]; then
     curl -fSL -o "$CACHE_DIR/face_landmarker.task" \
       "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
@@ -63,14 +70,29 @@ if [ "$TARGET" = "all" ] || [ "$TARGET" = "aura" ]; then
            "$AURA_APP/src/main/assets/voice/tts" \
            "$AURA_APP/src/main/assets/voice/whisper"
 
+  # Remove old v1 Gemma model & old unpacked espeak folder
+  rm -f "$AURA_APP/src/main/assets/models/"*.gguf
+  rm -rf "$AURA_APP/src/main/assets/voice/espeak-ng-data"
+
   cp -f "$CACHE_DIR/sherpa-onnx-2.0.2.aar" "$AURA_APP/libs/sherpa-onnx-2.0.2.aar"
-  cp -f "$CACHE_DIR/gemma-3-1b-it-Q4_K_M.gguf" "$AURA_APP/src/main/assets/models/gemma-3-1b-it-Q4_K_M.gguf"
+  cp -fl "$CACHE_DIR/Llama-3.2-3B-Instruct-IQ3_M.gguf" "$AURA_APP/src/main/assets/models/Llama-3.2-3B-Instruct-IQ3_M.gguf" 2>/dev/null || \
+  cp -f "$CACHE_DIR/Llama-3.2-3B-Instruct-IQ3_M.gguf" "$AURA_APP/src/main/assets/models/Llama-3.2-3B-Instruct-IQ3_M.gguf"
+
   cp -f "$CACHE_DIR/face_landmarker.task" "$AURA_APP/src/main/assets/vision/face_landmarker.task"
   cp -f "$CACHE_DIR/selfie_segmenter.tflite" "$AURA_APP/src/main/assets/vision/selfie_segmenter.tflite"
 
-  rm -rf "$AURA_APP/src/main/assets/voice/espeak-ng-data"
-  cp -r "$CACHE_DIR/extracted/vits-piper-fr_FR-siwis-medium-int8/espeak-ng-data" \
-        "$AURA_APP/src/main/assets/voice/espeak-ng-data"
+  # Package espeak-ng-data as ONE single fast zip (< 5 MB, unzips in ~0.25s on Android!)
+  python3 - "$CACHE_DIR/extracted/vits-piper-fr_FR-siwis-medium-int8/espeak-ng-data" "$AURA_APP/src/main/assets/voice/espeak-ng-data.zip" <<'PY'
+import os, sys, zipfile
+src_dir, out_zip = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    for root, _, files in os.walk(src_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, src_dir)
+            zf.write(full, rel)
+print(f"Packed espeak-ng-data.zip: {os.path.getsize(out_zip)/1024/1024:.2f} MB")
+PY
 
   cp -f "$CACHE_DIR/extracted/vits-piper-fr_FR-siwis-medium-int8/fr_FR-siwis-medium.onnx" \
         "$AURA_APP/src/main/assets/voice/tts/fr_FR-siwis-medium.onnx"
@@ -90,4 +112,4 @@ if [ "$TARGET" = "all" ] || [ "$TARGET" = "aura" ]; then
         "$AURA_APP/src/main/assets/voice/whisper/tiny-tokens.txt"
 fi
 
-echo "Offline AI models ready for target: $TARGET"
+echo "Offline AI models v2 ready for target: $TARGET"

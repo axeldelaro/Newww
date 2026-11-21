@@ -2,27 +2,16 @@ package com.newww.luminaterrarium.engine
 
 import com.newww.luminaterrarium.model.*
 import java.time.Instant
-import java.time.LocalDate
 import java.time.ZoneId
-import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.random.Random
 
-/**
- * Moteur déterministe 100 % hors-ligne gérant :
- * - le cycle circadien selon l'heure réelle,
- * - l'impact de la batterie et de la charge,
- * - la conversion des pas réels en Rosée de marche,
- * - la décroissance bienveillante (l'esprit ne meurt jamais),
- * - les évolutions, quêtes quotidiennes, et dialogues contextuels.
- */
 object TerrariumSimulationEngine {
 
     const val STEPS_PER_DEW = 25
 
     fun currentDayKey(nowMs: Long = System.currentTimeMillis()): String {
-        val date = Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault()).toLocalDate()
-        return date.toString()
+        return Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault()).toLocalDate().toString()
     }
 
     fun currentHour(nowMs: Long = System.currentTimeMillis()): Int {
@@ -45,9 +34,6 @@ object TerrariumSimulationEngine {
         return SpiritMood.CALM
     }
 
-    /**
-     * Met à jour les besoins écoulés entre [TerrariumAppState.lastTickTimestampMs] et [nowMs].
-     */
     fun applyTimeTick(
         state: TerrariumAppState,
         battery: BatterySnapshot,
@@ -90,6 +76,7 @@ object TerrariumSimulationEngine {
                 else -> -1.2f * hours
             }
 
+            val fogGrowth = if (spirit.hydration > 60f) 0.08f * hours else -0.04f * hours
             val autoWake = spirit.isSleeping && dayPhase in listOf(DayPhase.MORNING, DayPhase.AFTERNOON) && spirit.energy > 85f
             val autoSleep = !spirit.isSleeping && dayPhase == DayPhase.NIGHT && spirit.energy < 35f
 
@@ -98,6 +85,7 @@ object TerrariumSimulationEngine {
                 hydration = (spirit.hydration - hydrationDecay).coerceIn(10f, 100f),
                 energy = (spirit.energy + energyDelta).coerceIn(12f, 100f),
                 happiness = (spirit.happiness + happyDelta).coerceIn(18f, 100f),
+                glassFog = (spirit.glassFog + fogGrowth).coerceIn(0f, 0.85f),
                 isSleeping = when {
                     autoWake -> false
                     autoSleep -> true
@@ -148,6 +136,34 @@ object TerrariumSimulationEngine {
         )
     }
 
+    fun wipeGlassFog(
+        state: TerrariumAppState,
+        nowMs: Long = System.currentTimeMillis()
+    ): TerrariumAppState {
+        val spirit = state.activeSpirit
+        if (spirit.glassFog <= 0.03f) return state
+        val nextFog = (spirit.glassFog - 0.35f).coerceAtLeast(0f)
+        val fullyClear = nextFog <= 0.03f
+        val nextXp = spirit.xp + if (fullyClear) 6 else 2
+        val evolved = EvolutionStage.fromXp(nextXp).level > spirit.stage.level
+        val updated = spirit.copy(
+            glassFog = nextFog,
+            happiness = (spirit.happiness + if (fullyClear) 6f else 2f).coerceAtMost(100f),
+            xp = nextXp,
+            lastSpeech = if (fullyClear) "Ooh, la vitre brille de mille feux ! Merci d'avoir essuyé la buée ✨" else spirit.lastSpeech,
+            lastSpeechAtMs = nowMs
+        )
+        val quest = ensureDayQuest(state.dailyQuest, nowMs).let {
+            if (fullyClear) it.copy(wipesCount = it.wipesCount + 1) else it
+        }
+        return commitSpiritUpdate(
+            state = state.copy(dailyQuest = quest, dewCurrency = state.dewCurrency + if (fullyClear) 3 else 0),
+            updated = updated,
+            evolved = evolved,
+            nowMs = nowMs
+        )
+    }
+
     fun tapGlass(
         state: TerrariumAppState,
         battery: BatterySnapshot,
@@ -156,14 +172,14 @@ object TerrariumSimulationEngine {
         val spirit = state.activeSpirit
         val speech = when {
             !battery.isCharging && battery.levelPercent <= 20 ->
-                "Mmmh… *bâille* ta batterie est basse, je garde mes forces…"
+                "Mmmh… ta batterie est basse, je garde mes forces…"
             spirit.isSleeping ->
                 "Zzz… oh ? Toc toc ? Encore cinq minutes…"
             else -> listOf(
-                "Toc toc ! Je t'ai vu derrière la vitre !",
-                "Héhé, ça chatouille les vibrations du bocal !",
-                "Tu veux jouer aux lucioles avec moi ?",
-                "Je suis là ! Regarde comme le bocal brille."
+                "Toc toc ! Je cours vers ton doigt !",
+                "Héhé, les vibrations du verre me chatouillent !",
+                "On fait une partie de Carillon ou de Pluie d'Étoiles ?",
+                "Regarde comme mes décorations brillent !"
             ).random()
         }
         val updated = spirit.copy(
@@ -220,12 +236,13 @@ object TerrariumSimulationEngine {
         val nextXp = spirit.xp + 8
         val evolved = EvolutionStage.fromXp(nextXp).level > spirit.stage.level
         val speech = if (isEmber) {
-            "Pshhh ! Doucement avec l'eau, juste une petite brume pour dépoussiérer !"
+            "Pshhh ! Juste une fine brume fraîche, merci !"
         } else {
-            "Pshhh… ah quelle fraîcheur ! Les gouttelettes scintillent sur le verre !"
+            "Pshhh… ah quelle fraîcheur ! Essuie la buée sur la vitre si tu veux !"
         }
         val updated = spirit.copy(
             hydration = (spirit.hydration + hydrationGain).coerceAtMost(100f),
+            glassFog = (spirit.glassFog + 0.30f).coerceAtMost(0.85f),
             happiness = (spirit.happiness + if (isEmber) 4f else 11f).coerceAtMost(100f),
             affection = (spirit.affection + 2f).coerceAtMost(100f),
             xp = nextXp,
@@ -255,15 +272,26 @@ object TerrariumSimulationEngine {
             clamped < 22f -> "Lumière tamisée… parfait pour se reposer doucement."
             ideal -> "Cette lumière est exactement comme je l'aime ! ✨"
             clamped > 88f && spirit.element != SpiritElement.EMBER -> "Ouh, ça brille fort ici !"
-            else -> "J'ajuste mes pétales à cette belle lueur."
+            else -> "J'ajuste mon aura à cette belle lueur."
         }
         val updated = spirit.copy(
             lightLevel = clamped,
-            happiness = (spirit.happiness + if (ideal) 3f else 0f).coerceAtMost(100f),
+            happiness = (spirit.happiness + if (ideal) 2f else 0f).coerceAtMost(100f),
             lastSpeech = speech,
             lastSpeechAtMs = nowMs
         )
         return state.copy(spirits = state.spirits + (spirit.element to updated))
+    }
+
+    fun setLampTint(state: TerrariumAppState, tint: LampTint): TerrariumAppState {
+        val spirit = state.activeSpirit.copy(lampTint = tint)
+        return state.copy(spirits = state.spirits + (spirit.element to spirit))
+    }
+
+    fun setDecorPosition(state: TerrariumAppState, decorId: String, x: Float, y: Float): TerrariumAppState {
+        val sp = state.activeSpirit
+        val nextPos = sp.decorPositions + (decorId to NormPos(x.coerceIn(0.18f, 0.82f), y.coerceIn(0.24f, 0.82f)))
+        return state.copy(spirits = state.spirits + (sp.element to sp.copy(decorPositions = nextPos)))
     }
 
     fun toggleLullabySleep(
@@ -293,6 +321,7 @@ object TerrariumSimulationEngine {
         nowMs: Long = System.currentTimeMillis()
     ): TerrariumAppState {
         if (stepsDelta <= 0) return state
+        val dayKey = currentDayKey(nowMs)
         val quest = ensureDayQuest(state.dailyQuest, nowMs)
         val previousConvertedUnits = state.totalStepsConverted / STEPS_PER_DEW
         val newTotal = state.totalStepsConverted + stepsDelta
@@ -300,16 +329,20 @@ object TerrariumSimulationEngine {
         val dewEarned = (newUnits - previousConvertedUnits).coerceAtLeast(0)
 
         val spirit = state.activeSpirit
-        val xpGain = dewEarned * 2
+        val xpGain = (dewEarned * 2).coerceAtMost(120)
         val nextXp = spirit.xp + xpGain
         val evolved = EvolutionStage.fromXp(nextXp).level > spirit.stage.level
+
+        val newDaySteps = quest.stepsToday + stepsDelta
+        val nextWeekly = (state.weeklySteps + (dayKey to newDaySteps))
+            .entries.sortedByDescending { it.key }.take(7).associate { it.key to it.value }
 
         val updatedSpirit = if (dewEarned > 0) {
             spirit.copy(
                 xp = nextXp,
-                happiness = (spirit.happiness + (dewEarned * 0.8f)).coerceAtMost(100f),
-                hydration = (spirit.hydration + (dewEarned * 0.5f)).coerceAtMost(100f),
-                lastSpeech = "Tes $stepsDelta pas ont fait perler +$dewEarned Rosée dans mon bocal ! 🌿",
+                happiness = (spirit.happiness + (dewEarned * 0.6f)).coerceAtMost(100f),
+                hydration = (spirit.hydration + (dewEarned * 0.4f)).coerceAtMost(100f),
+                lastSpeech = "Synchro auto : +$stepsDelta pas (+$dewEarned Rosée dans mon bocal) ! 🌿",
                 lastSpeechAtMs = nowMs
             )
         } else {
@@ -320,7 +353,8 @@ object TerrariumSimulationEngine {
             state = state.copy(
                 dewCurrency = state.dewCurrency + dewEarned,
                 totalStepsConverted = newTotal,
-                dailyQuest = quest.copy(stepsToday = quest.stepsToday + stepsDelta)
+                weeklySteps = nextWeekly,
+                dailyQuest = quest.copy(stepsToday = newDaySteps)
             ),
             updated = updatedSpirit,
             evolved = evolved,
@@ -330,39 +364,37 @@ object TerrariumSimulationEngine {
 
     fun completeMiniGame(
         state: TerrariumAppState,
-        caughtOrbs: Int,
+        mode: MiniGameMode,
+        score: Int,
         nowMs: Long = System.currentTimeMillis()
     ): TerrariumAppState {
         val spirit = state.activeSpirit
-        val dewReward = (caughtOrbs * 3).coerceIn(5, 60)
-        val xpGain = (caughtOrbs * 4).coerceIn(10, 80)
+        val dewReward = (score * 4).coerceIn(8, 75)
+        val xpGain = (score * 5).coerceIn(12, 95)
         val nextXp = spirit.xp + xpGain
         val evolved = EvolutionStage.fromXp(nextXp).level > spirit.stage.level
         val updated = spirit.copy(
             happiness = (spirit.happiness + 18f).coerceAtMost(100f),
-            affection = (spirit.affection + 5f).coerceAtMost(100f),
-            energy = (spirit.energy - 6f).coerceAtLeast(15f),
+            affection = (spirit.affection + 5.5f).coerceAtMost(100f),
+            energy = (spirit.energy - 5f).coerceAtLeast(15f),
             xp = nextXp,
             isSleeping = false,
-            lastSpeech = "Bravo !! $caughtOrbs lucioles attrapées (+${dewReward} Rosée) ! ✨",
+            lastSpeech = "Super partie de ${mode.labelFr} ! Score $score (+$dewReward Rosée) ✨",
             lastSpeechAtMs = nowMs
         )
         val quest = ensureDayQuest(state.dailyQuest, nowMs).let {
             it.copy(miniGamesWon = it.miniGamesWon + 1)
         }
         return commitSpiritUpdate(
-            state = state.copy(
-                dewCurrency = state.dewCurrency + dewReward,
-                dailyQuest = quest
-            ),
+            state = state.copy(dewCurrency = state.dewCurrency + dewReward, dailyQuest = quest),
             updated = updated,
             evolved = evolved,
             nowMs = nowMs,
             extraJournal = JournalEntry(
                 timestampMs = nowMs,
-                title = "Chasse aux Lucioles avec ${spirit.name}",
-                detail = "$caughtOrbs lucioles capturées (+$dewReward Rosée, +$xpGain XP).",
-                icon = "✨"
+                title = "${mode.labelFr} avec ${spirit.name}",
+                detail = "Score $score (+$dewReward Rosée, +$xpGain XP).",
+                icon = mode.emoji
             )
         )
     }
@@ -381,7 +413,7 @@ object TerrariumSimulationEngine {
             val updated = spirit.copy(
                 activeDecorIds = nextActive,
                 happiness = (spirit.happiness + 10f).coerceAtMost(100f),
-                lastSpeech = "Oh ! Tu as ajouté « ${decor.labelFr} » dans mon bocal !",
+                lastSpeech = "Oh ! Tu as installé « ${decor.labelFr} » dans mon bocal !",
                 lastSpeechAtMs = nowMs
             )
             return state.copy(
@@ -439,7 +471,7 @@ object TerrariumSimulationEngine {
             dewCurrency = state.dewCurrency + rewardDew,
             dailyQuest = quest.copy(claimedIds = quest.claimedIds + questId),
             journal = (listOf(
-                JournalEntry(nowMs, "Rituel du jour accompli", "+$rewardDew Rosée ajoutée à ta réserve.", "🎁")
+                JournalEntry(nowMs, "Rituel du jour accompli", "+$rewardDew Rosée ajoutée.", "🎁")
             ) + state.journal).take(40)
         )
     }
@@ -464,23 +496,26 @@ object TerrariumSimulationEngine {
         dayPhase: DayPhase
     ): String {
         if (battery.isCharging) {
-            return "Tu recharges le téléphone ? Je sens une douce énergie qui me réchauffe ! ⚡"
+            return "Tu recharges le téléphone ? Une douce énergie dore mon bocal ! ⚡"
         }
         if (battery.levelPercent <= 20) {
-            return "Ta batterie est à ${battery.levelPercent}%… je fais une petite sieste pour économiser nos forces."
+            return "Ta batterie est à ${battery.levelPercent}%… je fais une petite sieste."
+        }
+        if (spirit.glassFog > 0.55f) {
+            return "Il y a plein de buée sur la vitre ! Glisse ton doigt pour l'essuyer 💧"
         }
         if (spirit.hunger < 30f) {
-            return "Mon petit ventre gargouille… tu aurais un peu de ${spirit.element.favoriteFood.labelFr} ?"
+            return "Mon petit ventre gargouille… tu aurais de la ${spirit.element.favoriteFood.labelFr} ?"
         }
         if (spirit.hydration < 30f) {
             return "L'air du bocal est un peu sec, une petite brume me ferait tant de bien 💧"
         }
         return when (dayPhase) {
             DayPhase.DAWN -> "L'aube se lève… bonjour ! Prêt pour une douce journée ensemble ?"
-            DayPhase.MORNING -> "Belle matinée ! Chaque pas que tu fais nourrit mon terrarium."
-            DayPhase.AFTERNOON -> "Coucou ! Une petite pause caresse ou une chasse aux lucioles ?"
+            DayPhase.MORNING -> "Belle matinée ! Tes pas sont comptés automatiquement pour nourrir mon jardin."
+            DayPhase.AFTERNOON -> "Coucou ! On joue aux Lucioles, au Carillon ou à la Pluie d'Étoiles ?"
             DayPhase.DUSK -> "Le ciel vire au doré… j'adore cette lumière du soir dans mon bocal."
-            DayPhase.NIGHT -> "La nuit est calme et étoilée. Baisse un peu la lampe quand tu iras dormir 🌙"
+            DayPhase.NIGHT -> "La nuit est calme et étoilée. Passe la lampe en Clair de Lune quand tu veux 🌙"
         }
     }
 
@@ -492,26 +527,10 @@ object TerrariumSimulationEngine {
             return "Mmmh… tes caresses sont si douces même quand la batterie fatigue…"
         }
         val pool = when (spirit.element) {
-            SpiritElement.MOSS -> listOf(
-                "Hihi, mes petites feuilles frétillent ! 🌿",
-                "Ton doigt est tout chaud, j'adore ça…",
-                "Je ronronne comme la mousse sous la pluie 💚"
-            )
-            SpiritElement.WATER -> listOf(
-                "Bloop bloop ! Ça fait plein de petites bulles joyeuses ! 💧",
-                "Je scintille dès que tu me caresses !",
-                "Douce vague de bonheur dans mon bocal 💙"
-            )
-            SpiritElement.EMBER -> listOf(
-                "Crac-crac ! Mes étincelles dansent de joie ! 🔥",
-                "Chaleur maximale dans mon petit cœur !",
-                "Héhé, attention je pétille quand je suis content !"
-            )
-            SpiritElement.CLOUD -> listOf(
-                "Je flotte encore plus haut quand tu me caresses ☁️",
-                "Doux comme un oreiller d'étoiles… ✨",
-                "Un mini arc-en-ciel rien que pour toi !"
-            )
+            SpiritElement.MOSS -> listOf("Hihi, mes petites feuilles frétillent ! 🌿", "Ton doigt est tout chaud…", "Je ronronne comme la mousse sous la pluie 💚")
+            SpiritElement.WATER -> listOf("Bloop bloop ! Plein de petites bulles joyeuses ! 💧", "Je scintille dès que tu me caresses !", "Douce vague de bonheur 💙")
+            SpiritElement.EMBER -> listOf("Crac-crac ! Mes étincelles dansent de joie ! 🔥", "Chaleur maximale dans mon petit cœur !", "Attention je pétille quand je suis content !")
+            SpiritElement.CLOUD -> listOf("Je flotte encore plus haut quand tu me caresses ☁️", "Doux comme un oreiller d'étoiles… ✨", "Un mini arc-en-ciel rien que pour toi !")
         }
         return pool[Random.nextInt(pool.size)]
     }
@@ -538,14 +557,7 @@ object TerrariumSimulationEngine {
             )
         }
         if (extraJournal != null) entries += extraJournal
-        val nextJournal = if (entries.isNotEmpty()) {
-            (entries + state.journal).take(40)
-        } else {
-            state.journal
-        }
-        return state.copy(
-            spirits = state.spirits + (updated.element to updated),
-            journal = nextJournal
-        )
+        val nextJournal = if (entries.isNotEmpty()) (entries + state.journal).take(40) else state.journal
+        return state.copy(spirits = state.spirits + (updated.element to updated), journal = nextJournal)
     }
 }

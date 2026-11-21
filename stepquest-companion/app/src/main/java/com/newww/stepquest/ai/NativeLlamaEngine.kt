@@ -33,7 +33,7 @@ class NativeLlamaEngine(private val context: Context) {
     private val _prepProgress = MutableStateFlow(0f)
     val prepProgress: StateFlow<Float> = _prepProgress.asStateFlow()
 
-    private val _statusLabel = MutableStateFlow("IA locale prête à démarrer")
+    private val _statusLabel = MutableStateFlow("Préparation de Gemma-3 1B FR…")
     val statusLabel: StateFlow<String> = _statusLabel.asStateFlow()
 
     init {
@@ -54,18 +54,18 @@ class NativeLlamaEngine(private val context: Context) {
 
             val modelFile = prepareBundledModel() ?: run {
                 _status.value = LlmStatus.FALLBACK_ONLY
-                _statusLabel.value = "Modèle hors-ligne indisponible (mode secours)"
+                _statusLabel.value = "Modèle local introuvable"
                 return@withLock false
             }
 
             _status.value = LlmStatus.LOADING_MODEL
-            _statusLabel.value = "Chargement de Gemma-3 1B en mémoire locale…"
+            _statusLabel.value = "Chargement de Gemma-3 1B FR en mémoire locale…"
             val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
             val ok = runCatching { nativeLoadModel(modelFile.absolutePath, threads, 2048) }.getOrDefault(false)
             if (ok) {
                 _status.value = LlmStatus.READY
                 _prepProgress.value = 1f
-                _statusLabel.value = "IA Locale Gemma-3 1B active (100 % hors-ligne)"
+                _statusLabel.value = "IA Locale Gemma-3 1B FR active (100 % hors-ligne)"
             } else {
                 _status.value = LlmStatus.FALLBACK_ONLY
                 _statusLabel.value = "Mode narratif hors-ligne actif"
@@ -77,12 +77,10 @@ class NativeLlamaEngine(private val context: Context) {
     suspend fun generate(
         prompt: String,
         maxTokens: Int = 220,
-        temperature: Float = 0.72f,
+        temperature: Float = 0.65f,
         onToken: (String) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
-        if (_status.value != LlmStatus.READY) {
-            ensureLoaded()
-        }
+        if (_status.value != LlmStatus.READY) ensureLoaded()
         if (_status.value != LlmStatus.READY) return@withContext ""
         mutex.withLock {
             val cb = object : TokenCallback {
@@ -109,22 +107,22 @@ class NativeLlamaEngine(private val context: Context) {
         val target = File(modelDir, MODEL_FILENAME)
         val assetPath = "models/$MODEL_FILENAME"
 
-        val assetSize = runCatching {
-            context.assets.openFd(assetPath).use { it.length }
-        }.getOrDefault(-1L)
-
+        val assetSize = runCatching { context.assets.openFd(assetPath).use { it.length } }.getOrDefault(-1L)
         if (target.exists() && (assetSize <= 0L || target.length() == assetSize) && target.length() > 10_000_000L) {
             _prepProgress.value = 1f
             return target
         }
 
+        // Nettoie d'éventuels anciens modèles v1
+        modelDir.listFiles()?.filter { it.name.endsWith(".gguf") && it.name != MODEL_FILENAME }?.forEach { it.delete() }
+
         _status.value = LlmStatus.PREPARING_ASSETS
-        _statusLabel.value = "Installation unique du cerveau IA intégré (0 Mo téléchargé)…"
+        _statusLabel.value = "Installation unique de Qwen2.5 1.5B intégré (0 Mo téléchargé)…"
         val tmp = File(modelDir, "$MODEL_FILENAME.part")
         return runCatching {
             context.assets.open(assetPath).use { input ->
                 FileOutputStream(tmp).use { output ->
-                    val buffer = ByteArray(1024 * 1024)
+                    val buffer = ByteArray(2 * 1024 * 1024)
                     var copied = 0L
                     while (true) {
                         val read = input.read(buffer)

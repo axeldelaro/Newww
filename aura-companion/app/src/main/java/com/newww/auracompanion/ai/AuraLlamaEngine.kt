@@ -36,7 +36,7 @@ class AuraLlamaEngine(private val context: Context) {
     private val _progress = MutableStateFlow(0f)
     val progress: StateFlow<Float> = _progress.asStateFlow()
 
-    private val _statusMessage = MutableStateFlow("Initialisation IA locale…")
+    private val _statusMessage = MutableStateFlow("Initialisation de Llama-3.2 3B FR…")
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
     suspend fun ensureLoaded(): Boolean = withContext(Dispatchers.IO) {
@@ -44,27 +44,27 @@ class AuraLlamaEngine(private val context: Context) {
             if (_state.value == EngineInitState.READY) return@withLock true
             if (!nativeReady) {
                 _state.value = EngineInitState.FALLBACK
-                _statusMessage.value = "Mode conversationnel léger actif"
+                _statusMessage.value = "Mode léger actif (lib native absente)"
                 return@withLock false
             }
 
             val modelFile = extractAssetModelIfNeeded() ?: run {
                 _state.value = EngineInitState.FALLBACK
-                _statusMessage.value = "Modèle local introuvable (mode secours)"
+                _statusMessage.value = "Modèle local introuvable"
                 return@withLock false
             }
 
             _state.value = EngineInitState.LOADING
-            _statusMessage.value = "Chargement du cerveau Gemma-3 1B en mémoire…"
+            _statusMessage.value = "Chargement du cerveau Llama-3.2 3B FR en mémoire…"
             val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
             val ok = runCatching { nativeLoadModel(modelFile.absolutePath, threads, 2048) }.getOrDefault(false)
             if (ok) {
                 _state.value = EngineInitState.READY
                 _progress.value = 1f
-                _statusMessage.value = "Cerveau IA Gemma-3 1B actif (100 % hors-ligne)"
+                _statusMessage.value = "IA Locale Llama-3.2 3B FR active ✓ (100 % hors-ligne)"
             } else {
                 _state.value = EngineInitState.FALLBACK
-                _statusMessage.value = "Mode conversationnel hors-ligne actif"
+                _statusMessage.value = "Mémoire insuffisante — mode secours actif"
             }
             ok
         }
@@ -73,7 +73,7 @@ class AuraLlamaEngine(private val context: Context) {
     suspend fun generate(
         prompt: String,
         maxTokens: Int = 160,
-        temperature: Float = 0.78f,
+        temperature: Float = 0.65f,
         onToken: (String) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
         if (_state.value != EngineInitState.READY) ensureLoaded()
@@ -102,18 +102,21 @@ class AuraLlamaEngine(private val context: Context) {
         val assetPath = "models/$MODEL_NAME"
 
         val assetSize = runCatching { context.assets.openFd(assetPath).use { it.length } }.getOrDefault(-1L)
-        if (target.exists() && (assetSize <= 0L || target.length() == assetSize) && target.length() > 10_000_000L) {
+        if (target.exists() && (assetSize <= 0L || target.length() == assetSize) && target.length() > 50_000_000L) {
             _progress.value = 1f
             return target
         }
 
+        // Supprime d'éventuels anciens modèles v1 pour libérer l'espace
+        dir.listFiles()?.filter { it.name.endsWith(".gguf") && it.name != MODEL_NAME }?.forEach { it.delete() }
+
         _state.value = EngineInitState.EXTRACTING
-        _statusMessage.value = "Préparation unique du cerveau IA intégré (0 Mo téléchargé)…"
+        _statusMessage.value = "Installation unique du cerveau Llama-3.2 3B intégré (0 Mo téléchargé)…"
         val tmp = File(dir, "$MODEL_NAME.part")
         return runCatching {
             context.assets.open(assetPath).use { input ->
                 FileOutputStream(tmp).use { output ->
-                    val buf = ByteArray(1024 * 1024)
+                    val buf = ByteArray(2 * 1024 * 1024)
                     var copied = 0L
                     while (true) {
                         val n = input.read(buf)
@@ -135,6 +138,6 @@ class AuraLlamaEngine(private val context: Context) {
     }
 
     companion object {
-        const val MODEL_NAME = "gemma-3-1b-it-Q4_K_M.gguf"
+        const val MODEL_NAME = "Llama-3.2-3B-Instruct-IQ3_M.gguf"
     }
 }

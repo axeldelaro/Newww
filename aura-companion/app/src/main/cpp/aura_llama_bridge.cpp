@@ -29,10 +29,7 @@ bool is_valid_utf8_prefix(const std::string& s, size_t& valid_len) {
         else if ((c & 0xE0) == 0xC0) need = 2;
         else if ((c & 0xF0) == 0xE0) need = 3;
         else if ((c & 0xF8) == 0xF0) need = 4;
-        else {
-            i++;
-            continue;
-        }
+        else { i++; continue; }
         if (i + need > n) break;
         i += need;
     }
@@ -41,24 +38,14 @@ bool is_valid_utf8_prefix(const std::string& s, size_t& valid_len) {
 }
 
 void unload_locked() {
-    if (g_ctx) {
-        llama_free(g_ctx);
-        g_ctx = nullptr;
-    }
-    if (g_model) {
-        llama_model_free(g_model);
-        g_model = nullptr;
-    }
+    if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
 }
 } // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeLoadModel(
-        JNIEnv* env,
-        jobject /* thiz */,
-        jstring modelPath,
-        jint nThreads,
-        jint nCtx) {
+        JNIEnv* env, jobject, jstring modelPath, jint nThreads, jint nCtx) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const char* pathStr = env->GetStringUTFChars(modelPath, nullptr);
     if (!pathStr) return JNI_FALSE;
@@ -66,7 +53,6 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeLoadModel(
     env->ReleaseStringUTFChars(modelPath, pathStr);
 
     unload_locked();
-
     if (!g_backend_initialized) {
         llama_backend_init();
         g_backend_initialized = true;
@@ -94,21 +80,17 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeLoadModel(
         return JNI_FALSE;
     }
 
-    LOGI("Aura loaded model %s (ctx=%d, threads=%d)", path.c_str(), cparams.n_ctx, cparams.n_threads);
+    LOGI("Aura loaded 3B model %s (ctx=%d, threads=%d)", path.c_str(), cparams.n_ctx, cparams.n_threads);
     return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeStop(
-        JNIEnv* /* env */,
-        jobject /* thiz */) {
+Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeStop(JNIEnv*, jobject) {
     g_stop_flag.store(true);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeUnload(
-        JNIEnv* /* env */,
-        jobject /* thiz */) {
+Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeUnload(JNIEnv*, jobject) {
     g_stop_flag.store(true);
     std::lock_guard<std::mutex> lock(g_mutex);
     unload_locked();
@@ -116,15 +98,9 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeUnload(
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeGenerate(
-        JNIEnv* env,
-        jobject /* thiz */,
-        jstring jPrompt,
-        jint maxTokens,
-        jfloat temperature,
-        jobject tokenCallback) {
+        JNIEnv* env, jobject, jstring jPrompt, jint maxTokens, jfloat temperature, jobject tokenCallback) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_stop_flag.store(false);
-
     if (!g_model || !g_ctx) return env->NewStringUTF("");
 
     const char* promptChars = env->GetStringUTFChars(jPrompt, nullptr);
@@ -138,18 +114,19 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeGenerate(
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     const int n_ctx = static_cast<int>(llama_n_ctx(g_ctx));
-    int n_prompt_est = -llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
+    // parse_special=true pour <|begin_of_text|>, <|start_header_id|>, <|eot_id|>; add_special=false car <|begin_of_text|> est déjà dans le prompt
+    int n_prompt_est = -llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, false, true);
     if (n_prompt_est <= 0) return env->NewStringUTF("");
 
     std::vector<llama_token> tokens(n_prompt_est);
     int n_tokens = llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
-                                  tokens.data(), static_cast<int32_t>(tokens.size()), true, true);
+                                  tokens.data(), static_cast<int32_t>(tokens.size()), false, true);
     if (n_tokens <= 0) return env->NewStringUTF("");
     tokens.resize(n_tokens);
 
-    const int max_prompt = n_ctx - 80;
+    const int max_prompt = n_ctx - 96;
     if (static_cast<int>(tokens.size()) > max_prompt && max_prompt > 64) {
-        tokens.erase(tokens.begin(), tokens.end() - max_prompt);
+        tokens.erase(tokens.begin() + 1, tokens.end() - max_prompt + 1);
     }
 
     const int chunk_size = 256;
@@ -163,27 +140,26 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeGenerate(
         }
     }
 
+    // top_k / top_p avant penalties pour un échantillonnage ultra-rapide sur ARM64
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler* sampler = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
-            llama_vocab_n_tokens(vocab), 64, 1.14f, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.92f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0.05f ? temperature : 0.78f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.88f, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+            llama_vocab_n_tokens(vocab), 64, 1.12f, 0.0f, 0.0f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0.05f ? temperature : 0.65f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     jclass cbClass = nullptr;
     jmethodID cbMethod = nullptr;
     if (tokenCallback != nullptr) {
         cbClass = env->GetObjectClass(tokenCallback);
-        if (cbClass) {
-            cbMethod = env->GetMethodID(cbClass, "onToken", "(Ljava/lang/String;)V");
-        }
+        if (cbClass) cbMethod = env->GetMethodID(cbClass, "onToken", "(Ljava/lang/String;)V");
     }
 
     std::string full_output;
     std::string utf8_pending;
-    const int limit = maxTokens > 16 ? maxTokens : 200;
+    const int limit = maxTokens > 16 ? maxTokens : 180;
 
     for (int i = 0; i < limit; ++i) {
         if (g_stop_flag.load()) break;
@@ -202,8 +178,12 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeGenerate(
                 utf8_pending.erase(0, valid_len);
                 full_output += emit;
 
-                if (full_output.find("<end_of_turn>") != std::string::npos) {
-                    full_output.erase(full_output.find("<end_of_turn>"));
+                size_t s1 = full_output.find("<|eot_id|>");
+                size_t s2 = full_output.find("<|start_header_id|>");
+                size_t s3 = full_output.find("<end_of_turn>");
+                size_t stopPos = std::min(s1, std::min(s2, s3));
+                if (stopPos != std::string::npos) {
+                    full_output.erase(stopPos);
                     break;
                 }
 
@@ -221,6 +201,5 @@ Java_com_newww_auracompanion_ai_AuraLlamaEngine_nativeGenerate(
 
     if (cbClass) env->DeleteLocalRef(cbClass);
     llama_sampler_free(sampler);
-
     return env->NewStringUTF(full_output.c_str());
 }

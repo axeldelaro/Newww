@@ -88,26 +88,37 @@ enum class EvolutionStage(val level: Int, val labelFr: String, val minXp: Int) {
 }
 
 @Serializable
+enum class LampTint(val labelFr: String, val colorHex: Long) {
+    GOLDEN_SUN("Soleil Doré", 0xFFFFE599),
+    MOON_BLUE("Clair de Lune", 0xFFA6D8FF),
+    AURORA_ROSE("Aurore Rose", 0xFFFF9BD2),
+    FOREST_EMERALD("Lueur Émeraude", 0xFF8EF5BE)
+}
+
+@Serializable
 enum class JarStyle(val labelFr: String, val costDew: Int, val descriptionFr: String) {
-    ROUND_TERRARIUM("Bocal Rond", 0, "Classique en verre soufflé avec bouchon de liège"),
+    ROUND_TERRARIUM("Bocal Rond", 0, "Verre soufflé classique et bouchon de liège gravé"),
     APOTHECARY("Flacon Apothicaire", 40, "Silhouette élancée de laboratoire botanique"),
     LANTERN("Lanterne Céleste", 85, "Cadre doré suspendu à lumière douce"),
-    CRYSTAL_GEODE("Géode Cristalline", 140, "Prisme facetté aux reflets d'aurore")
+    CRYSTAL_GEODE("Géode Cristalline", 140, "Prisme facetté aux reflets d'aurore"),
+    TEARDROP_DOME("Goutte Suspendue", 190, "Bulle aérienne aux reflets irisés"),
+    OBSERVATORY("Dôme Astral", 250, "Coupole d'observatoire sertie de laiton")
 }
 
 @Serializable
 enum class FoodType(
     val labelFr: String,
+    val emoji: String,
     val hungerGain: Float,
     val energyGain: Float,
     val moodGain: Float,
     val xpGain: Int,
     val colorHex: Long
 ) {
-    SWEET_DEW("Rosée Sucrée", 24f, 10f, 10f, 8, 0xFF6AE4FF),
-    LUMINA_BERRY("Baie Lumineuse", 32f, 8f, 12f, 10, 0xFF7CF7A0),
-    SOLAR_CRYSTAL("Cristal Solaire", 28f, 18f, 10f, 12, 0xFFFFB84D),
-    STAR_PETAL("Pétale d'Étoile", 22f, 14f, 20f, 14, 0xFFE59EFF)
+    SWEET_DEW("Rosée Sucrée", "💧", 24f, 10f, 10f, 8, 0xFF6AE4FF),
+    LUMINA_BERRY("Baie Lumineuse", "🫐", 32f, 8f, 12f, 10, 0xFF7CF7A0),
+    SOLAR_CRYSTAL("Cristal Solaire", "✨", 28f, 18f, 10f, 12, 0xFFFFB84D),
+    STAR_PETAL("Pétale d'Étoile", "🌸", 22f, 14f, 20f, 14, 0xFFE59EFF)
 }
 
 @Serializable
@@ -115,21 +126,30 @@ enum class DecorItem(
     val id: String,
     val labelFr: String,
     val costDew: Int,
-    val categoryFr: String
+    val categoryFr: String,
+    val defaultX: Float,
+    val defaultY: Float
 ) {
-    MOSS_STONES("moss_stones", "Galets Mousseux", 0, "Sol"),
-    GLOW_MUSHROOMS("glow_mushrooms", "Champignons Lucioles", 20, "Flore"),
-    FERN_CLUSTER("fern_cluster", "Fougères Douces", 25, "Flore"),
-    WATER_LILY("water_lily", "Nénuphar Blanc", 30, "Eau"),
-    QUARTZ_CRYSTAL("quartz_crystal", "Cristaux de Quartz", 40, "Minéral"),
-    FAIRY_LANTERN("fairy_lantern", "Mini Lanterne", 55, "Lumière"),
-    SEA_SHELL("sea_shell", "Coquillage Nacré", 35, "Eau"),
-    FIREFLIES_NEST("fireflies_nest", "Essaim de Lucioles", 65, "Magie"),
-    BONSAI_TWIG("bonsai_twig", "Branche Bonsaï", 75, "Flore"),
-    MOON_PEBBLE("moon_pebble", "Pierre de Lune", 60, "Minéral"),
-    MINI_TORII("mini_torii", "Portique Zen", 95, "Décor"),
-    STAR_CHIME("star_chime", "Carillon d'Étoiles", 110, "Magie")
+    MOSS_STONES("moss_stones", "Galets Mousseux", 0, "Sol", 0.25f, 0.78f),
+    GLOW_MUSHROOMS("glow_mushrooms", "Champignons Lucioles", 20, "Flore", 0.34f, 0.76f),
+    FERN_CLUSTER("fern_cluster", "Fougères Douces", 25, "Flore", 0.74f, 0.76f),
+    WATER_LILY("water_lily", "Nénuphar Blanc", 30, "Eau", 0.45f, 0.80f),
+    QUARTZ_CRYSTAL("quartz_crystal", "Cristaux de Quartz", 40, "Minéral", 0.80f, 0.77f),
+    FAIRY_LANTERN("fairy_lantern", "Mini Lanterne", 55, "Lumière", 0.28f, 0.30f),
+    SEA_SHELL("sea_shell", "Coquillage Nacré", 35, "Eau", 0.62f, 0.80f),
+    FIREFLIES_NEST("fireflies_nest", "Essaim de Lucioles", 65, "Magie", 0.52f, 0.42f),
+    BONSAI_TWIG("bonsai_twig", "Branche Bonsaï", 75, "Flore", 0.23f, 0.74f),
+    MOON_PEBBLE("moon_pebble", "Pierre de Lune", 60, "Minéral", 0.54f, 0.81f),
+    MINI_TORII("mini_torii", "Portique Zen", 95, "Décor", 0.72f, 0.75f),
+    STAR_CHIME("star_chime", "Carillon d'Étoiles", 110, "Magie", 0.73f, 0.28f),
+    SAKURA_BRANCH("sakura_branch", "Rameau Sakura", 125, "Flore", 0.76f, 0.44f),
+    CRYSTAL_FOUNTAIN("crystal_fountain", "Source Cristalline", 140, "Eau", 0.38f, 0.79f),
+    MINI_CABIN("mini_cabin", "Cabane Fée", 160, "Décor", 0.64f, 0.75f),
+    AURORA_PRISM("aurora_prism", "Prisme d'Aurore", 180, "Magie", 0.50f, 0.26f)
 }
+
+@Serializable
+data class NormPos(val x: Float, val y: Float)
 
 @Serializable
 enum class AmbientSoundscape(val labelFr: String, val subtitleFr: String) {
@@ -171,6 +191,13 @@ enum class DayPhase(val labelFr: String) {
     }
 }
 
+enum class MiniGameMode(val labelFr: String, val emoji: String, val descFr: String) {
+    NONE("", "", ""),
+    FIREFLIES("Chasse aux Lucioles", "✨", "Attrape les lucioles dorées (×2 en combo) !"),
+    STAR_RAIN("Pluie d'Étoiles", "🌠", "Glisse ton doigt pour guider ton esprit sous les étoiles !"),
+    MELODY("Carillon Mémoire", "🎵", "Répète la mélodie lumineuse jouée par ton esprit !")
+}
+
 @Serializable
 data class JournalEntry(
     val timestampMs: Long,
@@ -185,6 +212,7 @@ data class DailyQuestProgress(
     val petsCount: Int = 0,
     val feedsCount: Int = 0,
     val mistsCount: Int = 0,
+    val wipesCount: Int = 0,
     val miniGamesWon: Int = 0,
     val stepsToday: Int = 0,
     val claimedIds: List<String> = emptyList()
@@ -194,19 +222,22 @@ data class DailyQuestProgress(
 data class SpiritProfile(
     val element: SpiritElement,
     val name: String = element.defaultName,
-    val hunger: Float = 84f,       // 0..100 (100 = bien nourri)
-    val hydration: Float = 82f,    // 0..100 (humidité / hydratation)
-    val energy: Float = 88f,       // 0..100
-    val happiness: Float = 86f,    // 0..100
-    val affection: Float = 20f,    // 0..100
-    val lightLevel: Float = 65f,   // 0..100 (contrôlé par l'utilisateur)
+    val hunger: Float = 84f,
+    val hydration: Float = 82f,
+    val energy: Float = 88f,
+    val happiness: Float = 86f,
+    val affection: Float = 20f,
+    val lightLevel: Float = 68f,
+    val lampTint: LampTint = LampTint.GOLDEN_SUN,
+    val glassFog: Float = 0.25f,
     val xp: Int = 0,
     val jarStyle: JarStyle = JarStyle.ROUND_TERRARIUM,
-    val activeDecorIds: List<String> = listOf(DecorItem.MOSS_STONES.id),
+    val activeDecorIds: List<String> = listOf(DecorItem.MOSS_STONES.id, DecorItem.GLOW_MUSHROOMS.id),
+    val decorPositions: Map<String, NormPos> = emptyMap(),
     val customAuraHex: Long = element.primaryColorHex,
     val isSleeping: Boolean = false,
     val adoptedAtMs: Long = System.currentTimeMillis(),
-    val lastSpeech: String = "Bonjour ! Tapote le verre ou caresse-moi doucement.",
+    val lastSpeech: String = "Bonjour ! Caresse-moi, essuie la buée ou lance-moi une friandise !",
     val lastSpeechAtMs: Long = System.currentTimeMillis()
 ) {
     val stage: EvolutionStage get() = EvolutionStage.fromXp(xp)
@@ -221,19 +252,19 @@ data class TerrariumAppState(
         SpiritElement.EMBER to SpiritProfile(SpiritElement.EMBER),
         SpiritElement.CLOUD to SpiritProfile(SpiritElement.CLOUD)
     ),
-    val dewCurrency: Int = 45,
-    val unlockedDecorIds: List<String> = listOf(DecorItem.MOSS_STONES.id),
+    val dewCurrency: Int = 65,
+    val unlockedDecorIds: List<String> = listOf(DecorItem.MOSS_STONES.id, DecorItem.GLOW_MUSHROOMS.id),
     val unlockedJarStyles: List<JarStyle> = listOf(JarStyle.ROUND_TERRARIUM),
     val totalStepsConverted: Int = 0,
-    val lastHardwareStepBaseline: Int = -1,
+    val weeklySteps: Map<String, Int> = emptyMap(),
     val soundscape: AmbientSoundscape = AmbientSoundscape.SILENT,
     val sfxEnabled: Boolean = true,
     val remindersEnabled: Boolean = true,
     val journal: List<JournalEntry> = listOf(
         JournalEntry(
             timestampMs = System.currentTimeMillis(),
-            title = "Bienvenue dans Lumina Terrarium",
-            detail = "Ton premier bocal s'est illuminé. Prends soin de tes esprits au fil de la journée !",
+            title = "Bienvenue dans Lumina Terrarium v2",
+            detail = "Ton bocal s'est illuminé ! Tes pas de la journée sont synchronisés automatiquement.",
             icon = "✨"
         )
     ),
@@ -250,7 +281,13 @@ data class BatterySnapshot(
 )
 
 data class TiltSnapshot(
-    val tiltX: Float = 0f, // -1..1
-    val tiltY: Float = 0f, // -1..1
+    val tiltX: Float = 0f,
+    val tiltY: Float = 0f,
     val shakeIntensity: Float = 0f
+)
+
+data class PedometerHealth(
+    val permissionGranted: Boolean = true,
+    val hasHardwareSensor: Boolean = true,
+    val statusText: String = "Podomètre automatique actif"
 )

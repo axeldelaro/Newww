@@ -25,6 +25,7 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
     private val _state = MutableStateFlow(ExpeditionEngine.ensureDayRollover(repo.load()))
     val state: StateFlow<StepQuestState> = _state.asStateFlow()
 
+    val pedometerStatus: StateFlow<PedometerStatus> = stepTracker.status
     val llmStatus: StateFlow<LlmStatus> = llm.status
     val llmPrepProgress: StateFlow<Float> = llm.prepProgress
     val llmStatusLabel: StateFlow<String> = llm.statusLabel
@@ -35,19 +36,24 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
     private val _streamingDraft = MutableStateFlow("")
     val streamingDraft: StateFlow<String> = _streamingDraft.asStateFlow()
 
+    private val _mapToast = MutableStateFlow("")
+    val mapToast: StateFlow<String> = _mapToast.asStateFlow()
+
     val hasHardwarePedometer: Boolean get() = stepTracker.hasHardwareStepSensor
 
     init {
         ExpeditionReminderWorker.schedule(application)
         stepTracker.start()
-        viewModelScope.launch {
-            llm.ensureLoaded()
-        }
+        viewModelScope.launch { llm.ensureLoaded() }
     }
 
     fun onResume() {
-        stepTracker.start()
+        stepTracker.rebind()
         commit(ExpeditionEngine.ensureDayRollover(_state.value))
+    }
+
+    fun onPermissionResult() {
+        stepTracker.rebind()
     }
 
     fun onPause() {
@@ -63,6 +69,38 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
     fun recordSteps(delta: Int) {
         if (delta <= 0) return
         commit(ExpeditionEngine.advanceSteps(_state.value, delta))
+    }
+
+    fun collectMapTreasure() {
+        val next = ExpeditionEngine.collectMapTreasure(_state.value)
+        commit(next)
+        _mapToast.value = next.events.firstOrNull()?.description ?: "Trésor ramassé !"
+    }
+
+    fun cheerAdventurer() {
+        val s = _state.value
+        commit(s.copy(morale = (s.morale + 5f).coerceAtMost(100f), xp = s.xp + 4))
+        _mapToast.value = "${s.adventurerName} et ${s.familiar.labelFr} te saluent joyeusement ! ✨"
+    }
+
+    fun exploreNearbyEncounter() {
+        commit(ExpeditionEngine.triggerEncounter(_state.value))
+    }
+
+    fun resolveEncounterChoice(choiceIndex: Int) {
+        val next = ExpeditionEngine.resolveEncounterChoice(_state.value, choiceIndex)
+        commit(next)
+        _mapToast.value = next.events.firstOrNull()?.description ?: "Aventure résolue !"
+    }
+
+    fun craftRecipe(recipe: CraftRecipe) {
+        val next = ExpeditionEngine.craftRecipe(_state.value, recipe)
+        commit(next)
+        _mapToast.value = "Fabriqué : ${recipe.labelFr} !"
+    }
+
+    fun claimStepMilestone(targetSteps: Int, rewardCoins: Int) {
+        commit(ExpeditionEngine.claimStepMilestone(_state.value, targetSteps, rewardCoins))
     }
 
     fun toggleGear(gear: GearItem) {
@@ -81,8 +119,8 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
         commit(ExpeditionEngine.restAtCamp(_state.value))
     }
 
-    fun customizeAdventurer(cls: AdventurerClass, name: String, cloakHex: Long) {
-        commit(ExpeditionEngine.selectAdventurer(_state.value, cls, name, cloakHex))
+    fun customizeAdventurer(cls: AdventurerClass, name: String, cloakHex: Long, familiar: FamiliarCompanion) {
+        commit(ExpeditionEngine.selectAdventurer(_state.value, cls, name, cloakHex, familiar))
     }
 
     fun setRemindersEnabled(enabled: Boolean) {
@@ -98,7 +136,7 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             val prompt = ExpeditionEngine.buildLetterPrompt(snapshot)
             val buffer = StringBuilder()
-            val generated = llm.generate(prompt, maxTokens = 260, temperature = 0.78f) { piece ->
+            val generated = llm.generate(prompt, maxTokens = 260, temperature = 0.70f) { piece ->
                 buffer.append(piece)
                 _streamingDraft.value = buffer.toString()
             }
@@ -133,6 +171,7 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
         val text = rawText.trim()
         if (text.isEmpty() || _isGenerating.value) return
 
+        val beforeHistory = _state.value
         val userMsg = CampChatMessage(UUID.randomUUID().toString(), fromUser = true, text = text)
         val updated = _state.value.copy(campChat = (_state.value.campChat + userMsg).takeLast(40))
         commit(updated)
@@ -141,16 +180,16 @@ class StepQuestViewModel(application: Application) : AndroidViewModel(applicatio
         _streamingDraft.value = ""
 
         viewModelScope.launch {
-            val prompt = ExpeditionEngine.buildChatPrompt(updated, text)
+            val prompt = ExpeditionEngine.buildChatPrompt(beforeHistory, text)
             val buffer = StringBuilder()
-            val generated = llm.generate(prompt, maxTokens = 160, temperature = 0.72f) { piece ->
+            val generated = llm.generate(prompt, maxTokens = 160, temperature = 0.62f) { piece ->
                 buffer.append(piece)
                 _streamingDraft.value = buffer.toString()
             }
 
             val biome = ExpeditionEngine.biomeForSteps(updated.totalSteps)
             val replyText = generated.ifBlank {
-                "Merci pour ton message ! Ici près de ${ExpeditionEngine.currentLandmark(updated.totalSteps)} (${biome.nameFr}), tes ${updated.todaySteps} pas m'ont déjà fait parcourir un beau chemin. On continue ensemble !"
+                "Merci pour ton message ! Ici près de ${ExpeditionEngine.currentLandmark(updated.totalSteps)} (${biome.nameFr}), tes ${updated.todaySteps} pas nous ont déjà bien fait avancer."
             }
             val botMsg = CampChatMessage(UUID.randomUUID().toString(), fromUser = false, text = replyText)
             commit(_state.value.copy(campChat = (_state.value.campChat + botMsg).takeLast(40)))
