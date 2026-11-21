@@ -34,10 +34,12 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -89,11 +91,14 @@ import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
 import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
+import com.kinetix.coach.vision.AngleCorrection
 import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseLandmarkerHelper
 import com.kinetix.coach.vision.SkeletonOverlay
+import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 private val REST_PRESETS_SEC = listOf(45, 60, 90, 120)
 
@@ -165,6 +170,33 @@ fun VisionScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // 1-Tap AUTO / FIXE Mode Pill Toggle
+                    Surface(
+                        modifier = Modifier
+                            .height(44.dp)
+                            .clickable { viewModel.toggleAutoDetect() },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (uiState.isAutoDetectEnabled) SignalOrange else ObsidianBg.copy(alpha = 0.90f),
+                        border = BorderStroke(
+                            1.dp,
+                            if (uiState.isAutoDetectEnabled) SignalOrange else BorderHairline
+                        )
+                    ) {
+                        Box(
+                            modifier = Modifier.padding(horizontal = 9.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = if (uiState.isAutoDetectEnabled) "AUTO" else "FIXE",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (uiState.isAutoDetectEnabled) CrispWhite else SteelGray,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.width(6.dp))
+
                     // Exercise Selector Trigger
                     Surface(
                         modifier = Modifier
@@ -174,21 +206,35 @@ fun VisionScreen(
                         color = ObsidianBg.copy(alpha = 0.88f),
                         border = BorderStroke(1.dp, BorderHairline)
                     ) {
+                        val confPct = (uiState.autoDetectConfidence * 100f).roundToInt()
+                        val titleLabel = when {
+                            uiState.isAutoDetectEnabled && confPct >= 55 ->
+                                "AUTO · ${uiState.selectedExercise.labelFr} $confPct%"
+                            uiState.isAutoDetectEnabled ->
+                                "AUTO · ${uiState.selectedExercise.labelFr}"
+                            else -> uiState.selectedExercise.labelFr
+                        }
+                        val subLabel = if (uiState.isAutoDetectEnabled && confPct < 55) {
+                            "${uiState.autoDetectStatusFr} · ${uiState.delegateLabel}"
+                        } else {
+                            "${uiState.selectedExercise.musclesFr} · ${uiState.delegateLabel}"
+                        }
                         Row(
-                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = uiState.selectedExercise.labelFr,
-                                    style = MaterialTheme.typography.titleMedium,
+                                    text = titleLabel,
+                                    style = MaterialTheme.typography.titleSmall,
                                     color = CrispWhite,
+                                    fontWeight = FontWeight.Bold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = "${uiState.selectedExercise.cameraAngleHint} · ${uiState.delegateLabel}",
+                                    text = subLabel,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = SteelGray,
                                     maxLines = 1,
@@ -198,7 +244,8 @@ fun VisionScreen(
                             Icon(
                                 imageVector = Icons.Default.KeyboardArrowDown,
                                 contentDescription = "Changer d'exercice",
-                                tint = SignalOrange
+                                tint = SignalOrange,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
@@ -215,26 +262,26 @@ fun VisionScreen(
                         border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.85f))
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.PlayArrow,
                                 contentDescription = "Voir la démo vidéo",
                                 tint = SignalOrange,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(17.dp)
                             )
-                            Spacer(Modifier.width(3.dp))
+                            Spacer(Modifier.width(2.dp))
                             Text(
                                 text = "Démo",
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = CrispWhite,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
 
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(5.dp))
 
                     // Voice Toggle
                     HudIconButton(
@@ -244,11 +291,11 @@ fun VisionScreen(
                             imageVector = if (uiState.isVoiceEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                             contentDescription = "Coach vocal",
                             tint = if (uiState.isVoiceEnabled) SignalOrange else SteelGray,
-                            modifier = Modifier.size(19.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
 
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(5.dp))
 
                     // Flip Camera
                     HudIconButton(
@@ -258,50 +305,97 @@ fun VisionScreen(
                             imageVector = Icons.Default.Cameraswitch,
                             contentDescription = "Changer de caméra",
                             tint = CrispWhite,
-                            modifier = Modifier.size(19.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
                 }
 
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(7.dp))
 
-                // Live Posture Feedback Strip
-                val statusColor = when (uiState.frame.formQuality) {
-                    FormQuality.GOOD -> FormGood
-                    FormQuality.CAUTION -> FormCaution
-                    FormQuality.FAULT -> FormFault
-                }
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = ObsidianBg.copy(alpha = 0.86f),
-                    border = BorderStroke(1.dp, if (uiState.frame.poseDetected) statusColor else BorderHairline),
-                    modifier = Modifier.fillMaxWidth()
+                // Compact Telemetry Sub-Bar: 3D Viewpoint + Live Calories + Framing Alert (only when needed)
+                val vp = uiState.viewpointInfo
+                val liveTotalKcal = uiState.sessionTotalCaloriesKcal + uiState.currentSetCaloriesKcal
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                    // Camera Angle & 3D Precision Pill
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = ObsidianBg.copy(alpha = 0.86f),
+                        border = BorderStroke(1.dp, if (vp.is3DActive) FormGood.copy(alpha = 0.65f) else BorderHairline)
                     ) {
+                        val modeTag = if (vp.is3DActive) "3D" else "2D"
+                        val vpLabel = if (uiState.frame.poseDetected) {
+                            "$modeTag · ${vp.viewpoint.shortLabelFr} ${vp.azimuthDeg}°"
+                        } else {
+                            "$modeTag · MULTI-ANGLES"
+                        }
                         Text(
-                            text = uiState.errorMessage ?: uiState.frame.feedbackFr,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = CrispWhite,
-                            modifier = Modifier.weight(1f),
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
+                            text = vpLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (vp.is3DActive && uiState.frame.poseDetected) FormGood else SteelGray,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
-                        Spacer(Modifier.width(10.dp))
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = statusColor.copy(alpha = 0.20f),
-                            border = BorderStroke(1.dp, statusColor)
+                    }
+
+                    // Live Profile-Calibrated Calories Pill
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = ObsidianBg.copy(alpha = 0.86f),
+                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "${uiState.frame.formScore}%",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = statusColor,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            Icon(
+                                imageVector = Icons.Filled.LocalFireDepartment,
+                                contentDescription = null,
+                                tint = SignalOrange,
+                                modifier = Modifier.size(13.dp)
                             )
+                            Spacer(Modifier.width(3.dp))
+                            Text(
+                                text = String.format(Locale.US, "%.1f kcal", liveTotalKcal),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    // Framing Alert Chip (only appears if body parts are clipped out of frame)
+                    val framingWarn = vp.framingWarningFr
+                    if (uiState.frame.poseDetected && !framingWarn.isNullOrBlank()) {
+                        Surface(
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(7.dp),
+                            color = ObsidianBg.copy(alpha = 0.90f),
+                            border = BorderStroke(1.dp, FormCaution)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.WarningAmber,
+                                    contentDescription = null,
+                                    tint = FormCaution,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = framingWarn,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = FormCaution,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 }
@@ -319,17 +413,29 @@ fun VisionScreen(
                 }
             }
 
-            // Bottom Telemetry HUD (with Multi-Set & Rest Timer Controls)
-            Surface(
+            // Bottom Stack: Live Precision Angle Correction Banner + Bottom Telemetry HUD
+            Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .padding(12.dp),
-                shape = RoundedCornerShape(12.dp),
-                color = ObsidianBg.copy(alpha = 0.93f),
-                border = BorderStroke(1.dp, BorderHairline)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(modifier = Modifier.padding(13.dp)) {
+                PrecisionCorrectionBanner(
+                    poseDetected = uiState.frame.poseDetected,
+                    formScore = uiState.frame.formScore,
+                    formQuality = uiState.frame.formQuality,
+                    topCorrection = uiState.frame.corrections.firstOrNull(),
+                    fallbackMessage = uiState.errorMessage ?: uiState.frame.feedbackFr
+                )
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = ObsidianBg.copy(alpha = 0.93f),
+                    border = BorderStroke(1.dp, BorderHairline)
+                ) {
+                    Column(modifier = Modifier.padding(13.dp)) {
                     // Multi-Set Header + Rest Preset Chips
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -508,6 +614,7 @@ fun VisionScreen(
                             }
                         }
                     }
+                    }
                 }
             }
         }
@@ -641,6 +748,7 @@ fun VisionScreen(
     uiState.completedSummary?.let { summary ->
         SessionSummarySheet(
             session = summary,
+            breakdown = uiState.completedBreakdown,
             onDismiss = { viewModel.dismissSummaryAndRestart() },
             onAnalyzeWithCoach = {
                 val prompt = viewModel.buildCoachDebriefPrompt(summary)
@@ -648,6 +756,122 @@ fun VisionScreen(
                 onAnalyzeWithCoach(prompt)
             }
         )
+    }
+}
+
+@Composable
+private fun PrecisionCorrectionBanner(
+    poseDetected: Boolean,
+    formScore: Int,
+    formQuality: FormQuality,
+    topCorrection: AngleCorrection?,
+    fallbackMessage: String
+) {
+    val accentColor = when {
+        !poseDetected -> SteelGray
+        topCorrection != null -> when (topCorrection.severity) {
+            FormQuality.FAULT -> FormFault
+            FormQuality.CAUTION -> FormCaution
+            FormQuality.GOOD -> FormGood
+        }
+        else -> when (formQuality) {
+            FormQuality.GOOD -> FormGood
+            FormQuality.CAUTION -> FormCaution
+            FormQuality.FAULT -> FormFault
+        }
+    }
+
+    Surface(
+        shape = RoundedCornerShape(9.dp),
+        color = ObsidianBg.copy(alpha = 0.90f),
+        border = BorderStroke(1.dp, if (poseDetected) accentColor.copy(alpha = 0.85f) else BorderHairline),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            // Swiss Precision vertical status bar
+            Box(
+                modifier = Modifier
+                    .width(4.dp)
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(accentColor)
+            )
+            Spacer(Modifier.width(9.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                if (poseDetected && topCorrection != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = accentColor.copy(alpha = 0.22f),
+                            border = BorderStroke(1.dp, accentColor.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = topCorrection.shortBadgeFr,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = accentColor,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                            )
+                        }
+                        Text(
+                            text = topCorrection.jointLabelFr.uppercase(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SteelGray,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = topCorrection.instructionFr,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CrispWhite,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                } else {
+                    Text(
+                        text = if (poseDetected && formQuality == FormQuality.GOOD) {
+                            "Alignement optimal · Angles validés"
+                        } else {
+                            fallbackMessage
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (poseDetected && formQuality == FormQuality.GOOD) FormGood else CrispWhite,
+                        fontWeight = if (poseDetected && formQuality == FormQuality.GOOD) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(8.dp))
+
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = accentColor.copy(alpha = 0.18f),
+                border = BorderStroke(1.dp, accentColor)
+            ) {
+                Text(
+                    text = "$formScore%",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = accentColor,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                )
+            }
+        }
     }
 }
 
@@ -661,7 +885,7 @@ private fun RestCountdownOverlayPill(
 ) {
     val mins = remainingSec / 60
     val secs = remainingSec % 60
-    val formattedTime = String.format("%02d:%02d", mins, secs)
+    val formattedTime = String.format(Locale.US, "%02d:%02d", mins, secs)
     val progress = if (totalSec > 0) (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f) else 0f
 
     Surface(
@@ -769,7 +993,7 @@ private fun CameraPermissionPrompt(onRequest: () -> Unit) {
         contentAlignment = Alignment.Center
     ) {
         IndustrialCard(modifier = Modifier.fillMaxWidth()) {
-            SectionLabel(text = "VISION BIOMÉCANIQUE HORS-LIGNE")
+            SectionLabel(text = "VISION BIOMÉCANIQUE 3D HORS-LIGNE")
             Spacer(Modifier.height(10.dp))
             Text(
                 text = "Accès caméra requis",
@@ -778,7 +1002,7 @@ private fun CameraPermissionPrompt(onRequest: () -> Unit) {
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "KINETIX Vision analyse vos 33 repères articulaires 100% en local sur votre appareil via MediaPipe. Aucune image n'est enregistrée ni transmise.",
+                text = "KINETIX Vision analyse vos 33 repères articulaires 3D 100% en local sur votre appareil via MediaPipe. Aucune image n'est enregistrée ni transmise.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = SteelGray
             )
@@ -807,7 +1031,9 @@ private fun CameraPoseViewport(
     val landmarkerHelper = remember {
         PoseLandmarkerHelper(
             context = context,
-            onResult = { pts, w, h, ts -> viewModel.onPoseLandmarks(pts, w, h, ts) },
+            onResult = { screenPts, worldPts, w, h, ts ->
+                viewModel.onPoseLandmarks(screenPts, worldPts, w, h, ts)
+            },
             onError = { msg -> viewModel.reportError(msg) }
         )
     }
@@ -875,6 +1101,7 @@ private fun CameraPoseViewport(
 @Composable
 private fun SessionSummarySheet(
     session: WorkoutSession,
+    breakdown: List<ExerciseBreakdownItem>,
     onDismiss: () -> Unit,
     onAnalyzeWithCoach: () -> Unit
 ) {
@@ -890,12 +1117,12 @@ private fun SessionSummarySheet(
                 .padding(bottom = 28.dp)
         ) {
             SectionLabel(
-                text = "BILAN BIOMÉCANIQUE",
+                text = "BILAN BIOMÉCANIQUE 3D",
                 trailing = if (session.notes.isNotBlank()) session.notes.uppercase() else "ENREGISTRÉ"
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = session.exerciseType.labelFr,
+                text = if (breakdown.size > 1) "Séance Multi-Exercices" else session.exerciseType.labelFr,
                 style = MaterialTheme.typography.headlineMedium,
                 color = CrispWhite
             )
@@ -907,9 +1134,16 @@ private fun SessionSummarySheet(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     MetricCell(
-                        label = if (session.exerciseType.isIsometric) "Maintien" else "Répétitions",
-                        value = if (session.exerciseType.isIsometric) "${session.durationSec}" else "${session.reps}",
-                        unit = if (session.exerciseType.isIsometric) "sec" else "reps",
+                        label = if (session.exerciseType.isIsometric && breakdown.size <= 1) "Maintien" else "Reps",
+                        value = if (session.exerciseType.isIsometric && breakdown.size <= 1) "${session.durationSec}" else "${session.reps}",
+                        unit = if (session.exerciseType.isIsometric && breakdown.size <= 1) "s" else "",
+                        modifier = Modifier.weight(1f)
+                    )
+                    MetricCell(
+                        label = "Calories",
+                        value = String.format(Locale.US, "%.1f", session.caloriesKcal),
+                        unit = "kcal",
+                        valueColor = SignalOrange,
                         modifier = Modifier.weight(1f)
                     )
                     MetricCell(
@@ -920,11 +1154,48 @@ private fun SessionSummarySheet(
                         modifier = Modifier.weight(1f)
                     )
                     MetricCell(
-                        label = "ROM Moy.",
+                        label = "ROM",
                         value = "${session.avgRomPct}",
                         unit = "%",
                         modifier = Modifier.weight(1f)
                     )
+                }
+            }
+
+            if (breakdown.size > 1) {
+                Spacer(Modifier.height(10.dp))
+                IndustrialCard(containerColor = ObsidianBg) {
+                    SectionLabel(text = "Exercices auto-détectés", trailing = "${breakdown.size} MOUVEMENTS")
+                    Spacer(Modifier.height(6.dp))
+                    breakdown.forEach { item ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = item.exercise.labelFr,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (item.exercise.isIsometric) "${item.holdSec}s" else "${item.reps} reps",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SteelGray
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = String.format(Locale.US, "%.1f kcal", item.caloriesKcal),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SignalOrange,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
 

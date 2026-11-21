@@ -136,7 +136,8 @@ data class WorkoutSession(
     val avgFormScore: Int,
     val avgRomPct: Int,
     val topFaults: List<String>,
-    val notes: String = ""
+    val notes: String = "",
+    val caloriesKcal: Double = 0.0
 )
 
 data class ChatMessage(

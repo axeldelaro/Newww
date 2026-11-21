@@ -1,20 +1,20 @@
-# Newww — Suite d'Applications Android Haut de Gamme 100 % Hors-Ligne (v1.1.0)
+# Newww — Suite d'Applications Android Haut de Gamme 100 % Hors-Ligne (v1.2.0)
 
 Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + Jetpack Compose + NDK C++`), conçues sans aucun serveur, sans compte, sans abonnement et sans dépendance cloud.
 
 ---
 
-## 1. KINETIX Coach (`kinetix-coach/` — v1.1.0)
-**Coach Sportif Vision IA + Vidéos Biomécaniques + Coach Textuel LLM Local + Base Colossale**
+## 1. KINETIX Coach (`kinetix-coach/` — v1.2.0)
+**Vision Biomécanique 3D Multi-Angles + Détection Auto d'Exercices + Calories + 42 Vidéos + Coach IA Local**
 
 - **Package** : `com.kinetix.coach` (Android 10+ / `arm64-v8a`, 100 % hors-ligne, zéro requête réseau)
-- **42 Vidéos Explicatives Biomécaniques MP4 H.264 Hors-Ligne** (`assets/videos/`, `2,5 Mo`, 30 FPS) :
-  - Couverture **100 %** : 16/16 exercices Vision IA + **911/911 exercices** de l’Encyclopédie.
-  - Silhouettes anatomiques volumétriques, muscles actifs surlignés en orange, matériel (barre/haltères/banc/poulie/kettlebell), angles articulaires dynamiques, phase, tempo et respiration.
-  - Lecteur natif intégré avec **ralenti technique `0.5× / 1.0× / 1.5×`**, décomposition en 4 étapes et checklist *À faire / À éviter* dans **Vision**, **Encyclopédie** et **sources du Coach IA**.
-- **LLM Local Prêt à l’Emploi (intégré dans l’APK)** : `Gemma-3 1B Instruct Q4_K_M` via `llama.cpp` ARM64 (`armv8.2-a+dotprod+fp16`), streaming fluide, rendu Markdown propre, import optionnel de `.gguf` externe.
-- **Base de Connaissances Hors-Ligne Massive (`knowledge_base.db`)** : **2 683 fiches uniques en français** SQLite FTS5 (`~2,6 ms` / requête) + 156 synonymes + filtres par groupe musculaire.
-- **Vision IA & Suivi** : `CameraX` + `MediaPipe Pose Landmarker`, 16 exercices analysés (reps, ROM %, score de forme, coach vocal TTS FR), **minuteur de repos intelligent + multi-séries**, calculateurs **1RM** & **TDEE / Macros**.
+- **Vision Biomécanique 3D Multi-Angles** (`PoseLandmarkerHelper` `worldLandmarks` + `OneEuroFilter` + `CameraViewpointDetector`) :
+  - Mesure les vrais angles articulaires en 3D métrique sous **tous les angles de caméra** (`Face 0°`, `3/4 G/D 45°`, `Profil G/D 90°`, `Dos 180°`), symétrie gauche/droite, valgus 3D et alertes de cadrage.
+  - **Corrections visuelles & vocales au degré près** : arcs rapporteurs colorés aux articulations, ligne fantôme pointillée de la posture cible idéale, flèches directionnelles sur le squelette et consigne chiffrée (`114° → ≤95°`).
+- **Détection Automatique de l’Exercice (`AutoExerciseDetector`)** : identifie en direct l’exercice pratiqué parmi les 16 mouvements (mode `AUTO` / `FIXE` 1-tap, hystérésis anti-clignotement, cumul multi-exercices).
+- **Calories Dépensées en Direct (`CalorieEngine`)** : calcul MET corrigé (Mifflin-St Jeor sur le profil athlète) + travail mécanique ajusté par la ROM % et le tempo, suivi live dans le HUD, historique SQLite v2 et débrief Coach IA.
+- **42 Vidéos Explicatives Biomécaniques MP4 H.264 Hors-Ligne** (`assets/videos/`, `2,5 Mo`, 30 FPS) couvrant **100 % des exercices** (16/16 Vision + **911/911 Encyclopédie**), lecteur natif **ralenti `0.5× / 1.0× / 1.5×`**, minuteur de repos intelligent + multi-séries.
+- **LLM Local Prêt à l’Emploi (intégré dans l’APK)** : `Gemma-3 1B Instruct Q4_K_M` via `llama.cpp` ARM64 + **2 683 fiches uniques** SQLite FTS5 (`~2,6 ms`).
 
 ---
 

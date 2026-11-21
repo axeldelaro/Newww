@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FitnessCenter
+import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -215,6 +216,7 @@ private fun HistoryTabContent(
 ) {
     val totalSessions = sessions.size
     val totalReps = sessions.sumOf { it.reps }
+    val totalKcal = sessions.sumOf { it.caloriesKcal }
     val avgScore = if (sessions.isNotEmpty()) {
         sessions.map { it.avgFormScore }.average().roundToInt()
     } else 0
@@ -235,12 +237,18 @@ private fun HistoryTabContent(
                 ) {
                     MetricCell(label = "Séances", value = "$totalSessions")
                     MetricCell(
-                        label = "Score moyen",
+                        label = "Score",
                         value = if (totalSessions > 0) "$avgScore" else "—",
                         unit = if (totalSessions > 0) "/100" else "",
                         valueColor = if (totalSessions > 0) formScoreColor(avgScore) else SteelGray
                     )
-                    MetricCell(label = "Total reps", value = "$totalReps", valueColor = SignalOrange)
+                    MetricCell(label = "Reps", value = "$totalReps")
+                    MetricCell(
+                        label = "Calories",
+                        value = if (totalKcal >= 100.0) "${totalKcal.roundToInt()}" else String.format(Locale.US, "%.1f", totalKcal),
+                        unit = "kcal",
+                        valueColor = SignalOrange
+                    )
                 }
             }
         }
@@ -412,11 +420,36 @@ private fun SessionHistoryCard(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = dateStr,
+                    text = if (session.notes.isNotBlank()) "$dateStr · ${session.notes}" else dateStr,
                     style = MaterialTheme.typography.labelSmall,
                     color = SteelGray
                 )
             }
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = ElevatedSurface,
+                border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.55f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.LocalFireDepartment,
+                        contentDescription = null,
+                        tint = SignalOrange,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        text = String.format(Locale.US, "%.1f kcal", session.caloriesKcal),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = CrispWhite,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+            Spacer(Modifier.width(4.dp))
             IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
                 Icon(
                     imageVector = Icons.Filled.DeleteOutline,

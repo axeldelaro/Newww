@@ -16,7 +16,13 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 
 class PoseLandmarkerHelper(
     private val context: Context,
-    private val onResult: (points: List<PosePoint>, imageWidth: Int, imageHeight: Int, timestampMs: Long) -> Unit,
+    private val onResult: (
+        screenPoints: List<PosePoint>,
+        worldPoints: List<PosePoint>,
+        imageWidth: Int,
+        imageHeight: Int,
+        timestampMs: Long
+    ) -> Unit,
     private val onError: (String) -> Unit
 ) {
     companion object {
@@ -59,9 +65,9 @@ class PoseLandmarkerHelper(
                 .setMinPosePresenceConfidence(0.50f)
                 .setMinTrackingConfidence(0.50f)
                 .setResultListener { result: PoseLandmarkerResult, input: MPImage ->
-                    val firstPose = result.landmarks().firstOrNull()
-                    if (firstPose != null && firstPose.isNotEmpty()) {
-                        val pts = firstPose.map { lm ->
+                    val firstScreen = result.landmarks().firstOrNull()
+                    if (firstScreen != null && firstScreen.isNotEmpty()) {
+                        val screenPts = firstScreen.map { lm ->
                             PosePoint(
                                 x = lm.x(),
                                 y = lm.y(),
@@ -69,9 +75,22 @@ class PoseLandmarkerHelper(
                                 visibility = lm.visibility().orElse(1f)
                             )
                         }
-                        onResult(pts, input.width, input.height, result.timestampMs())
+                        val firstWorld = result.worldLandmarks().firstOrNull()
+                        val worldPts = if (firstWorld != null && firstWorld.size >= firstScreen.size) {
+                            firstWorld.mapIndexed { idx, wlm ->
+                                PosePoint(
+                                    x = wlm.x(),
+                                    y = wlm.y(),
+                                    z = wlm.z(),
+                                    visibility = wlm.visibility().orElse(screenPts[idx].visibility)
+                                )
+                            }
+                        } else {
+                            emptyList()
+                        }
+                        onResult(screenPts, worldPts, input.width, input.height, result.timestampMs())
                     } else {
-                        onResult(emptyList(), input.width, input.height, result.timestampMs())
+                        onResult(emptyList(), emptyList(), input.width, input.height, result.timestampMs())
                     }
                 }
                 .setErrorListener { err: RuntimeException ->

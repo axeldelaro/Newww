@@ -14,7 +14,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
 
     companion object {
         private const val DB_NAME = "kinetix_user.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
     }
 
     private val _sessions = MutableStateFlow<List<WorkoutSession>>(emptyList())
@@ -42,7 +42,8 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
                 avg_form_score INTEGER NOT NULL,
                 avg_rom_pct INTEGER NOT NULL,
                 top_faults_json TEXT NOT NULL,
-                notes TEXT NOT NULL
+                notes TEXT NOT NULL,
+                calories_kcal REAL NOT NULL DEFAULT 0.0
             )
             """.trimIndent()
         )
@@ -85,7 +86,11 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
         )
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE workout_sessions ADD COLUMN calories_kcal REAL NOT NULL DEFAULT 0.0")
+        }
+    }
 
     fun refreshAll() {
         _sessions.value = loadSessions()
@@ -103,6 +108,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
             put("avg_rom_pct", session.avgRomPct)
             put("top_faults_json", JSONArray(session.topFaults).toString())
             put("notes", session.notes)
+            put("calories_kcal", session.caloriesKcal)
         }
         val id = writableDatabase.insert("workout_sessions", null, cv)
         _sessions.value = loadSessions()
@@ -117,7 +123,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
     private fun loadSessions(): List<WorkoutSession> {
         val list = mutableListOf<WorkoutSession>()
         readableDatabase.rawQuery(
-            "SELECT id, timestamp_ms, exercise_id, reps, duration_sec, avg_form_score, avg_rom_pct, top_faults_json, notes FROM workout_sessions ORDER BY timestamp_ms DESC LIMIT 100",
+            "SELECT id, timestamp_ms, exercise_id, reps, duration_sec, avg_form_score, avg_rom_pct, top_faults_json, notes, calories_kcal FROM workout_sessions ORDER BY timestamp_ms DESC LIMIT 100",
             null
         ).use { c ->
             while (c.moveToNext()) {
@@ -136,7 +142,8 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
                         avgFormScore = c.getInt(5),
                         avgRomPct = c.getInt(6),
                         topFaults = faults,
-                        notes = c.getString(8)
+                        notes = c.getString(8),
+                        caloriesKcal = c.getDouble(9)
                     )
                 )
             }
