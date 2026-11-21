@@ -17,6 +17,7 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,7 +34,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
@@ -48,6 +51,7 @@ import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
@@ -72,6 +76,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size as ComposeSize
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -109,7 +118,8 @@ import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseLandmarkerHelper
 import com.kinetix.coach.vision.SkeletonOverlay
-import com.kinetix.coach.vision.VbtMetrics
+import com.kinetix.coach.vision.VelocityFatigueZone
+import com.kinetix.coach.vision.VelocityTelemetry
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
@@ -652,12 +662,6 @@ fun VisionScreen(
                         }
                     }
 
-                    // Live VBT Telemetry Strip (appears cleanly after Rep 1 on dynamic exercises)
-                    if (!uiState.selectedExercise.isIsometric && uiState.frame.vbt.hasData) {
-                        Spacer(Modifier.height(8.dp))
-                        VbtTelemetryStrip(vbt = uiState.frame.vbt)
-                    }
-
                     Spacer(Modifier.height(10.dp))
 
                     Row(
@@ -776,6 +780,17 @@ fun VisionScreen(
                                 }
                             }
                         }
+                    }
+
+                    // Live VBT Concentric Speed & Estimated Max Reps Telemetry Strip (dynamic exercises)
+                    if (!uiState.selectedExercise.isIsometric && uiState.frame.velocityTelemetry.isSupported) {
+                        Spacer(Modifier.height(9.dp))
+                        HairlineDivider()
+                        Spacer(Modifier.height(8.dp))
+                        VelocityTelemetryStrip(
+                            vbt = uiState.frame.velocityTelemetry,
+                            currentReps = uiState.frame.repCount
+                        )
                     }
                     }
                 }
@@ -981,12 +996,12 @@ fun VisionScreen(
         }
     }
 
-    // Session Summary Bottom Sheet with 1-tap Coach AI Biomechanical Debrief
+    // Session Summary Bottom Sheet with 1-tap Coach AI Biomechanical & VBT Debrief
     uiState.completedSummary?.let { summary ->
         SessionSummarySheet(
             session = summary,
             breakdown = uiState.completedBreakdown,
-            vbt = uiState.completedVbt,
+            velocityTelemetry = uiState.completedVelocityTelemetry,
             onDismiss = { viewModel.dismissSummaryAndRestart() },
             onAnalyzeWithCoach = {
                 val prompt = viewModel.buildCoachDebriefPrompt(summary)
@@ -1007,79 +1022,6 @@ private fun LiveSkeletonOverlayLayer(
         overlayState = overlayState,
         modifier = modifier
     )
-}
-
-@Composable
-private fun VbtTelemetryStrip(vbt: VbtMetrics) {
-    val zoneColor = when {
-        vbt.velocityLossPct >= 40 -> FormFault
-        vbt.velocityLossPct >= 30 -> SignalOrange
-        vbt.velocityLossPct >= 20 -> FormCaution
-        else -> FormGood
-    }
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = ElevatedSurface,
-        border = BorderStroke(1.dp, zoneColor.copy(alpha = 0.45f))
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 9.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Concentric Velocity (m/s)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "VBT",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = SteelGray,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.width(5.dp))
-                Text(
-                    text = String.format(Locale.US, "%.2f m/s", vbt.lastConcentricVelocityMs),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = CrispWhite,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            // Velocity Loss %
-            Text(
-                text = if (vbt.velocityLossPct > 0) "VL -${vbt.velocityLossPct}%" else "PIC",
-                style = MaterialTheme.typography.labelSmall,
-                color = zoneColor,
-                fontWeight = FontWeight.Bold
-            )
-
-            // Estimated RIR Pill
-            Surface(
-                shape = RoundedCornerShape(4.dp),
-                color = zoneColor.copy(alpha = 0.18f),
-                border = BorderStroke(1.dp, zoneColor.copy(alpha = 0.7f))
-            ) {
-                Text(
-                    text = "RIR ${vbt.rirLabel}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = zoneColor,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                )
-            }
-
-            // 3-Phase Tempo (Ecc-Pause-Conc)
-            Text(
-                text = vbt.tempoLabel,
-                style = MaterialTheme.typography.labelSmall,
-                color = SteelGray,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1
-            )
-        }
-    }
 }
 
 @Composable
@@ -1449,12 +1391,197 @@ private fun CameraPoseViewport(
     )
 }
 
+private fun fatigueZoneColor(zone: VelocityFatigueZone): Color = when (zone) {
+    VelocityFatigueZone.CALIBRATING -> SteelGray
+    VelocityFatigueZone.EXPLOSIVE -> FormGood
+    VelocityFatigueZone.OPTIMAL -> SignalOrange
+    VelocityFatigueZone.FATIGUE -> FormCaution
+    VelocityFatigueZone.NEAR_FAILURE -> FormFault
+}
+
+@Composable
+private fun VelocityTelemetryStrip(
+    vbt: VelocityTelemetry,
+    currentReps: Int
+) {
+    val zoneColor = fatigueZoneColor(vbt.fatigueZone)
+    val displaySpeed = if (vbt.lastRepVelocityMps > 0.01f) vbt.lastRepVelocityMps else vbt.currentLiveVelocityMps
+    val speedLabel = if (displaySpeed > 0.01f) String.format(Locale.US, "%.2f m/s", displaySpeed) else "-- m/s"
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // Left: Live concentric velocity + Velocity Loss % + Readiness
+        Column(modifier = Modifier.weight(1.05f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Speed,
+                    contentDescription = "Vitesse concentrique",
+                    tint = zoneColor,
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    text = speedLabel,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = CrispWhite,
+                    fontWeight = FontWeight.Bold
+                )
+                if (vbt.repVelocitiesMps.size >= 2) {
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = zoneColor.copy(alpha = 0.20f),
+                        border = BorderStroke(1.dp, zoneColor.copy(alpha = 0.65f))
+                    ) {
+                        Text(
+                            text = if (vbt.velocityLossPct > 0) "-${vbt.velocityLossPct}%" else "0%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = zoneColor,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            val subText = if (vbt.completedSets.isNotEmpty() && vbt.readinessPct in 50..96) {
+                "Fraîcheur ${vbt.readinessPct}% · ${vbt.fatigueZone.shortLabelFr}"
+            } else {
+                vbt.statusFr
+            }
+            Text(
+                text = subText,
+                style = MaterialTheme.typography.labelSmall,
+                color = SteelGray,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // Center: Live Rep-by-Rep Concentric Velocity Decay Sparkline
+        VelocitySparklineChart(
+            velocities = vbt.repVelocitiesMps,
+            baselineVelocity = maxOf(vbt.sessionFreshBaselineMps, vbt.baselineVelocityMps),
+            modifier = Modifier
+                .width(74.dp)
+                .height(30.dp)
+        )
+
+        // Right: Estimated Max Reps & RIR Precision Pill
+        Surface(
+            shape = RoundedCornerShape(7.dp),
+            color = if (vbt.estimatedMaxReps != null) zoneColor.copy(alpha = 0.16f) else ElevatedSurface,
+            border = BorderStroke(
+                1.dp,
+                if (vbt.estimatedMaxReps != null) zoneColor.copy(alpha = 0.80f) else BorderHairline
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                val estMax = vbt.estimatedMaxReps
+                val rir = vbt.estimatedRir
+                Text(
+                    text = if (estMax != null) "MAX ~$estMax" else "CALIB. $currentReps/3",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (estMax != null) CrispWhite else SteelGray,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = when {
+                        rir != null && rir == 0 -> "ÉCHEC · RPE 10"
+                        rir != null -> "RIR $rir · ${vbt.confidencePct}%"
+                        vbt.estimatedFreshMaxReps != null -> "RÉF. ~${vbt.estimatedFreshMaxReps}"
+                        else -> "VBT ACTIF"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (estMax != null) zoneColor else SteelGray,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VelocitySparklineChart(
+    velocities: List<Float>,
+    baselineVelocity: Float,
+    modifier: Modifier = Modifier
+) {
+    val dashEffect = remember { PathEffect.dashPathEffect(floatArrayOf(6f, 5f), 0f) }
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val padV = 3f
+        val usableH = (h - padV * 2f).coerceAtLeast(4f)
+
+        // Subtle failure threshold reference line (~50% baseline)
+        val failY = h - padV - usableH * 0.48f
+        drawLine(
+            color = FormFault.copy(alpha = 0.42f),
+            start = Offset(0f, failY),
+            end = Offset(w, failY),
+            strokeWidth = 1.4f,
+            pathEffect = dashEffect
+        )
+
+        if (velocities.isEmpty()) {
+            // Subtle baseline slots before first rep
+            val slots = 6
+            val gap = 3f
+            val barW = ((w - gap * (slots - 1)) / slots).coerceAtLeast(3f)
+            for (idx in 0 until slots) {
+                val x = idx * (barW + gap)
+                drawRoundRect(
+                    color = ElevatedSurface,
+                    topLeft = Offset(x, h - padV - 6f),
+                    size = ComposeSize(barW, 6f),
+                    cornerRadius = CornerRadius(2f, 2f)
+                )
+            }
+            return@Canvas
+        }
+
+        val visible = velocities.takeLast(12)
+        val refMax = maxOf(baselineVelocity, visible.maxOrNull() ?: 0.5f, 0.25f)
+        val count = visible.size.coerceAtLeast(4)
+        val gap = 3f
+        val barW = ((w - gap * (count - 1)) / count).coerceAtLeast(3f)
+
+        visible.forEachIndexed { idx, v ->
+            val ratio = (v / refMax).coerceIn(0.14f, 1.0f)
+            val barH = usableH * ratio
+            val x = idx * (barW + gap)
+            val y = h - padV - barH
+            val vl = ((1f - ratio) * 100f)
+            val barColor = when {
+                vl >= 40f -> FormFault
+                vl >= 25f -> FormCaution
+                vl >= 10f -> SignalOrange
+                else -> FormGood
+            }
+            drawRoundRect(
+                color = barColor,
+                topLeft = Offset(x, y),
+                size = ComposeSize(barW, barH),
+                cornerRadius = CornerRadius(2.5f, 2.5f)
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SessionSummarySheet(
     session: WorkoutSession,
     breakdown: List<ExerciseBreakdownItem>,
-    vbt: VbtMetrics,
+    velocityTelemetry: VelocityTelemetry?,
     onDismiss: () -> Unit,
     onAnalyzeWithCoach: () -> Unit
 ) {
@@ -1466,6 +1593,7 @@ private fun SessionSummarySheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 28.dp)
         ) {
@@ -1474,11 +1602,31 @@ private fun SessionSummarySheet(
                 trailing = if (session.notes.isNotBlank()) session.notes.uppercase() else "ENREGISTRÉ"
             )
             Spacer(Modifier.height(6.dp))
-            Text(
-                text = if (breakdown.size > 1) "Séance Multi-Exercices" else session.exerciseType.labelFr,
-                style = MaterialTheme.typography.headlineMedium,
-                color = CrispWhite
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = if (breakdown.size > 1) "Séance Multi-Exercices" else session.exerciseType.labelFr,
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = CrispWhite
+                )
+                if (session.detectedVariant.isNotBlank() && breakdown.size <= 1) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = SignalOrangeDim,
+                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.75f))
+                    ) {
+                        Text(
+                            text = session.detectedVariant,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = SignalOrange,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+            }
             Spacer(Modifier.height(14.dp))
 
             IndustrialCard(containerColor = ObsidianBg) {
@@ -1515,50 +1663,106 @@ private fun SessionSummarySheet(
                 }
             }
 
-            if (vbt.hasData && !session.exerciseType.isIsometric) {
+            // VBT Progressive Velocity & Estimated Max Reps Card
+            val hasVbtData = !session.exerciseType.isIsometric &&
+                (session.peakVelocityMps > 0.05f || session.estimatedMaxReps > 0 ||
+                    (velocityTelemetry != null && (velocityTelemetry.repVelocitiesMps.isNotEmpty() || velocityTelemetry.completedSets.isNotEmpty())))
+            if (hasVbtData) {
                 Spacer(Modifier.height(10.dp))
                 IndustrialCard(containerColor = ObsidianBg) {
                     SectionLabel(
-                        text = "VBT · VITESSE & FATIGUE",
-                        trailing = "${vbt.zoneLabelFr} · ${vbt.tempoLabel}"
+                        text = "Vitesse & Estimation Rep Max (VBT)",
+                        trailing = velocityTelemetry?.fatigueZone?.shortLabelFr ?: "VBT"
                     )
                     Spacer(Modifier.height(8.dp))
-                    val vlColor = when {
-                        vbt.velocityLossPct >= 40 -> FormFault
-                        vbt.velocityLossPct >= 30 -> SignalOrange
-                        vbt.velocityLossPct >= 20 -> FormCaution
-                        else -> FormGood
-                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         MetricCell(
-                            label = "Vitesse moy.",
-                            value = String.format(Locale.US, "%.2f", vbt.meanSetVelocityMs),
+                            label = "Pic vitesse",
+                            value = String.format(Locale.US, "%.2f", session.peakVelocityMps),
                             unit = "m/s",
                             modifier = Modifier.weight(1f)
                         )
                         MetricCell(
-                            label = "Pic",
-                            value = String.format(Locale.US, "%.2f", vbt.bestSetVelocityMs),
-                            unit = "m/s",
-                            modifier = Modifier.weight(1f)
-                        )
-                        MetricCell(
-                            label = "Perte VL",
-                            value = "-${vbt.velocityLossPct}",
+                            label = "Perte vit.",
+                            value = "-${session.velocityLossPct}",
                             unit = "%",
-                            valueColor = vlColor,
+                            valueColor = when {
+                                session.velocityLossPct >= 40 -> FormFault
+                                session.velocityLossPct >= 25 -> FormCaution
+                                else -> FormGood
+                            },
                             modifier = Modifier.weight(1f)
                         )
                         MetricCell(
-                            label = "RIR estimé",
-                            value = vbt.rirLabel,
-                            unit = "",
-                            valueColor = vlColor,
+                            label = "Max estimé",
+                            value = if (session.estimatedMaxReps > 0) "~${session.estimatedMaxReps}" else "--",
+                            unit = if (session.estimatedMaxReps > 0) "reps" else "",
+                            valueColor = SignalOrange,
                             modifier = Modifier.weight(1f)
                         )
+                        val rirVal = velocityTelemetry?.estimatedRir
+                        MetricCell(
+                            label = "RIR fin",
+                            value = rirVal?.toString() ?: "--",
+                            unit = "",
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    if (velocityTelemetry != null && velocityTelemetry.repVelocitiesMps.size >= 2) {
+                        Spacer(Modifier.height(10.dp))
+                        VelocitySparklineChart(
+                            velocities = velocityTelemetry.repVelocitiesMps,
+                            baselineVelocity = maxOf(velocityTelemetry.sessionFreshBaselineMps, velocityTelemetry.baselineVelocityMps),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(42.dp)
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Rep 1", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                            Text("Ligne rouge : seuil échec estimé", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                            Text("Rep ${velocityTelemetry.repVelocitiesMps.size}", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                        }
+                    }
+
+                    if (velocityTelemetry != null && velocityTelemetry.completedSets.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        HairlineDivider()
+                        Spacer(Modifier.height(6.dp))
+                        velocityTelemetry.completedSets.forEach { setSum ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "Série ${setSum.setNumber} · ${setSum.repCount} reps",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = CrispWhite
+                                )
+                                Text(
+                                    text = String.format(
+                                        Locale.US,
+                                        "%.2f→%.2f m/s (-%d%%)%s",
+                                        setSum.baselineVelocityMps,
+                                        setSum.lastVelocityMps,
+                                        setSum.velocityLossPct,
+                                        if (setSum.estimatedMaxReps != null) " · Max ~${setSum.estimatedMaxReps}" else ""
+                                    ),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SignalOrange,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
                     }
                 }
             }

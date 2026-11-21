@@ -137,7 +137,11 @@ data class WorkoutSession(
     val avgRomPct: Int,
     val topFaults: List<String>,
     val notes: String = "",
-    val caloriesKcal: Double = 0.0
+    val caloriesKcal: Double = 0.0,
+    val detectedVariant: String = "",
+    val estimatedMaxReps: Int = 0,
+    val peakVelocityMps: Float = 0f,
+    val velocityLossPct: Int = 0
 )
 
 data class ChallengeRecord(

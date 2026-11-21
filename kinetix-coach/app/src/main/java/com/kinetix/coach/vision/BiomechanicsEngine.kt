@@ -22,10 +22,13 @@ enum class DetectionStrictness(val labelFr: String, val descFr: String) {
 enum class PushupVariant(val labelFr: String) {
     STANDARD("Classique"),
     WIDE("Large"),
+    CLOSE("Serrée"),
     DIAMOND("Diamant"),
     KNEE("Genoux"),
     PIKE("Piquée"),
-    ARCHER("Archer")
+    ARCHER("Archer"),
+    INCLINE("Inclinée"),
+    DECLINE("Déclinée")
 }
 
 data class PosePoint(
@@ -89,15 +92,22 @@ data class BiomechanicsFrame(
     val completedRepDurationSec: Float = 0f,
     val isometricDeltaSec: Float = 0f,
     val detectedVariantFr: String? = null,
+    val detectedVariantId: String? = null,
     val isStabilizing: Boolean = false,
-    val vbt: VbtMetrics = VbtMetrics()
+    val velocityTelemetry: VelocityTelemetry = VelocityTelemetry(),
+    val completedRepVelocityMps: Float = 0f
 )
 
 /**
- * Pure-Kotlin real-time 3D multi-angle biomechanics analyzer for all 16 KINETIX exercises.
- * Uses MediaPipe 33-landmark screen & 3D metric world coordinates with adaptive Casiez One-Euro
- * filtering, viewpoint-invariant 3D joint geometry, multi-signal fused depth tracking,
- * automatic variant recognition, bilateral symmetry checks, degree-exact corrections, and VBT.
+ * Pure-Kotlin real-time 3D multi-angle biomechanics & VBT analyzer for all 16 KINETIX exercises.
+ *
+ * Features:
+ * - Adaptive Casiez One-Euro filtering + physics-based [PoseSanityFilter] & [CameraViewpointTracker]
+ * - Viewpoint-invariant 3D SO(3) joint geometry with height-calibrated 2D fallbacks
+ * - Deadlock-free multi-signal fused depth tracking across all 9 push-up variants & all 16 exercises
+ * - Comprehensive variant classification via [ExerciseVariantDetector] with biomechanical adaptation
+ * - Calm, non-spammy temporal persistence & cooldown coaching via [PostureFeedbackCoach]
+ * - Real-time Velocity-Based Training (VBT) concentric speed & estimated Max Reps / RIR via [VelocityEstimator]
  */
 class BiomechanicsEngine(
     initialExercise: ExerciseType = ExerciseType.SQUAT,
@@ -123,12 +133,13 @@ class BiomechanicsEngine(
         const val LEFT_ANKLE = 27
         const val RIGHT_ANKLE = 28
 
-        private const val SYMMETRY_THRESHOLD_DEG = 13f
-        // 25 ms allows fast touch-and-go explosive push-ups at 25-30 FPS (33-40 ms/frame) while
-        // minRepDurationMs (300 ms live / 180 ms deterministic) still rejects 1-frame spikes.
-        private const val MIN_BOTTOM_DWELL_MS = 25L
+        private const val SYMMETRY_THRESHOLD_DEG = 14f
+        private const val MIN_BOTTOM_DWELL_MS = 55L
+        private const val FAST_TOUCH_BOTTOM_DWELL_MS = 25L
         private const val POSTURE_ABORT_GRACE_FRAMES = 4
         private const val PUSHUP_WINDOW_MS = 4200L
+        private const val DEPTH_STALL_MIN_MS = 480L
+        private const val EARLY_REVERSAL_HINT_MS = 1800L
 
         /** Classic 2D screen-space joint angle in degrees (0..180). */
         fun angleDegrees(a: PosePoint, b: PosePoint, c: PosePoint): Float {
@@ -231,7 +242,6 @@ class BiomechanicsEngine(
          * True 3D frontal-plane medial knee collapse (valgus) angle in degrees, projected onto
          * the athlete's anatomical lateral axis (`pelvisRightAxis` pointing Left Hip -> Right Hip).
          * Positive values indicate inward (medial) knee collapse; <= 0° indicates neutral/outward tracking.
-         * Works accurately from Front, 3/4, and Back camera viewpoints.
          */
         fun frontalKneeValgus3D(
             hip: PosePoint,
@@ -257,9 +267,7 @@ class BiomechanicsEngine(
             val devY = knee.y - expY
             val devZ = knee.z - expZ
 
-            // Signed projection along anatomical Left->Right axis
             val lateralProj = devX * pelvisRightAxis.x + devY * pelvisRightAxis.y + devZ * pelvisRightAxis.z
-            // Medial direction: +axis for left leg (toward right), -axis for right leg (toward left)
             val medialMeters = if (isLeftLeg) lateralProj else -lateralProj
             val halfLeg = (haLen * 0.5f).coerceAtLeast(0.15f)
             return (atan2(medialMeters.toDouble(), halfLeg.toDouble()) * 180.0 / PI).toFloat()
@@ -288,11 +296,15 @@ class BiomechanicsEngine(
     var strictness: DetectionStrictness = initialStrictness
         private set
 
+    var athleteHeightMeters: Float = 1.76f
+
     private val sanityFilter = PoseSanityFilter()
     private val viewpointTracker = CameraViewpointTracker()
-    private val vbtEngine = VbtEngine()
     private val screenSmoother = PoseOneEuroSmoother()
     private val worldSmoother = PoseOneEuroSmoother()
+    private val variantDetector = ExerciseVariantDetector()
+    private val postureCoach = PostureFeedbackCoach()
+    private val velocityEstimator = VelocityEstimator(initialExercise)
     private var legacySmoothedScreen: MutableList<PosePoint>? = null
     private var legacySmoothedWorld: MutableList<PosePoint>? = null
 
@@ -306,7 +318,9 @@ class BiomechanicsEngine(
     private var repCount: Int = 0
     private var phase: MovementPhase = MovementPhase.READY
     private var reachedBottom: Boolean = false
+    private var enteredBottomFromRamp: Boolean = false
     private var bottomEnteredTsMs: Long = 0L
+    private var concentricLeftBottomTsMs: Long = 0L
     private var burpeeStage: Int = 0 // 0=stand, 1=down/plank
     private var burpeeBottomEnteredTsMs: Long = 0L
     private var plankHoldMs: Long = 0L
@@ -315,12 +329,25 @@ class BiomechanicsEngine(
     private var lastMotionGuard: MotionGuardState = MotionGuardState()
     private var postureGateRejectStreak: Int = 0
 
-    // Self-healing multi-signal vertical drop & variant latch trackers
+    // Phase-1 / Phase-2 metric kinematic trackers for accurate concentric VBT measurement
+    private var prevPrimaryPosMeters: Float = Float.NaN
+    private var phase1StartPosMeters: Float = Float.NaN
+    private var phase1EndPosMeters: Float = Float.NaN
+    private var phase1PeakVelMps: Float = 0f
+    private var phase2StartPosMeters: Float = Float.NaN
+    private var phase2PeakVelMps: Float = 0f
+    private var lastActiveLimbLeft: Boolean? = null
+
+    // Anti-spam depth stall & early reversal tracker (prevents nagging while athlete smoothly descends)
+    private var depthStallAnchorMetric: Float = Float.NaN
+    private var depthStallStartTsMs: Long = Long.MIN_VALUE
+    private var earlyReversalHintUntilTsMs: Long = Long.MIN_VALUE
+
+    // Self-healing sliding-window vertical top references (deadlock-free across all camera angles!)
     private val pushupHeightWindow = ArrayDeque<PushupHeightSample>(128)
     private var adaptivePushupTopHeight: Float = 0f
     private var pushupStraightArmStreak: Int = 0
     private var adaptiveDipTopHeight: Float = 0f
-    private var latchedPushupVariant: PushupVariant? = null
 
     // Session metrics accumulators
     private var formScoreSum: Long = 0L
@@ -330,6 +357,7 @@ class BiomechanicsEngine(
     private var romSamples: Int = 0
     private val faultCounts = linkedMapOf<String, Int>()
     private var currentRepFault: String? = null
+    private val variantCounts = linkedMapOf<String, Int>()
 
     val isMidRep: Boolean
         get() = phase == MovementPhase.ECCENTRIC ||
@@ -342,9 +370,10 @@ class BiomechanicsEngine(
     val currentMotionGuard: MotionGuardState
         get() = lastMotionGuard
 
-    fun setAthleteHeightCm(heightCm: Int) {
-        vbtEngine.setAthleteHeightCm(heightCm)
-    }
+    fun currentVelocityTelemetry(): VelocityTelemetry = velocityEstimator.currentTelemetry()
+
+    fun dominantVariantLabel(): String? =
+        variantCounts.entries.maxByOrNull { it.value }?.key
 
     fun setStrictness(mode: DetectionStrictness) {
         strictness = mode
@@ -352,6 +381,7 @@ class BiomechanicsEngine(
 
     fun setExercise(exercise: ExerciseType) {
         currentExercise = exercise
+        velocityEstimator.setExercise(exercise, clearSessionHistory = true)
         resetSession()
     }
 
@@ -361,7 +391,18 @@ class BiomechanicsEngine(
      */
     fun switchExerciseSmoothly(exercise: ExerciseType) {
         currentExercise = exercise
+        velocityEstimator.setExercise(exercise, clearSessionHistory = false)
         resetExerciseCountersOnly()
+    }
+
+    /**
+     * Archives the active set's velocity telemetry and prepares the next set while preserving
+     * cross-set fresh baseline velocity for cumulative fatigue & readiness tracking.
+     */
+    fun completeSet(): SetVelocitySummary? {
+        val summary = velocityEstimator.completeSet()
+        resetExerciseCountersOnly()
+        return summary
     }
 
     /**
@@ -376,12 +417,14 @@ class BiomechanicsEngine(
         legacySmoothedScreen = null
         legacySmoothedWorld = null
         lastFrameTsMs = 0L
+        prevPrimaryPosMeters = Float.NaN
         lastMotionGuard = MotionGuardState()
         postureGateRejectStreak = 0
     }
 
     fun resetSession() {
         resetTrackingFilters()
+        velocityEstimator.resetSession()
         resetExerciseCountersOnly()
     }
 
@@ -389,34 +432,61 @@ class BiomechanicsEngine(
         repCount = 0
         phase = MovementPhase.READY
         reachedBottom = false
+        enteredBottomFromRamp = false
         bottomEnteredTsMs = 0L
+        concentricLeftBottomTsMs = 0L
         burpeeStage = 0
         burpeeBottomEnteredTsMs = 0L
         plankHoldMs = 0L
         repStartTsMs = 0L
         postureGateRejectStreak = 0
+        prevPrimaryPosMeters = Float.NaN
+        phase1StartPosMeters = Float.NaN
+        phase1EndPosMeters = Float.NaN
+        phase1PeakVelMps = 0f
+        phase2StartPosMeters = Float.NaN
+        phase2PeakVelMps = 0f
+        lastActiveLimbLeft = null
+        depthStallAnchorMetric = Float.NaN
+        depthStallStartTsMs = Long.MIN_VALUE
+        earlyReversalHintUntilTsMs = Long.MIN_VALUE
         pushupHeightWindow.clear()
         adaptivePushupTopHeight = 0f
         pushupStraightArmStreak = 0
         adaptiveDipTopHeight = 0f
-        latchedPushupVariant = null
-        vbtEngine.resetSet()
+        variantDetector.reset()
+        postureCoach.reset()
         formScoreSum = 0L
         formScoreSamples = 0
         repRomPeak = 0
         romSum = 0L
         romSamples = 0
         faultCounts.clear()
+        variantCounts.clear()
         currentRepFault = null
     }
 
-    private fun abortIncompleteRepCycle() {
+    private fun abortIncompleteRepCycle(timestampMs: Long = 0L) {
+        // If the athlete genuinely attempted a rep (>= 34% ROM) and reversed early without reaching depth,
+        // briefly allow a calm depth cue instead of spamming during descent!
+        if (!reachedBottom && repRomPeak >= 34 && timestampMs > 0L) {
+            earlyReversalHintUntilTsMs = timestampMs + EARLY_REVERSAL_HINT_MS
+        }
         phase = MovementPhase.READY
         reachedBottom = false
+        enteredBottomFromRamp = false
         bottomEnteredTsMs = 0L
+        concentricLeftBottomTsMs = 0L
         repStartTsMs = 0L
         repRomPeak = 0
         currentRepFault = null
+        phase1StartPosMeters = Float.NaN
+        phase1EndPosMeters = Float.NaN
+        phase1PeakVelMps = 0f
+        phase2StartPosMeters = Float.NaN
+        phase2PeakVelMps = 0f
+        depthStallAnchorMetric = Float.NaN
+        depthStallStartTsMs = Long.MIN_VALUE
     }
 
     fun emptyFrame(): BiomechanicsFrame = BiomechanicsFrame(
@@ -439,7 +509,7 @@ class BiomechanicsEngine(
         viewpointInfo = ViewpointInfo(),
         corrections = emptyList(),
         isStabilizing = false,
-        vbt = vbtEngine.currentMetrics()
+        velocityTelemetry = velocityEstimator.currentTelemetry()
     )
 
     /** Backward-compatible 2D-only entry point. */
@@ -492,7 +562,7 @@ class BiomechanicsEngine(
             abortIncompleteRepCycle()
             burpeeStage = 0
             burpeeBottomEnteredTsMs = 0L
-            postureGateRejectStreak = 0
+            prevPrimaryPosMeters = Float.NaN
             return BiomechanicsFrame(
                 exercise = currentExercise,
                 landmarks = screenPts,
@@ -513,7 +583,7 @@ class BiomechanicsEngine(
                 viewpointInfo = viewpointInfo,
                 corrections = emptyList(),
                 isStabilizing = true,
-                vbt = vbtEngine.currentMetrics()
+                velocityTelemetry = velocityEstimator.currentTelemetry()
             )
         }
 
@@ -523,7 +593,6 @@ class BiomechanicsEngine(
         val useLeft = viewpointInfo.dominantSideLeft
         val bothVisible = viewpointInfo.bothSidesVisible
 
-        // Dominant side indices (for drawing screen-space badges/ghosts on the clearest visible side)
         val shIdx = if (useLeft) LEFT_SHOULDER else RIGHT_SHOULDER
         val elIdx = if (useLeft) LEFT_ELBOW else RIGHT_ELBOW
         val wrIdx = if (useLeft) LEFT_WRIST else RIGHT_WRIST
@@ -531,7 +600,6 @@ class BiomechanicsEngine(
         val knIdx = if (useLeft) LEFT_KNEE else RIGHT_KNEE
         val anIdx = if (useLeft) LEFT_ANKLE else RIGHT_ANKLE
 
-        // Screen landmarks for overlay badges & ghost coordinates
         val shS = screenPts[shIdx]
         val elS = screenPts[elIdx]
         val wrS = screenPts[wrIdx]
@@ -539,7 +607,6 @@ class BiomechanicsEngine(
         val knS = screenPts[knIdx]
         val anS = screenPts[anIdx]
 
-        // Joint angle helper dispatching to true 3D or 2D fallback
         fun jointAngle(a: Int, b: Int, c: Int): Float =
             if (use3D) angleDegrees3D(geomPts[a], geomPts[b], geomPts[c])
             else angleDegrees(geomPts[a], geomPts[b], geomPts[c])
@@ -548,7 +615,6 @@ class BiomechanicsEngine(
             if (use3D) bodyLineAlignment3D(geomPts[shI], geomPts[hpI], geomPts[anI])
             else bodyLineAlignmentDegrees(geomPts[shI], geomPts[hpI], geomPts[anI])
 
-        // Independent left & right joint angles (3D when available)
         val leftKnee = jointAngle(LEFT_HIP, LEFT_KNEE, LEFT_ANKLE)
         val rightKnee = jointAngle(RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
         val leftHip = jointAngle(LEFT_SHOULDER, LEFT_HIP, LEFT_KNEE)
@@ -562,7 +628,6 @@ class BiomechanicsEngine(
         val leftAlign = bodyAlign(LEFT_SHOULDER, LEFT_HIP, LEFT_ANKLE)
         val rightAlign = bodyAlign(RIGHT_SHOULDER, RIGHT_HIP, RIGHT_ANKLE)
 
-        // Visibility weights per limb
         val lLegW = minOf(screenPts[LEFT_HIP].visibility, screenPts[LEFT_KNEE].visibility, screenPts[LEFT_ANKLE].visibility)
         val rLegW = minOf(screenPts[RIGHT_HIP].visibility, screenPts[RIGHT_KNEE].visibility, screenPts[RIGHT_ANKLE].visibility)
         val lArmW = minOf(screenPts[LEFT_SHOULDER].visibility, screenPts[LEFT_ELBOW].visibility, screenPts[LEFT_WRIST].visibility)
@@ -624,97 +689,43 @@ class BiomechanicsEngine(
 
         val pelvisAxis = if (use3D) computePelvisRightAxis(worldPts[LEFT_HIP], worldPts[RIGHT_HIP]) else PosePoint(1f, 0f, 0f)
 
-        var score = 100
-        var romPct = 0
-        var feedback = "Posture maîtrisée — continuez."
-        var faultMsg: String? = null
-        var voiceCue: String? = null
-        var repCompletedNow = false
-        var completedRepRom = 0
-        var completedRepDurSec = 0f
-        var isometricDeltaSec = 0f
-        var detectedVariantFr: String? = null
-
-        val isStrict = strictness == DetectionStrictness.STRICT
-
-        val badges = mutableListOf<JointAngleBadge>()
-        val corrections = mutableListOf<AngleCorrection>()
-
-        fun addSymmetryCorrectionIfNeeded(
-            leftDeg: Float,
-            rightDeg: Float,
-            leftW: Float,
-            rightW: Float,
-            active: Boolean,
-            jointLabel: String,
-            leftJointIdx: Int,
-            rightJointIdx: Int
-        ) {
-            if (!bothVisible || !active) return
-            if (leftW < 0.55f || rightW < 0.55f) return
-            val diff = abs(leftDeg - rightDeg)
-            if (diff >= SYMMETRY_THRESHOLD_DEG) {
-                val delta = diff.roundToInt()
-                val offIdx = if (leftDeg > rightDeg) leftJointIdx else rightJointIdx
-                score -= 10
-                val msg = "Équilibrez gauche (${leftDeg.roundToInt()}°) et droite (${rightDeg.roundToInt()}°)"
-                corrections.add(
-                    AngleCorrection(
-                        jointIndex = offIdx,
-                        jointLabelFr = "Symétrie $jointLabel",
-                        currentDeg = delta,
-                        targetMinDeg = 0,
-                        targetMaxDeg = 10,
-                        deltaDeg = delta,
-                        severity = FormQuality.CAUTION,
-                        arrowDx = 0f,
-                        arrowDy = 1f,
-                        shortBadgeFr = "SYMÉTRIE ±$delta°",
-                        instructionFr = msg,
-                        voiceCueFr = "Équilibrez gauche et droite"
-                    )
-                )
-            }
+        // Compute primary-mover metric position (meters, positive = moving against gravity) & live velocity
+        val primaryPosMeters = computePrimaryMoverPositionMeters(
+            exercise = currentExercise,
+            geomPts = geomPts,
+            screenPts = screenPts,
+            use3D = use3D,
+            bothVisible = bothVisible,
+            useLeft = useLeft
+        )
+        val instantSignedVelMps = if (dtMs > 0L && prevPrimaryPosMeters.isFinite()) {
+            val dtSec = (dtMs / 1000f).coerceIn(1f / 240f, 0.25f)
+            ((primaryPosMeters - prevPrimaryPosMeters) / dtSec).coerceIn(-4.0f, 4.0f)
+        } else {
+            0f
         }
+        val instantSpeedMps = abs(instantSignedVelMps)
+        prevPrimaryPosMeters = primaryPosMeters
 
-        // Physical posture sanity gate: prevent out-of-position phantom reps & fault spam
-        // while allowing ALL real-world camera placements (front-floor tilted phone, 3/4, side profile).
-        val postureGateFeedback: String? = when (currentExercise) {
-            ExerciseType.PUSHUP -> {
-                val pushupBodyOk = fullBodyTilt >= 24f || torsoTilt >= 26f || frontFloorHorizontal
-                // Allow chest to descend slightly below wrist perspective line on low floor cameras (-0.12f)
-                val wristsNotOverhead = activeWrSY >= activeShSY - 0.12f
-                if (!pushupBodyOk || !wristsNotOverhead) {
-                    "Mettez-vous en position pompes au sol."
-                } else {
-                    null
-                }
-            }
-            ExerciseType.SQUAT,
-            ExerciseType.LUNGE,
-            ExerciseType.BULGARIAN_SQUAT,
-            ExerciseType.DEADLIFT,
-            ExerciseType.OVERHEAD_PRESS,
-            ExerciseType.BICEP_CURL,
-            ExerciseType.LATERAL_RAISE,
-            ExerciseType.JUMPING_JACK -> {
-                if (fullBodyTilt >= 68f && torsoTilt >= 65f) {
-                    "Redressez-vous debout pour cet exercice."
-                } else {
-                    null
-                }
-            }
-            ExerciseType.GLUTE_BRIDGE,
-            ExerciseType.LEG_RAISE -> {
-                val frontFloorSupine = (torsoVert2DGlobal / shWidth2DGlobal) < 0.85f && midShSAll.y >= 0.48f
-                if (torsoTilt < 32f && !frontFloorSupine) {
-                    "Allongez-vous sur le dos pour cet exercice."
-                } else {
-                    null
-                }
-            }
-            else -> null
-        }
+        // Physical posture sanity gate (viewpoint-safe across Front, 3/4, Profile, Rear, Incline & Decline!)
+        val postureGateFeedback = evaluatePostureGate(
+            exercise = currentExercise,
+            use3D = use3D,
+            bothVisible = bothVisible,
+            useLeft = useLeft,
+            geomPts = geomPts,
+            screenPts = screenPts,
+            torsoTilt = torsoTilt,
+            fullBodyTilt = fullBodyTilt,
+            lArmW = lArmW,
+            rArmW = rArmW,
+            frontFloorHorizontal = frontFloorHorizontal,
+            activeWrSY = activeWrSY,
+            activeShSY = activeShSY,
+            midShSAll = midShSAll,
+            torsoVert2DGlobal = torsoVert2DGlobal,
+            shWidth2DGlobal = shWidth2DGlobal
+        )
 
         if (postureGateFeedback != null) {
             postureGateRejectStreak++
@@ -742,50 +753,189 @@ class BiomechanicsEngine(
                     viewpointInfo = viewpointInfo,
                     corrections = emptyList(),
                     isStabilizing = false,
-                    vbt = vbtEngine.currentMetrics()
+                    velocityTelemetry = velocityEstimator.currentTelemetry()
                 )
             }
         } else {
             postureGateRejectStreak = 0
         }
 
+        // Detect exercise variant across ALL 16 exercises (temporally stabilized in live mode)
+        val variant = variantDetector.detect(
+            VariantKinematicsInput(
+                exercise = currentExercise,
+                phase = phase,
+                use3D = use3D,
+                bothVisible = bothVisible,
+                useLeft = useLeft,
+                screenPts = screenPts,
+                geomPts = geomPts,
+                lArmW = lArmW,
+                rArmW = rArmW,
+                lLegW = lLegW,
+                rLegW = rLegW,
+                leftKnee = leftKnee,
+                rightKnee = rightKnee,
+                kneeAngle = kneeAngle,
+                leftHip = leftHip,
+                rightHip = rightHip,
+                hipAngle = hipAngle,
+                leftElbow = leftElbow,
+                rightElbow = rightElbow,
+                elbowAngle = elbowAngle,
+                leftShoulder = leftShoulder,
+                rightShoulder = rightShoulder,
+                shoulderAngle = shoulderAngle,
+                armFullAngle = armFullAngle,
+                torsoTilt = torsoTilt,
+                fullBodyTilt = fullBodyTilt,
+                bodyLineAlign = bodyLineAlign,
+                verticalSpeedMps = instantSignedVelMps,
+                deterministicPassThrough = isDeterministicPassThrough
+            )
+        )
+        val detectedVariantFr = variant.labelFr
+        variantCounts[detectedVariantFr] = (variantCounts[detectedVariantFr] ?: 0) + 1
+
+        var romPct = 0
+        var baseFeedback = "Posture maîtrisée — continuez."
+        var repVoiceCue: String? = null
+        var repCompletedNow = false
+        var completedRepRom = 0
+        var completedRepDurSec = 0f
+        var completedRepVelMps = 0f
+        var isometricDeltaSec = 0f
+        var plankScoreOverride: Int? = null
+
+        val isStrict = strictness == DetectionStrictness.STRICT
+        val badges = mutableListOf<JointAngleBadge>()
+        val rawIssues = mutableListOf<RawPostureIssue>()
+
+        fun addSymmetryIssueIfNeeded(
+            leftDeg: Float,
+            rightDeg: Float,
+            leftW: Float,
+            rightW: Float,
+            active: Boolean,
+            jointLabel: String,
+            leftJointIdx: Int,
+            rightJointIdx: Int
+        ) {
+            if (variant.exemptsSymmetry || !bothVisible || !active) return
+            if (leftW < 0.55f || rightW < 0.55f) return
+            val diff = abs(leftDeg - rightDeg)
+            if (diff >= SYMMETRY_THRESHOLD_DEG) {
+                val delta = diff.roundToInt()
+                val offIdx = if (leftDeg > rightDeg) leftJointIdx else rightJointIdx
+                val msg = "Équilibrez gauche (${leftDeg.roundToInt()}°) et droite (${rightDeg.roundToInt()}°)"
+                rawIssues.add(
+                    RawPostureIssue(
+                        key = "SYMMETRY_$jointLabel",
+                        correction = AngleCorrection(
+                            jointIndex = offIdx,
+                            jointLabelFr = "Symétrie $jointLabel",
+                            currentDeg = delta,
+                            targetMinDeg = 0,
+                            targetMaxDeg = 10,
+                            deltaDeg = delta,
+                            severity = FormQuality.CAUTION,
+                            arrowDx = 0f,
+                            arrowDy = 1f,
+                            shortBadgeFr = "SYMÉTRIE ±$delta°",
+                            instructionFr = msg,
+                            voiceCueFr = "Équilibrez gauche et droite"
+                        ),
+                        scorePenalty = 10
+                    )
+                )
+            }
+        }
+
+        // Helper: returns true ONLY when depth coaching should be shown (NEVER mid-smooth-descent in live mode!)
+        fun shouldEmitDepthHint(trackedMetric: Float, metricTolerance: Float): Boolean {
+            if (isDeterministicPassThrough) return true
+            if (timestampMs <= earlyReversalHintUntilTsMs) return true
+            if (depthStallAnchorMetric.isNaN() || abs(trackedMetric - depthStallAnchorMetric) > metricTolerance) {
+                depthStallAnchorMetric = trackedMetric
+                depthStallStartTsMs = timestampMs
+                return false
+            }
+            return (timestampMs - depthStallStartTsMs) >= DEPTH_STALL_MIN_MS
+        }
+
+        fun recordCompletedCycle(cycle: CycleResult, activeLeftSide: Boolean? = null) {
+            if (!cycle.completed) return
+            repCompletedNow = true
+            completedRepRom = cycle.completedRom
+            completedRepDurSec = cycle.durationSec
+            val spec = VelocityEstimator.specFor(currentExercise)
+            val concDur = if (spec.isConcentricFirst) cycle.phase1DurationSec else cycle.phase2DurationSec
+            val eccDur = if (spec.isConcentricFirst) cycle.phase2DurationSec else cycle.phase1DurationSec
+            val concDisp = if (spec.isConcentricFirst) cycle.phase1DispMeters else cycle.phase2DispMeters
+            val concPeakV = if (spec.isConcentricFirst) cycle.phase1PeakVelMps else cycle.phase2PeakVelMps
+            val vbt = velocityEstimator.recordRep(
+                concentricDurationSec = concDur,
+                eccentricDurationSec = eccDur,
+                totalDurationSec = cycle.durationSec,
+                measuredDisplacementMeters = concDisp,
+                peakInstantVelocityMps = concPeakV,
+                romPct = cycle.completedRom,
+                timestampMs = timestampMs
+            )
+            completedRepVelMps = vbt.lastRepVelocityMps
+            postureCoach.notifyRepCompleted(timestampMs)
+            variantDetector.onRepCompleted(activeLeftSide)
+        }
+
         when (currentExercise) {
             ExerciseType.SQUAT -> {
-                romPct = mapRange(kneeAngle, 168f, if (isStrict) 82f else 90f)
+                val isPistol = variant.id == "PISTOL"
+                val activeSquatLeft = if (isPistol) (variant.preferredActiveLeft ?: useLeft) else useLeft
+                val activeSquatKnee = if (isPistol) minOf(leftKnee, rightKnee) else kneeAngle
+                val activeKnIdx = if (isPistol) (if (activeSquatLeft) LEFT_KNEE else RIGHT_KNEE) else knIdx
+                val activeHpIdx = if (isPistol) (if (activeSquatLeft) LEFT_HIP else RIGHT_HIP) else hpIdx
+                val activeAnIdx = if (isPistol) (if (activeSquatLeft) LEFT_ANKLE else RIGHT_ANKLE) else anIdx
+                val activeKnS = screenPts[activeKnIdx]
+
+                romPct = mapRange(activeSquatKnee, 168f, if (isStrict) 82f else 90f)
                 var kneeTargetHint: Int? = null
                 var hipTargetHint: Int? = null
 
                 // 1. Torso forward lean check (3D yaw-invariant)
-                if (torsoTilt > 44f) {
-                    val delta = (torsoTilt - 44f).roundToInt().coerceAtLeast(1)
-                    score -= 22
-                    faultMsg = "Redressez la poitrine (buste trop penché)"
-                    hipTargetHint = 40
+                val maxTorsoLean = if (variant.id == "SUMO") 48f else 44f
+                if (torsoTilt > maxTorsoLean) {
+                    val delta = (torsoTilt - maxTorsoLean).roundToInt().coerceAtLeast(1)
+                    hipTargetHint = (maxTorsoLean - 4f).roundToInt()
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 35f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 44,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE +$delta°",
-                            instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤44°)",
-                            voiceCueFr = "Redressez le buste de $delta degrés"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "SQUAT_TORSO",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = maxTorsoLean.roundToInt(),
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE +$delta°",
+                                instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤${maxTorsoLean.roundToInt()}°)",
+                                voiceCueFr = "Redressez le buste"
+                            ),
+                            scorePenalty = 22,
+                            feedbackMsgFr = "Redressez la poitrine (buste trop penché)"
                         )
                     )
                 }
 
                 // 2. Knee valgus check (3D medial collapse projected onto pelvis lateral axis + 2D fallback)
                 var valgusDetected = false
-                if (use3D && bothVisible && kneeAngle < 138f && lLegW >= 0.45f && rLegW >= 0.45f) {
+                if (!isPistol && use3D && bothVisible && activeSquatKnee < 138f && lLegW >= 0.45f && rLegW >= 0.45f) {
                     val lValgus = frontalKneeValgus3D(
                         worldPts[LEFT_HIP], worldPts[LEFT_KNEE], worldPts[LEFT_ANKLE], pelvisAxis, isLeftLeg = true
                     )
@@ -804,29 +954,32 @@ class BiomechanicsEngine(
                         val midX = (screenPts[LEFT_HIP].x + screenPts[RIGHT_HIP].x) * 0.5f
                         val outDx = outwardScreenDirection(kScr.x, aScr.x, midX)
                         val delta = maxValgus.roundToInt()
-                        score -= 38
-                        faultMsg = "Poussez les genoux vers l'extérieur (valgus)"
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = kIdx,
-                                jointLabelFr = "Valgus genou",
-                                currentDeg = delta,
-                                targetMinDeg = 0,
-                                targetMaxDeg = 8,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = outDx,
-                                arrowDy = 0f,
-                                ghostAnchorIndex = hIdx,
-                                ghostTargetX = aScr.x,
-                                ghostTargetY = kScr.y,
-                                shortBadgeFr = "VALGUS $delta°",
-                                instructionFr = "Poussez le genou vers l'extérieur ($delta° de valgus)",
-                                voiceCueFr = "Poussez les genoux vers l'extérieur"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "SQUAT_VALGUS",
+                                correction = AngleCorrection(
+                                    jointIndex = kIdx,
+                                    jointLabelFr = "Valgus genou",
+                                    currentDeg = delta,
+                                    targetMinDeg = 0,
+                                    targetMaxDeg = 8,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = outDx,
+                                    arrowDy = 0f,
+                                    ghostAnchorIndex = hIdx,
+                                    ghostTargetX = aScr.x,
+                                    ghostTargetY = kScr.y,
+                                    shortBadgeFr = "VALGUS $delta°",
+                                    instructionFr = "Poussez le genou vers l'extérieur ($delta° de valgus)",
+                                    voiceCueFr = "Poussez les genoux vers l'extérieur"
+                                ),
+                                scorePenalty = 38,
+                                feedbackMsgFr = "Poussez les genoux vers l'extérieur (valgus)"
                             )
                         )
                     }
-                } else if (!use3D && kneeAngle < 135f) {
+                } else if (!isPistol && !use3D && activeSquatKnee < 135f) {
                     val kneeSpan = abs(screenPts[LEFT_KNEE].x - screenPts[RIGHT_KNEE].x)
                     val ankleSpan = abs(screenPts[LEFT_ANKLE].x - screenPts[RIGHT_ANKLE].x)
                     if (ankleSpan > 0.08f && kneeSpan < ankleSpan * 0.72f) {
@@ -841,31 +994,34 @@ class BiomechanicsEngine(
                         val midX = (screenPts[LEFT_ANKLE].x + screenPts[RIGHT_ANKLE].x) * 0.5f
                         val outDx = outwardScreenDirection(kScr.x, aScr.x, midX)
                         val approxDeg = ((1f - kneeSpan / ankleSpan) * 25f).roundToInt().coerceIn(8, 25)
-                        score -= 38
-                        faultMsg = "Poussez les genoux vers l'extérieur (valgus)"
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = kIdx,
-                                jointLabelFr = "Valgus genou",
-                                currentDeg = approxDeg,
-                                targetMinDeg = 0,
-                                targetMaxDeg = 8,
-                                deltaDeg = approxDeg,
-                                severity = FormQuality.FAULT,
-                                arrowDx = outDx,
-                                arrowDy = 0f,
-                                ghostAnchorIndex = hIdx,
-                                ghostTargetX = aScr.x,
-                                ghostTargetY = kScr.y,
-                                shortBadgeFr = "VALGUS $approxDeg°",
-                                instructionFr = "Poussez les genoux dans l'axe des orteils (valgus)",
-                                voiceCueFr = "Poussez les genoux vers l'extérieur"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "SQUAT_VALGUS",
+                                correction = AngleCorrection(
+                                    jointIndex = kIdx,
+                                    jointLabelFr = "Valgus genou",
+                                    currentDeg = approxDeg,
+                                    targetMinDeg = 0,
+                                    targetMaxDeg = 8,
+                                    deltaDeg = approxDeg,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = outDx,
+                                    arrowDy = 0f,
+                                    ghostAnchorIndex = hIdx,
+                                    ghostTargetX = aScr.x,
+                                    ghostTargetY = kScr.y,
+                                    shortBadgeFr = "VALGUS $approxDeg°",
+                                    instructionFr = "Poussez les genoux dans l'axe des orteils (valgus)",
+                                    voiceCueFr = "Poussez les genoux vers l'extérieur"
+                                ),
+                                scorePenalty = 38,
+                                feedbackMsgFr = "Poussez les genoux vers l'extérieur (valgus)"
                             )
                         )
                     }
                 }
 
-                // 3. Multi-signal cycle update: knee angle + hip-to-knee vertical parallel drop in ADAPTIVE
+                // 3. Multi-signal cycle update: knee angle + hip-to-knee vertical parallel assist in ADAPTIVE
                 val midHipY = if (bothVisible) (geomPts[LEFT_HIP].y + geomPts[RIGHT_HIP].y) * 0.5f else geomPts[hpIdx].y
                 val midKneeY = if (bothVisible) (geomPts[LEFT_KNEE].y + geomPts[RIGHT_KNEE].y) * 0.5f else geomPts[knIdx].y
                 val thighLen = if (use3D) {
@@ -873,8 +1029,8 @@ class BiomechanicsEngine(
                 } else {
                     dist2D(hpS, knS).coerceAtLeast(0.08f)
                 }
-                val hipNearParallel = kneeAngle < 126f && (midKneeY - midHipY) <= thighLen * 0.22f
-                val effectiveSquatMetric = if (!isStrict && hipNearParallel) minOf(kneeAngle, 104f) else kneeAngle
+                val hipNearParallel = activeSquatKnee < 128f && (midKneeY - midHipY) <= thighLen * 0.24f
+                val effectiveSquatMetric = if (!isStrict && hipNearParallel) minOf(activeSquatKnee, 104f) else activeSquatKnee
                 if (!isStrict && hipNearParallel && romPct < 88) {
                     romPct = maxOf(romPct, 88)
                 }
@@ -885,67 +1041,66 @@ class BiomechanicsEngine(
                     bottomThreshold = if (isStrict) 98f else 108f,
                     finishThreshold = if (isStrict) 156f else 150f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isPistol) activeSquatLeft else null)
 
-                // 4. Precision depth angle guidance when descending / paused above parallel
-                if (!reachedBottom && kneeAngle in 98.5f..132f && !valgusDetected) {
-                    val delta = (kneeAngle - 95f).roundToInt().coerceAtLeast(1)
-                    score -= 4
+                // 4. Anti-spam depth guidance (fires ONLY on stall / early reversal in live mode!)
+                if (!reachedBottom && activeSquatKnee in 98.5f..132f && !valgusDetected &&
+                    shouldEmitDepthHint(activeSquatKnee, metricTolerance = 3.0f)
+                ) {
+                    val delta = (activeSquatKnee - 95f).roundToInt().coerceAtLeast(1)
                     kneeTargetHint = 95
-                    val (gx, gy) = squatDepthGhost(knS, hpS)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = knIdx,
-                            jointLabelFr = "Genou",
-                            currentDeg = kneeAngle.roundToInt(),
-                            targetMinDeg = 70,
-                            targetMaxDeg = 95,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            ghostAnchorIndex = knIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "GENOU -$delta°",
-                            instructionFr = "Descendez encore $delta° (${kneeAngle.roundToInt()}° → ≤95°)",
-                            voiceCueFr = "Descendez encore $delta degrés"
+                    val (gx, gy) = squatDepthGhost(activeKnS, hpS)
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "SQUAT_DEPTH",
+                            correction = AngleCorrection(
+                                jointIndex = activeKnIdx,
+                                jointLabelFr = "Genou",
+                                currentDeg = activeSquatKnee.roundToInt(),
+                                targetMinDeg = 70,
+                                targetMaxDeg = 95,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                ghostAnchorIndex = activeKnIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "GENOU -$delta°",
+                                instructionFr = "Descendez encore $delta° (${activeSquatKnee.roundToInt()}° → ≤95°)",
+                                voiceCueFr = "Descendez encore $delta degrés"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                // 5. Bilateral symmetry check
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftKnee, rightKnee, lLegW, rLegW,
-                    active = kneeAngle < 140f,
+                    active = activeSquatKnee < 138f,
                     jointLabel = "genoux",
                     leftJointIdx = LEFT_KNEE,
                     rightJointIdx = RIGHT_KNEE
                 )
 
                 if (repCompletedNow) {
-                    voiceCue = if (completedRepRom < 75) "Descendez un peu plus bas" else "$repCount"
+                    repVoiceCue = if (completedRepRom < 72) "Descendez un peu plus bas" else "$repCount"
                 }
 
-                val kneeBadgeQuality = when {
-                    valgusDetected -> FormQuality.FAULT
-                    kneeTargetHint != null -> FormQuality.CAUTION
-                    else -> scoreToQuality(score)
-                }
                 badges.add(
                     JointAngleBadge(
-                        landmarkIndex = knIdx,
-                        x = knS.x,
-                        y = knS.y,
-                        degrees = kneeAngle.roundToInt(),
-                        quality = kneeBadgeQuality,
-                        parentIndex = hpIdx,
-                        childIndex = anIdx,
+                        landmarkIndex = activeKnIdx,
+                        x = activeKnS.x,
+                        y = activeKnS.y,
+                        degrees = activeSquatKnee.roundToInt(),
+                        quality = if (valgusDetected) FormQuality.FAULT else if (kneeTargetHint != null) FormQuality.CAUTION else FormQuality.GOOD,
+                        parentIndex = activeHpIdx,
+                        childIndex = activeAnIdx,
                         targetRangeText = if (isStrict) "≤95°" else "≤108°",
                         targetDegHint = kneeTargetHint
                     )
@@ -956,28 +1111,29 @@ class BiomechanicsEngine(
                         x = hpS.x,
                         y = hpS.y,
                         degrees = hipAngle.roundToInt(),
-                        quality = if (torsoTilt > 44f) FormQuality.FAULT else FormQuality.GOOD,
+                        quality = if (torsoTilt > maxTorsoLean) FormQuality.FAULT else FormQuality.GOOD,
                         parentIndex = shIdx,
                         childIndex = knIdx,
-                        targetRangeText = "≤44° buste",
+                        targetRangeText = "≤${maxTorsoLean.roundToInt()}° buste",
                         targetDegHint = hipTargetHint
                     )
                 )
-                feedback = faultMsg ?: when (phase) {
-                    MovementPhase.BOTTOM -> if (kneeAngle <= 96f) {
-                        "Profondeur complète (${kneeAngle.roundToInt()}°) — poussez !"
+                baseFeedback = when (phase) {
+                    MovementPhase.BOTTOM -> if (activeSquatKnee <= 96f) {
+                        "Profondeur $detectedVariantFr validée (${activeSquatKnee.roundToInt()}°) — poussez !"
                     } else {
-                        "Parallèle validée (${kneeAngle.roundToInt()}°) — poussez !"
+                        "Parallèle validée (${activeSquatKnee.roundToInt()}°) — poussez !"
                     }
-                    MovementPhase.ECCENTRIC -> corrections.firstOrNull()?.instructionFr ?: "Contrôlez la descente, dos neutre."
-                    MovementPhase.CONCENTRIC -> "Poussez fort dans tout le pied."
-                    else -> "Prêt — descendez genoux dans l'axe."
+                    MovementPhase.ECCENTRIC -> "Squat $detectedVariantFr — contrôlez la descente, dos neutre."
+                    MovementPhase.CONCENTRIC -> "Poussez explosif dans tout le pied !"
+                    else -> "Squat $detectedVariantFr prêt — genoux dans l'axe."
                 }
             }
 
             ExerciseType.PUSHUP -> {
                 // 1. Cross-checked 3D + 2D elbow angles (immune to MediaPipe prone 3D flattening in side profile)
                 val bothArmsVis = lArmW >= 0.40f && rArmW >= 0.40f
+                val bestArmVis = maxOf(lArmW, rArmW)
                 val isProfileView = viewpointInfo.viewpoint == CameraViewpoint.PROFILE_LEFT ||
                     viewpointInfo.viewpoint == CameraViewpoint.PROFILE_RIGHT
 
@@ -996,73 +1152,15 @@ class BiomechanicsEngine(
                 }
                 val effElbowAngle = fuseSide(effLeftElbow, effRightElbow, lArmW, rArmW, useLeft, bothVisible)
                 val minElbow = minOf(effLeftElbow, effRightElbow)
-                val maxElbow = maxOf(effLeftElbow, effRightElbow)
                 val bestElbow = if (bothArmsVis) minElbow else if (lArmW >= rArmW) effLeftElbow else effRightElbow
 
-                // 2. Auto-detect Push-up Variant cleanly across 3D, 2D & tilted front-floor viewpoints
-                val isProneBody = torsoTilt >= 26f || fullBodyTilt >= 24f || frontFloorHorizontal
-                val leftAnkleAboveKnee = screenPts[LEFT_ANKLE].visibility >= 0.35f &&
-                    screenPts[LEFT_KNEE].visibility >= 0.35f &&
-                    geomPts[LEFT_ANKLE].y < geomPts[LEFT_KNEE].y - 0.03f
-                val rightAnkleAboveKnee = screenPts[RIGHT_ANKLE].visibility >= 0.35f &&
-                    screenPts[RIGHT_KNEE].visibility >= 0.35f &&
-                    geomPts[RIGHT_ANKLE].y < geomPts[RIGHT_KNEE].y - 0.03f
-                val ankleLifted = when {
-                    lLegW >= 0.35f && rLegW >= 0.35f -> leftAnkleAboveKnee || rightAnkleAboveKnee
-                    useLeft -> leftAnkleAboveKnee
-                    else -> rightAnkleAboveKnee
-                }
-                val legsVisibleEnoughForKneeCheck = maxOf(lLegW, rLegW) >= 0.42f
-                val isKnee = isProneBody && legsVisibleEnoughForKneeCheck && (ankleLifted || kneeAngle < 125f)
+                val isKnee = variant.usesKneeAlignment
+                val isPike = variant.exemptsHighHip
+                val isArcher = variant.id == "ARCHER"
+                val isWide = variant.id == "WIDE"
+                val isIncline = variant.id == "INCLINE"
 
-                val midWristYGeom = if (bothArmsVis) {
-                    (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
-                } else {
-                    geomPts[wrIdx].y
-                }
-                val midShYGeom = if (bothArmsVis) {
-                    (geomPts[LEFT_SHOULDER].y + geomPts[RIGHT_SHOULDER].y) * 0.5f
-                } else {
-                    geomPts[shIdx].y
-                }
-                val handsNearFloor = midWristYGeom >= midShYGeom - (if (use3D) 0.08f else 0.05f)
-                val isPike = !isKnee && legsVisibleEnoughForKneeCheck && hipAngle < 125f && bodyLineAlign > 205f && handsNearFloor
-
-                val isArcherNow = bothArmsVis && maxElbow > 145f && minElbow < 115f
-                if (isArcherNow) {
-                    latchedPushupVariant = PushupVariant.ARCHER
-                } else if (phase == MovementPhase.READY && maxElbow > 148f && minElbow > 148f) {
-                    latchedPushupVariant = null
-                }
-                val isArcher = isArcherNow || (latchedPushupVariant == PushupVariant.ARCHER && phase != MovementPhase.READY)
-
-                val canMeasureHandSpan = (use3D && lArmW >= 0.35f && rArmW >= 0.35f) ||
-                    (bothVisible && lArmW >= 0.40f && rArmW >= 0.40f)
-                val shWidthPushup = if (use3D) {
-                    dist3D(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]).coerceAtLeast(0.18f)
-                } else {
-                    dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.05f)
-                }
-                val wristSpanPushup = if (use3D) {
-                    dist3D(worldPts[LEFT_WRIST], worldPts[RIGHT_WRIST])
-                } else {
-                    dist2D(screenPts[LEFT_WRIST], screenPts[RIGHT_WRIST])
-                }
-                val wristRatio = if (canMeasureHandSpan) wristSpanPushup / shWidthPushup else 1.0f
-                val isWide = canMeasureHandSpan && wristRatio > 1.55f
-                val isDiamond = canMeasureHandSpan && wristRatio < 0.55f
-
-                val pushupVariant = when {
-                    isPike -> PushupVariant.PIKE
-                    isArcher -> PushupVariant.ARCHER
-                    isKnee -> PushupVariant.KNEE
-                    isWide -> PushupVariant.WIDE
-                    isDiamond -> PushupVariant.DIAMOND
-                    else -> PushupVariant.STANDARD
-                }
-                detectedVariantFr = pushupVariant.labelFr
-
-                // 3. Occlusion- & angle-safe body alignment check (never spams false hip faults on front-floor push-ups!)
+                // 2. Occlusion- & angle-safe alignment check (shoulder-hip-knee for Knee; exempt Pike & occluded front hips)
                 val effectiveAlign = if (isKnee) {
                     val lKneeAlign = bodyAlign(LEFT_SHOULDER, LEFT_HIP, LEFT_KNEE)
                     val rKneeAlign = bodyAlign(RIGHT_SHOULDER, RIGHT_HIP, RIGHT_KNEE)
@@ -1088,85 +1186,94 @@ class BiomechanicsEngine(
                 var hipHint: Int? = null
 
                 if (canJudgeBodyAlign) {
-                    if (effectiveAlign < 155f) {
+                    if (effectiveAlign < 154f) {
                         val delta = (172f - effectiveAlign).roundToInt().coerceAtLeast(1)
-                        score -= 28
-                        faultMsg = "Gainez les abdos : ne creusez pas le bas du dos"
                         hipHint = 175
                         val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = hpIdx,
-                                jointLabelFr = "Hanches",
-                                currentDeg = effectiveAlign.roundToInt(),
-                                targetMinDeg = 160,
-                                targetMaxDeg = 200,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = 0f,
-                                arrowDy = -1f,
-                                ghostAnchorIndex = shIdx,
-                                ghostTargetX = gx,
-                                ghostTargetY = gy,
-                                shortBadgeFr = "HANCHES +$delta°",
-                                instructionFr = "Remontez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 162–198°)",
-                                voiceCueFr = "Gainez les abdos, remontez les hanches"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "PUSHUP_HIP_SAG",
+                                correction = AngleCorrection(
+                                    jointIndex = hpIdx,
+                                    jointLabelFr = "Hanches",
+                                    currentDeg = effectiveAlign.roundToInt(),
+                                    targetMinDeg = 158,
+                                    targetMaxDeg = 202,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = 0f,
+                                    arrowDy = -1f,
+                                    ghostAnchorIndex = shIdx,
+                                    ghostTargetX = gx,
+                                    ghostTargetY = gy,
+                                    shortBadgeFr = "HANCHES +$delta°",
+                                    instructionFr = "Remontez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 160–200°)",
+                                    voiceCueFr = "Gainez les abdos, remontez les hanches"
+                                ),
+                                scorePenalty = 26,
+                                feedbackMsgFr = "Gainez les abdos : ne creusez pas le bas du dos"
                             )
                         )
-                    } else if (effectiveAlign > 205f) {
+                    } else if (effectiveAlign > 206f) {
                         val delta = (effectiveAlign - 188f).roundToInt().coerceAtLeast(1)
-                        score -= 20
-                        faultMsg = "Abaissez légèrement les hanches"
                         hipHint = 180
                         val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = hpIdx,
-                                jointLabelFr = "Hanches",
-                                currentDeg = effectiveAlign.roundToInt(),
-                                targetMinDeg = 160,
-                                targetMaxDeg = 200,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = 0f,
-                                arrowDy = 1f,
-                                ghostAnchorIndex = shIdx,
-                                ghostTargetX = gx,
-                                ghostTargetY = gy,
-                                shortBadgeFr = "HANCHES -$delta°",
-                                instructionFr = "Abaissez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 162–198°)",
-                                voiceCueFr = "Abaissez les hanches pour aligner le corps"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "PUSHUP_HIP_PIKE",
+                                correction = AngleCorrection(
+                                    jointIndex = hpIdx,
+                                    jointLabelFr = "Hanches",
+                                    currentDeg = effectiveAlign.roundToInt(),
+                                    targetMinDeg = 158,
+                                    targetMaxDeg = 202,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = 0f,
+                                    arrowDy = 1f,
+                                    ghostAnchorIndex = shIdx,
+                                    ghostTargetX = gx,
+                                    ghostTargetY = gy,
+                                    shortBadgeFr = "HANCHES -$delta°",
+                                    instructionFr = "Abaissez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 160–200°)",
+                                    voiceCueFr = "Abaissez les hanches pour aligner le corps"
+                                ),
+                                scorePenalty = 20,
+                                feedbackMsgFr = "Abaissez légèrement les hanches"
                             )
                         )
                     }
                 }
 
-                // Elbow flare check (exempt Wide, Pike, and Archer variants where wider abduction is expected)
-                if (!isWide && !isPike && !isArcher && use3D && bothVisible && effElbowAngle < 125f && shoulderAngle > 78f) {
+                // Elbow flare check (exempt Wide, Pike, Archer)
+                if (!variant.exemptsElbowFlare && use3D && bothVisible && effElbowAngle < 122f && shoulderAngle > 80f) {
                     val delta = (shoulderAngle - 55f).roundToInt().coerceAtLeast(1)
-                    score -= 12
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = elIdx,
-                            jointLabelFr = "Coudes",
-                            currentDeg = shoulderAngle.roundToInt(),
-                            targetMinDeg = 35,
-                            targetMaxDeg = 60,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "COUDES -$delta°",
-                            instructionFr = "Rentrez les coudes vers les côtes (${shoulderAngle.roundToInt()}° → ~45°)",
-                            voiceCueFr = "Rentrez les coudes à 45 degrés"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "PUSHUP_FLARE",
+                            correction = AngleCorrection(
+                                jointIndex = elIdx,
+                                jointLabelFr = "Coudes",
+                                currentDeg = shoulderAngle.roundToInt(),
+                                targetMinDeg = 35,
+                                targetMaxDeg = 60,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "COUDES -$delta°",
+                                instructionFr = "Rentrez les coudes vers les côtes (${shoulderAngle.roundToInt()}° → ~45°)",
+                                voiceCueFr = "Rentrez les coudes à 45 degrés"
+                            ),
+                            scorePenalty = 12
                         )
                     )
                 }
 
-                // 4. Bulletproof 3-Signal Fused Push-Up Depth (Zero Lockup, All Angles, All Variants):
+                // 3. Bulletproof 3-Signal Fused Push-Up Depth Engine (Zero Lockup, All Angles, All 9 Variants):
                 //    Signal A: Active Elbow Flexion (3D + 2D profile cross-check)
                 //    Signal B: Camera-Tilt-Invariant 3D Arm Chord Compression (self-normalized, zero calibration)
-                //    Signal C: Sliding-Window Screen Vertical Chest+Head Drop (works even with occluded elbows on floor)
+                //    Signal C: Sliding-Window Screen Vertical Chest+Head Drop (works even with foreshortened 2D front elbows)
                 val activeElbow = when {
                     isArcher -> bestElbow
                     !isStrict && !bothVisible -> bestElbow
@@ -1177,13 +1284,13 @@ class BiomechanicsEngine(
                     isStrict && isWide -> 106f
                     isStrict -> 95f
                     isWide -> 116f
-                    else -> 108f
+                    isIncline -> 108f
+                    else -> 110f
                 }
                 val elbowProgress = ((148f - activeElbow) / (148f - elbowBottomTarget).coerceAtLeast(10f))
                     .coerceIn(0f, 1.25f)
 
                 // Signal B: Self-normalized 3D arm compression ratio (shoulder-to-wrist chord / anatomical arm length)
-                val bestArmVis = maxOf(lArmW, rArmW)
                 val armCompProgress = if (use3D && bestArmVis >= 0.42f) {
                     fun compForSide(sI: Int, eI: Int, wI: Int): Float {
                         val totalLen = (dist3D(worldPts[sI], worldPts[eI]) + dist3D(worldPts[eI], worldPts[wI]))
@@ -1214,8 +1321,7 @@ class BiomechanicsEngine(
                 }
                 val refScale2D = maxOf(shWidth2DGlobal, dist2D(midShSAll, midHpSAll), 0.14f)
                 val currentScreenHeight = ((activeWrSY - chestHeadY) / refScale2D).coerceIn(-0.35f, 2.20f)
-                val inPushupAttitude = isProneBody || isPike
-
+                val inPushupAttitude = torsoTilt >= 22f || fullBodyTilt >= 22f || frontFloorHorizontal || isPike || isIncline
                 if (inPushupAttitude) {
                     pushupHeightWindow.addLast(
                         PushupHeightSample(
@@ -1231,7 +1337,7 @@ class BiomechanicsEngine(
                         pushupHeightWindow.removeFirst()
                     }
 
-                    // Track sustained straight-arm top frames to self-heal if user just stepped down from standing!
+                    // Track sustained straight-arm top frames to self-heal immediately after stepping down from standing
                     if (activeElbow >= 148f && bestArmVis >= 0.45f) {
                         pushupStraightArmStreak++
                     } else {
@@ -1239,7 +1345,6 @@ class BiomechanicsEngine(
                     }
 
                     if (pushupStraightArmStreak >= 4) {
-                        // Purge any stale higher samples from before settling into push-up plank
                         val maxAllowed = currentScreenHeight + 0.18f
                         while (pushupHeightWindow.size > 4 && pushupHeightWindow.first().normHeight > maxAllowed) {
                             pushupHeightWindow.removeFirst()
@@ -1258,10 +1363,8 @@ class BiomechanicsEngine(
                         adaptivePushupTopHeight = if (adaptivePushupTopHeight <= 0.01f) {
                             windowTop
                         } else if (pushupStraightArmStreak >= 3 && currentScreenHeight < adaptivePushupTopHeight) {
-                            // Fast convergence (~0.3s) whenever arms are visibly straight at top: ZERO permanent lockup!
                             adaptivePushupTopHeight * 0.72f + currentScreenHeight * 0.28f
                         } else {
-                            // Track sliding window peak cleanly
                             maxOf(currentScreenHeight, adaptivePushupTopHeight * 0.96f + windowTop * 0.04f)
                                 .coerceAtMost(windowTop)
                         }
@@ -1286,7 +1389,7 @@ class BiomechanicsEngine(
                     0f
                 }
 
-                // Straight-arm lockout guard: if arms are clearly straight and uncompressed, NEVER allow
+                // Straight-arm lockout guard: if arms are clearly straight and uncompressed, never allow
                 // a stale height baseline to keep pushupDepth stuck in BOTTOM!
                 if (activeElbow >= 156f && bestArmVis >= 0.55f && armCompProgress < 0.15f) {
                     chestDropProgress = minOf(chestDropProgress, 0.16f)
@@ -1299,20 +1402,20 @@ class BiomechanicsEngine(
                 }
                 romPct = (pushupDepth * 100f).roundToInt().coerceIn(0, 100)
 
-                val peakThresh = if (isStrict) 0.80f else 0.62f
-                val finishThresh = if (isStrict) 0.26f else 0.34f
+                val peakThresh = if (isStrict) 0.78f else 0.60f
+                val finishThresh = if (isStrict) 0.25f else 0.34f
                 val cycle = updateProgressCycle(
                     progress = pushupDepth,
                     startThreshold = 0.22f,
                     peakThreshold = peakThresh,
                     finishThreshold = finishThresh,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                val activePushupLeft = if (isArcher && bothArmsVis) effLeftElbow <= effRightElbow else null
+                recordCompletedCycle(cycle, activePushupLeft)
 
                 val activeElIdx = if (isArcher && bothArmsVis) {
                     if (effLeftElbow <= effRightElbow) LEFT_ELBOW else RIGHT_ELBOW
@@ -1323,44 +1426,50 @@ class BiomechanicsEngine(
                 val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
                 val activeElS = screenPts[activeElIdx]
 
-                // Gentle depth coaching without blocking rep counting
-                if (!reachedBottom && pushupDepth in 0.28f..(peakThresh - 0.04f) && activeElbow in (elbowBottomTarget + 4f)..134f) {
+                // Anti-spam depth coaching (only fires on stall / early reversal in live mode!)
+                if (!reachedBottom && pushupDepth in 0.28f..(peakThresh - 0.04f) &&
+                    activeElbow in (elbowBottomTarget + 4f)..134f &&
+                    shouldEmitDepthHint(activeElbow, metricTolerance = 3.5f)
+                ) {
                     val targetDeg = elbowBottomTarget.roundToInt()
                     val delta = (activeElbow - elbowBottomTarget).roundToInt().coerceAtLeast(1)
                     elbowHint = targetDeg
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = activeElIdx,
-                            jointLabelFr = "Coude",
-                            currentDeg = activeElbow.roundToInt(),
-                            targetMinDeg = 75,
-                            targetMaxDeg = targetDeg,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Descendez encore $delta° (${activeElbow.roundToInt()}° → ≤$targetDeg°)",
-                            voiceCueFr = if (isPike) "Descendez la tête vers les mains" else "Descendez la poitrine plus bas"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "PUSHUP_DEPTH",
+                            correction = AngleCorrection(
+                                jointIndex = activeElIdx,
+                                jointLabelFr = "Coude",
+                                currentDeg = activeElbow.roundToInt(),
+                                targetMinDeg = 75,
+                                targetMaxDeg = targetDeg,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "COUDE -$delta°",
+                                instructionFr = "Descendez encore $delta° (${activeElbow.roundToInt()}° → ≤$targetDeg°)",
+                                voiceCueFr = if (isPike) "Descendez la tête vers les mains" else "Descendez la poitrine plus bas"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                if (!isArcher) {
-                    addSymmetryCorrectionIfNeeded(
-                        effLeftElbow, effRightElbow, lArmW, rArmW,
-                        active = activeElbow < 138f,
-                        jointLabel = "coudes",
-                        leftJointIdx = LEFT_ELBOW,
-                        rightJointIdx = RIGHT_ELBOW
-                    )
-                }
+                addSymmetryIssueIfNeeded(
+                    effLeftElbow, effRightElbow, lArmW, rArmW,
+                    active = activeElbow < 136f,
+                    jointLabel = "coudes",
+                    leftJointIdx = LEFT_ELBOW,
+                    rightJointIdx = RIGHT_ELBOW
+                )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
                         activeElIdx, activeElS.x, activeElS.y, activeElbow.roundToInt(),
-                        if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
+                        if (elbowHint != null) FormQuality.CAUTION else FormQuality.GOOD,
                         parentIndex = activeShIdx,
                         childIndex = activeWrIdx,
                         targetRangeText = "≤${elbowBottomTarget.roundToInt()}°",
@@ -1372,7 +1481,7 @@ class BiomechanicsEngine(
                         JointAngleBadge(
                             hpIdx, hpS.x, hpS.y,
                             if (isPike) hipAngle.roundToInt() else effectiveAlign.roundToInt(),
-                            if (isPike || effectiveAlign in 155f..205f) FormQuality.GOOD else FormQuality.FAULT,
+                            if (isPike || effectiveAlign in 154f..206f) FormQuality.GOOD else FormQuality.FAULT,
                             parentIndex = shIdx,
                             childIndex = alignEndIdx,
                             targetRangeText = if (isPike) "V inversé" else "160–200°",
@@ -1380,20 +1489,23 @@ class BiomechanicsEngine(
                         )
                     )
                 }
-                feedback = faultMsg ?: when (phase) {
+                baseFeedback = when (phase) {
                     MovementPhase.BOTTOM -> if (isPike) {
                         "Pompe piquée validée — repoussez fort !"
                     } else {
-                        "Amplitude ${pushupVariant.labelFr} validée — repoussez !"
+                        "Amplitude $detectedVariantFr validée — repoussez !"
                     }
-                    else -> when (pushupVariant) {
-                        PushupVariant.PIKE -> "Piquée détectée — descendez la tête entre les mains."
-                        PushupVariant.ARCHER -> "Archer détectée — fléchissez le bras actif en contrôle."
-                        PushupVariant.KNEE -> "Pompes genoux (${effectiveAlign.roundToInt()}°) — buste gainé."
-                        PushupVariant.WIDE -> "Prise large — poitrine vers le sol, amplitude fluide."
-                        PushupVariant.DIAMOND -> "Prise diamant — coudes près des côtes, triceps engagés."
-                        PushupVariant.STANDARD -> if (canJudgeBodyAlign) {
-                            "Corps aligné (${effectiveAlign.roundToInt()}°), coudes contrôlés."
+                    else -> when (variant.id) {
+                        "PIKE" -> "Piquée détectée — descendez la tête entre les mains."
+                        "ARCHER" -> "Archer détectée — fléchissez le bras actif en contrôle."
+                        "KNEE" -> "Pompes genoux (${effectiveAlign.roundToInt()}°) — buste gainé."
+                        "INCLINE" -> "Pompes inclinées — corps gainé, amplitude complète."
+                        "DECLINE" -> "Pompes déclinées — gainage fort, contrôlez la descente."
+                        "WIDE" -> "Prise large — poitrine vers le sol, amplitude fluide."
+                        "CLOSE" -> "Prise serrée — coudes près du corps, triceps engagés."
+                        "DIAMOND" -> "Prise diamant — coudes près des côtes, triceps engagés."
+                        else -> if (canJudgeBodyAlign) {
+                            "Pompes classiques (${effectiveAlign.roundToInt()}°) — mouvement fluide."
                         } else {
                             "Pompes détectées — contrôlez la descente et poussez fort."
                         }
@@ -1402,77 +1514,98 @@ class BiomechanicsEngine(
             }
 
             ExerciseType.LUNGE, ExerciseType.BULGARIAN_SQUAT -> {
+                val bothLegsVis = lLegW >= 0.45f && rLegW >= 0.45f
+                val isBulgarian = currentExercise == ExerciseType.BULGARIAN_SQUAT
                 val activeLeft = when {
-                    lLegW >= 0.45f && rLegW >= 0.45f -> leftKnee <= rightKnee
+                    // For Bulgarian split squat, ALWAYS track the grounded (lower ankle = larger Y) front leg
+                    // so a pre-bent elevated rear leg never hijacks rep counting!
+                    isBulgarian && bothLegsVis && abs(geomPts[LEFT_ANKLE].y - geomPts[RIGHT_ANKLE].y) > (if (use3D) 0.10f else 0.04f) ->
+                        geomPts[LEFT_ANKLE].y >= geomPts[RIGHT_ANKLE].y
+                    variant.preferredActiveLeft != null -> variant.preferredActiveLeft
+                    bothLegsVis -> leftKnee <= rightKnee
                     else -> useLeft
                 }
-                val minKnee = if (lLegW >= 0.45f && rLegW >= 0.45f) minOf(leftKnee, rightKnee) else kneeAngle
+                val activeKnee = when {
+                    isBulgarian && bothLegsVis && abs(geomPts[LEFT_ANKLE].y - geomPts[RIGHT_ANKLE].y) > (if (use3D) 0.10f else 0.04f) ->
+                        if (activeLeft) leftKnee else rightKnee
+                    bothLegsVis -> minOf(leftKnee, rightKnee)
+                    else -> kneeAngle
+                }
                 val activeKnIdx = if (activeLeft) LEFT_KNEE else RIGHT_KNEE
                 val activeHpIdx = if (activeLeft) LEFT_HIP else RIGHT_HIP
                 val activeAnIdx = if (activeLeft) LEFT_ANKLE else RIGHT_ANKLE
                 val activeKnS = screenPts[activeKnIdx]
 
-                romPct = mapRange(minKnee, 162f, if (isStrict) 88f else 96f)
-                val maxTilt = if (currentExercise == ExerciseType.BULGARIAN_SQUAT) 34f else 28f
+                romPct = mapRange(activeKnee, 162f, if (isStrict) 88f else 96f)
+                val maxTilt = when {
+                    variant.exemptsTorsoLean -> 42f // Lateral/Cossack lunge naturally leans more
+                    isBulgarian -> 38f
+                    else -> 30f
+                }
                 var kneeHint: Int? = null
 
                 if (torsoTilt > maxTilt) {
                     val delta = (torsoTilt - maxTilt).roundToInt().coerceAtLeast(1)
-                    score -= 22
-                    faultMsg = "Redressez le buste, regard droit devant"
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, maxTilt - 6f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = maxTilt.roundToInt(),
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE +$delta°",
-                            instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤${maxTilt.roundToInt()}°)",
-                            voiceCueFr = "Redressez le buste"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "LUNGE_TORSO",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = maxTilt.roundToInt(),
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE +$delta°",
+                                instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤${maxTilt.roundToInt()}°)",
+                                voiceCueFr = "Redressez le buste"
+                            ),
+                            scorePenalty = 22,
+                            feedbackMsgFr = "Redressez le buste, regard droit devant"
                         )
                     )
                 }
 
-                // 3D front-knee valgus check
-                if (use3D && bothVisible && minKnee < 135f) {
+                if (use3D && bothVisible && activeKnee < 135f) {
                     val vDeg = frontalKneeValgus3D(
                         worldPts[activeHpIdx], worldPts[activeKnIdx], worldPts[activeAnIdx], pelvisAxis, activeLeft
                     )
                     if (vDeg >= 10f) {
                         val delta = vDeg.roundToInt()
-                        score -= 24
-                        faultMsg = "Stabilisez le genou avant dans l'axe du pied"
                         val outDx = outwardScreenDirection(
                             activeKnS.x,
                             screenPts[activeAnIdx].x,
                             (screenPts[LEFT_HIP].x + screenPts[RIGHT_HIP].x) * 0.5f
                         )
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = activeKnIdx,
-                                jointLabelFr = "Genou avant",
-                                currentDeg = delta,
-                                targetMinDeg = 0,
-                                targetMaxDeg = 8,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = outDx,
-                                arrowDy = 0f,
-                                ghostAnchorIndex = activeHpIdx,
-                                ghostTargetX = screenPts[activeAnIdx].x,
-                                ghostTargetY = activeKnS.y,
-                                shortBadgeFr = "VALGUS $delta°",
-                                instructionFr = "Alignez le genou avant vers l'extérieur ($delta°)",
-                                voiceCueFr = "Alignez le genou avant avec le pied"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "LUNGE_VALGUS",
+                                correction = AngleCorrection(
+                                    jointIndex = activeKnIdx,
+                                    jointLabelFr = "Genou avant",
+                                    currentDeg = delta,
+                                    targetMinDeg = 0,
+                                    targetMaxDeg = 8,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = outDx,
+                                    arrowDy = 0f,
+                                    ghostAnchorIndex = activeHpIdx,
+                                    ghostTargetX = screenPts[activeAnIdx].x,
+                                    ghostTargetY = activeKnS.y,
+                                    shortBadgeFr = "VALGUS $delta°",
+                                    instructionFr = "Alignez le genou avant vers l'extérieur ($delta°)",
+                                    voiceCueFr = "Alignez le genou avant avec le pied"
+                                ),
+                                scorePenalty = 24,
+                                feedbackMsgFr = "Stabilisez le genou avant dans l'axe du pied"
                             )
                         )
                     }
@@ -1480,253 +1613,301 @@ class BiomechanicsEngine(
 
                 val bottomThresh = if (isStrict) 100f else 110f
                 val cycle = updateDownUpCycle(
-                    metric = minKnee,
+                    metric = activeKnee,
                     startThreshold = if (isStrict) 148f else 142f,
                     bottomThreshold = bottomThresh,
                     finishThreshold = if (isStrict) 154f else 144f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, activeLeft)
 
-                if (!reachedBottom && minKnee in (bottomThresh + 2f)..132f) {
-                    val delta = (minKnee - 95f).roundToInt().coerceAtLeast(1)
+                if (!reachedBottom && activeKnee in (bottomThresh + 2f)..132f &&
+                    shouldEmitDepthHint(activeKnee, metricTolerance = 3.0f)
+                ) {
+                    val delta = (activeKnee - 95f).roundToInt().coerceAtLeast(1)
                     kneeHint = 95
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = activeKnIdx,
-                            jointLabelFr = "Genou",
-                            currentDeg = minKnee.roundToInt(),
-                            targetMinDeg = 75,
-                            targetMaxDeg = 95,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "GENOU -$delta°",
-                            instructionFr = "Descendez encore $delta° (${minKnee.roundToInt()}° → ≤95°)",
-                            voiceCueFr = "Descendez encore $delta degrés"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "LUNGE_DEPTH",
+                            correction = AngleCorrection(
+                                jointIndex = activeKnIdx,
+                                jointLabelFr = "Genou",
+                                currentDeg = activeKnee.roundToInt(),
+                                targetMinDeg = 75,
+                                targetMaxDeg = 95,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "GENOU -$delta°",
+                                instructionFr = "Descendez encore $delta° (${activeKnee.roundToInt()}° → ≤95°)",
+                                voiceCueFr = "Descendez encore $delta degrés"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        activeKnIdx, activeKnS.x, activeKnS.y, minKnee.roundToInt(),
-                        if (kneeHint != null) FormQuality.CAUTION else scoreToQuality(score),
+                        activeKnIdx, activeKnS.x, activeKnS.y, activeKnee.roundToInt(),
+                        if (kneeHint != null) FormQuality.CAUTION else FormQuality.GOOD,
                         parentIndex = activeHpIdx,
                         childIndex = activeAnIdx,
                         targetRangeText = if (isStrict) "≤100°" else "≤110°",
                         targetDegHint = kneeHint
                     )
                 )
-                feedback = faultMsg ?: "Amplitude ${romPct}% — contrôlez la stabilité du genou."
+                baseFeedback = "${currentExercise.labelFr} ($detectedVariantFr) · Amplitude $romPct%."
             }
 
             ExerciseType.DEADLIFT -> {
-                romPct = mapRange(hipAngle, 168f, if (isStrict) 88f else 102f)
+                val isSingleLeg = variant.id == "SINGLE_LEG_RDL"
+                val isSumo = variant.id == "SUMO"
+                val isRdl = variant.id == "RDL"
+                val stanceLeft = variant.preferredActiveLeft ?: useLeft
+                val activeHip = if (isSingleLeg) (if (stanceLeft) leftHip else rightHip) else hipAngle
+                val activeKnee = if (isSingleLeg) (if (stanceLeft) leftKnee else rightKnee) else kneeAngle
+                val activeHpIdx = if (isSingleLeg) (if (stanceLeft) LEFT_HIP else RIGHT_HIP) else hpIdx
+                val activeKnIdx = if (isSingleLeg) (if (stanceLeft) LEFT_KNEE else RIGHT_KNEE) else knIdx
+                val activeAnIdx = if (isSingleLeg) (if (stanceLeft) LEFT_ANKLE else RIGHT_ANKLE) else anIdx
+                val activeHpS = screenPts[activeHpIdx]
+                val activeKnS = screenPts[activeKnIdx]
+
+                romPct = mapRange(activeHip, 168f, if (isStrict) 88f else 104f)
                 var hipHint: Int? = null
                 var kneeHint: Int? = null
 
-                if (kneeAngle < 115f && hipAngle > 110f) {
-                    val delta = (125f - kneeAngle).roundToInt().coerceAtLeast(1)
-                    score -= 18
-                    faultMsg = "Initiez par les hanches (évitez de squatter la barre)"
-                    kneeHint = 125
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Hanches",
-                            currentDeg = kneeAngle.roundToInt(),
-                            targetMinDeg = 120,
-                            targetMaxDeg = 165,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            shortBadgeFr = "CHARNIÈRE +$delta°",
-                            instructionFr = "Montez les hanches et dépliez les genoux (+$delta° → ≥120°)",
-                            voiceCueFr = "Poussez les hanches en arrière, ne squattez pas"
+                val minAllowedKnee = if (isSumo) 100f else 115f
+                if (activeKnee < minAllowedKnee && activeHip > 110f) {
+                    val delta = ((minAllowedKnee + 10f) - activeKnee).roundToInt().coerceAtLeast(1)
+                    kneeHint = (minAllowedKnee + 10f).roundToInt()
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "DEADLIFT_SQUATTING",
+                            correction = AngleCorrection(
+                                jointIndex = activeHpIdx,
+                                jointLabelFr = "Hanches",
+                                currentDeg = activeKnee.roundToInt(),
+                                targetMinDeg = minAllowedKnee.roundToInt(),
+                                targetMaxDeg = 165,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                shortBadgeFr = "CHARNIÈRE +$delta°",
+                                instructionFr = "Montez les hanches et dépliez les genoux (+$delta° → ≥${minAllowedKnee.roundToInt()}°)",
+                                voiceCueFr = "Poussez les hanches en arrière, ne squattez pas"
+                            ),
+                            scorePenalty = 18,
+                            feedbackMsgFr = "Initiez par les hanches (évitez de squatter la barre)"
                         )
                     )
                 }
-                // Fixed 3D-compatible hyperextension check via signed bodyLineAlign (>192°) instead of impossible 3D hipAngle > 185°
-                if (bodyLineAlign > 192f && torsoTilt > 10f && hipAngle > 158f) {
+                if (bodyLineAlign > 193f && torsoTilt > 10f && activeHip > 158f) {
                     val cur = bodyLineAlign.roundToInt()
                     val delta = (cur - 180).coerceAtLeast(5)
-                    score -= 22
-                    faultMsg = "Stoppez droit — ne cambrez pas en arrière"
                     hipHint = 178
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 4f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Lombaires",
-                            currentDeg = cur,
-                            targetMinDeg = 165,
-                            targetMaxDeg = 182,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "CAMBRURE -$delta°",
-                            instructionFr = "Stoppez droit à 180° sans cambrer (-$delta°)",
-                            voiceCueFr = "Stoppez droit, ne cambrez pas en arrière"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "DEADLIFT_HYPEREXT",
+                            correction = AngleCorrection(
+                                jointIndex = activeHpIdx,
+                                jointLabelFr = "Lombaires",
+                                currentDeg = cur,
+                                targetMinDeg = 165,
+                                targetMaxDeg = 182,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = activeHpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "CAMBRURE -$delta°",
+                                instructionFr = "Stoppez droit à 180° sans cambrer (-$delta°)",
+                                voiceCueFr = "Stoppez droit, ne cambrez pas en arrière"
+                            ),
+                            scorePenalty = 22,
+                            feedbackMsgFr = "Stoppez droit — ne cambrez pas en arrière"
                         )
                     )
                 }
 
+                val deadliftBottom = when {
+                    isStrict -> 105f
+                    isRdl || isSingleLeg -> 120f
+                    else -> 116f
+                }
                 val cycle = updateDownUpCycle(
-                    metric = hipAngle,
+                    metric = activeHip,
                     startThreshold = 150f,
-                    bottomThreshold = if (isStrict) 105f else 116f,
+                    bottomThreshold = deadliftBottom,
                     finishThreshold = if (isStrict) 162f else 154f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isSingleLeg) stanceLeft else null)
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftHip, rightHip, lTorsoW, rTorsoW,
-                    active = hipAngle < 145f,
+                    active = activeHip < 145f,
                     jointLabel = "hanches",
                     leftJointIdx = LEFT_HIP,
                     rightJointIdx = RIGHT_HIP
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "90–175°", targetDegHint = hipHint
+                        activeHpIdx, activeHpS.x, activeHpS.y, activeHip.roundToInt(), FormQuality.GOOD,
+                        parentIndex = shIdx, childIndex = activeKnIdx, targetRangeText = "90–175°", targetDegHint = hipHint
                     )
                 )
                 badges.add(
                     JointAngleBadge(
-                        knIdx, knS.x, knS.y, kneeAngle.roundToInt(),
+                        activeKnIdx, activeKnS.x, activeKnS.y, activeKnee.roundToInt(),
                         if (kneeHint != null) FormQuality.CAUTION else FormQuality.GOOD,
-                        parentIndex = hpIdx, childIndex = anIdx, targetRangeText = "≥120°", targetDegHint = kneeHint
+                        parentIndex = activeHpIdx, childIndex = activeAnIdx, targetRangeText = "≥${minAllowedKnee.roundToInt()}°", targetDegHint = kneeHint
                     )
                 )
-                feedback = faultMsg ?: when (phase) {
-                    MovementPhase.BOTTOM -> "Charnière verrouillée — poussez les hanches !"
-                    else -> "Dos neutre, barre proche des tibias."
+                baseFeedback = when (phase) {
+                    MovementPhase.BOTTOM -> "Charnière $detectedVariantFr verrouillée — poussez les hanches !"
+                    else -> "Soulevé $detectedVariantFr · Dos neutre, barre proche des tibias."
                 }
             }
 
             ExerciseType.OVERHEAD_PRESS -> {
+                val isUnilateral = variant.usesUnilateralLimb
+                val activeLeft = variant.preferredActiveLeft ?: useLeft
+                val activeElbow = if (isUnilateral) maxOf(leftElbow, rightElbow) else elbowAngle
+                val activeElIdx = if (isUnilateral) (if (activeLeft) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
+                val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
+                val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
+                val activeElS = screenPts[activeElIdx]
+                val activeShS = screenPts[activeShIdx]
+                val activeWrS = screenPts[activeWrIdx]
+
                 val overheadOk = if (use3D) {
-                    if (bothVisible) {
+                    if (isUnilateral) {
+                        worldPts[activeWrIdx].y < worldPts[activeShIdx].y
+                    } else if (bothVisible) {
                         ((worldPts[LEFT_WRIST].y + worldPts[RIGHT_WRIST].y) * 0.5f) <
                             ((worldPts[LEFT_SHOULDER].y + worldPts[RIGHT_SHOULDER].y) * 0.5f)
                     } else {
                         worldPts[wrIdx].y < worldPts[shIdx].y
                     }
                 } else {
-                    wrS.y < shS.y
+                    activeWrS.y < activeShS.y
                 }
-                romPct = if (overheadOk) mapRange(elbowAngle, 85f, if (isStrict) 165f else 155f) else mapRange(elbowAngle, 85f, 165f) / 2
+                romPct = if (overheadOk) mapRange(activeElbow, 85f, if (isStrict) 165f else 155f) else mapRange(activeElbow, 85f, 165f) / 2
                 var elbowHint: Int? = null
 
-                if (torsoTilt > 18f) {
+                if (torsoTilt > 19f) {
                     val delta = (torsoTilt - 18f).roundToInt().coerceAtLeast(1)
-                    score -= 25
-                    faultMsg = "Serrez fessiers et abdos — évitez de cambrer"
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 8f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 18,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE -$delta°",
-                            instructionFr = "Gainez le tronc : redressez de $delta° (${torsoTilt.roundToInt()}° → ≤18°)",
-                            voiceCueFr = "Serrez les abdos, ne cambrez pas"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "OHP_TORSO",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = 18,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE -$delta°",
+                                instructionFr = "Gainez le tronc : redressez de $delta° (${torsoTilt.roundToInt()}° → ≤18°)",
+                                voiceCueFr = "Serrez les abdos, ne cambrez pas"
+                            ),
+                            scorePenalty = 25,
+                            feedbackMsgFr = "Serrez fessiers et abdos — évitez de cambrer"
                         )
                     )
                 }
 
                 val topThresh = if (isStrict) 155f else 146f
                 val cycle = updateUpDownCycle(
-                    metric = elbowAngle,
+                    metric = activeElbow,
                     startThreshold = if (isStrict) 100f else 106f,
                     topThreshold = topThresh,
                     finishThreshold = if (isStrict) 95f else 110f,
                     extraTopCondition = overheadOk,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isUnilateral) activeLeft else null)
 
-                if (overheadOk && !reachedBottom && elbowAngle in 118f..(topThresh - 2f)) {
-                    val delta = (topThresh + 6f - elbowAngle).roundToInt().coerceAtLeast(1)
+                if (overheadOk && !reachedBottom && activeElbow in 118f..(topThresh - 2f) &&
+                    shouldEmitDepthHint(activeElbow, metricTolerance = 3.5f)
+                ) {
+                    val delta = (topThresh + 6f - activeElbow).roundToInt().coerceAtLeast(1)
                     elbowHint = (topThresh + 6f).roundToInt()
-                    val (gx, gy) = straightenLimbGhost(shS, elS, wrS)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = elIdx,
-                            jointLabelFr = "Verrouillage",
-                            currentDeg = elbowAngle.roundToInt(),
-                            targetMinDeg = topThresh.roundToInt(),
-                            targetMaxDeg = 180,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            ghostAnchorIndex = elIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "COUDE +$delta°",
-                            instructionFr = "Verrouillez les coudes (+$delta° : ${elbowAngle.roundToInt()}° → ≥${topThresh.roundToInt()}°)",
-                            voiceCueFr = "Verrouillez les bras en haut"
+                    val (gx, gy) = straightenLimbGhost(activeShS, activeElS, activeWrS)
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "OHP_LOCKOUT",
+                            correction = AngleCorrection(
+                                jointIndex = activeElIdx,
+                                jointLabelFr = "Verrouillage",
+                                currentDeg = activeElbow.roundToInt(),
+                                targetMinDeg = topThresh.roundToInt(),
+                                targetMaxDeg = 180,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                ghostAnchorIndex = activeElIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "COUDE +$delta°",
+                                instructionFr = "Verrouillez les coudes (+$delta° : ${activeElbow.roundToInt()}° → ≥${topThresh.roundToInt()}°)",
+                                voiceCueFr = "Verrouillez les bras en haut"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftElbow, rightElbow, lArmW, rArmW,
-                    active = elbowAngle > 105f,
+                    active = activeElbow > 108f,
                     jointLabel = "bras",
                     leftJointIdx = LEFT_ELBOW,
                     rightJointIdx = RIGHT_ELBOW
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        elIdx, elS.x, elS.y, elbowAngle.roundToInt(),
-                        if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≥${topThresh.roundToInt()}°", targetDegHint = elbowHint
+                        activeElIdx, activeElS.x, activeElS.y, activeElbow.roundToInt(),
+                        if (elbowHint != null) FormQuality.CAUTION else FormQuality.GOOD,
+                        parentIndex = activeShIdx, childIndex = activeWrIdx, targetRangeText = "≥${topThresh.roundToInt()}°", targetDegHint = elbowHint
                     )
                 )
-                feedback = faultMsg ?: "Poussée verticale stricte — verrouillez au-dessus."
+                baseFeedback = "Développé $detectedVariantFr — poussée verticale, verrouillez en haut."
             }
 
             ExerciseType.BICEP_CURL -> {
-                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
-                val isAlternating = bothVisible && bothArmsVis && abs(leftElbow - rightElbow) > 35f
-                val activeLeftCurl = if (isAlternating) leftElbow <= rightElbow else useLeft
+                val isAlternating = variant.usesUnilateralLimb
+                val activeLeftCurl = if (isAlternating) (variant.preferredActiveLeft ?: (leftElbow <= rightElbow)) else useLeft
                 val activeCurlElbow = if (isAlternating) minOf(leftElbow, rightElbow) else elbowAngle
                 val activeCurlShAngle = if (isAlternating) (if (activeLeftCurl) leftShoulder else rightShoulder) else shoulderAngle
                 val activeElIdx = if (isAlternating) (if (activeLeftCurl) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
@@ -1734,59 +1915,64 @@ class BiomechanicsEngine(
                 val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
                 val activeElS = screenPts[activeElIdx]
                 val activeShS = screenPts[activeShIdx]
-                if (isAlternating) detectedVariantFr = "Alterné"
 
                 romPct = mapRange(activeCurlElbow, 155f, if (isStrict) 48f else 62f)
-                val elbowDrift3D = use3D && activeCurlShAngle > 34f && activeCurlElbow < 110f
+                val elbowDrift3D = use3D && activeCurlShAngle > 35f && activeCurlElbow < 110f
                 val torsoLen2D = dist2D(shS, hpS).coerceAtLeast(0.08f)
                 val elbowDrift2D = !use3D && abs(activeElS.x - activeShS.x) > torsoLen2D * 0.42f && activeCurlElbow < 105f
                 if (elbowDrift3D || elbowDrift2D) {
                     val delta = (activeCurlShAngle - 25f).roundToInt().coerceAtLeast(8)
-                    score -= 24
-                    faultMsg = "Gardez le coude fixe près des côtes"
                     val pullDx = if (activeElS.x >= activeShS.x) -1f else 1f
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = activeElIdx,
-                            jointLabelFr = "Coude",
-                            currentDeg = activeCurlShAngle.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 28,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = pullDx,
-                            arrowDy = 0.25f,
-                            ghostAnchorIndex = activeShIdx,
-                            ghostTargetX = activeShS.x,
-                            ghostTargetY = activeElS.y,
-                            shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Reculez le coude près des côtes (${activeCurlShAngle.roundToInt()}° → ≤28°)",
-                            voiceCueFr = "Gardez les coudes collés aux côtes"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "CURL_ELBOW_DRIFT",
+                            correction = AngleCorrection(
+                                jointIndex = activeElIdx,
+                                jointLabelFr = "Coude",
+                                currentDeg = activeCurlShAngle.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = 28,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = pullDx,
+                                arrowDy = 0.25f,
+                                ghostAnchorIndex = activeShIdx,
+                                ghostTargetX = activeShS.x,
+                                ghostTargetY = activeElS.y,
+                                shortBadgeFr = "COUDE -$delta°",
+                                instructionFr = "Reculez le coude près des côtes (${activeCurlShAngle.roundToInt()}° → ≤28°)",
+                                voiceCueFr = "Gardez les coudes collés aux côtes"
+                            ),
+                            scorePenalty = 24,
+                            feedbackMsgFr = "Gardez le coude fixe près des côtes"
                         )
                     )
                 }
-                if (torsoTilt > 16f) {
+                if (torsoTilt > 17f) {
                     val delta = (torsoTilt - 16f).roundToInt().coerceAtLeast(1)
-                    score -= 20
-                    faultMsg = "Ne balancez pas le buste en arrière"
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 6f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 16,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE -$delta°",
-                            instructionFr = "Stabilisez le buste (-$delta° : ${torsoTilt.roundToInt()}° → ≤16°)",
-                            voiceCueFr = "Ne balancez pas le buste"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "CURL_SWING",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = 16,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE -$delta°",
+                                instructionFr = "Stabilisez le buste (-$delta° : ${torsoTilt.roundToInt()}° → ≤16°)",
+                                voiceCueFr = "Ne balancez pas le buste"
+                            ),
+                            scorePenalty = 20,
+                            feedbackMsgFr = "Ne balancez pas le buste en arrière"
                         )
                     )
                 }
@@ -1797,37 +1983,30 @@ class BiomechanicsEngine(
                     bottomThreshold = if (isStrict) 58f else 74f,
                     finishThreshold = if (isStrict) 148f else 136f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isAlternating) activeLeftCurl else null)
 
-                if (!isAlternating) {
-                    addSymmetryCorrectionIfNeeded(
-                        leftElbow, rightElbow, lArmW, rArmW,
-                        active = activeCurlElbow < 125f,
-                        jointLabel = "bras",
-                        leftJointIdx = LEFT_ELBOW,
-                        rightJointIdx = RIGHT_ELBOW
-                    )
-                }
+                addSymmetryIssueIfNeeded(
+                    leftElbow, rightElbow, lArmW, rArmW,
+                    active = activeCurlElbow < 125f,
+                    jointLabel = "bras",
+                    leftJointIdx = LEFT_ELBOW,
+                    rightJointIdx = RIGHT_ELBOW
+                )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        activeElIdx, activeElS.x, activeElS.y, activeCurlElbow.roundToInt(), scoreToQuality(score),
+                        activeElIdx, activeElS.x, activeElS.y, activeCurlElbow.roundToInt(), FormQuality.GOOD,
                         parentIndex = activeShIdx,
                         childIndex = activeWrIdx,
                         targetRangeText = if (isStrict) "≤58°" else "≤74°"
                     )
                 )
-                feedback = faultMsg ?: if (isAlternating) {
-                    "Curl alterné propre (${activeCurlElbow.roundToInt()}°) — coude fixe."
-                } else {
-                    "Flexion propre (${activeCurlElbow.roundToInt()}°), contrôlez la descente."
-                }
+                baseFeedback = "Curl $detectedVariantFr (${activeCurlElbow.roundToInt()}°) — coude fixe, descente contrôlée."
             }
 
             ExerciseType.TRICEP_DIP -> {
@@ -1836,7 +2015,7 @@ class BiomechanicsEngine(
                 val dipElbowFinish = if (isStrict) 155f else 146f
                 val dipElbowProgress = ((148f - elbowAngle) / (148f - dipElbowBottom).coerceAtLeast(10f)).coerceIn(0f, 1.25f)
 
-                // Adaptive vertical shoulder drop relative to planted wrists (bench & parallel dips)
+                // Deadlock-free self-healing vertical shoulder drop relative to planted wrists
                 val midWrYDip = if (bothArmsVis) (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f else geomPts[wrIdx].y
                 val midShYDip = if (bothArmsVis) (geomPts[LEFT_SHOULDER].y + geomPts[RIGHT_SHOULDER].y) * 0.5f else geomPts[shIdx].y
                 val dipTorsoLen = if (use3D) {
@@ -1844,72 +2023,77 @@ class BiomechanicsEngine(
                 } else {
                     dist2D(shS, hpS).coerceAtLeast(0.10f)
                 }
-                val currentDipHeight = ((midWrYDip - midShYDip) / dipTorsoLen).coerceAtLeast(0f)
-                if (torsoTilt <= 48f && currentDipHeight > 0.08f) {
-                    if (adaptiveDipTopHeight <= 0.01f || currentDipHeight > adaptiveDipTopHeight) {
-                        adaptiveDipTopHeight = currentDipHeight
-                    } else if (elbowAngle >= 146f || phase == MovementPhase.READY) {
-                        adaptiveDipTopHeight = adaptiveDipTopHeight * 0.78f + currentDipHeight * 0.22f
+                val currentDipHeight = ((midWrYDip - midShYDip) / dipTorsoLen).coerceIn(0f, 1.25f)
+                if (torsoTilt <= 48f && elbowAngle >= 142f && currentDipHeight in 0.14f..1.18f) {
+                    adaptiveDipTopHeight = if (adaptiveDipTopHeight <= 0.01f) {
+                        currentDipHeight
+                    } else {
+                        adaptiveDipTopHeight * 0.84f + currentDipHeight * 0.16f
                     }
                 }
-                var dipDropProgress = if (adaptiveDipTopHeight > 0.16f && torsoTilt <= 48f) {
-                    ((adaptiveDipTopHeight - currentDipHeight) / (adaptiveDipTopHeight * 0.32f)).coerceIn(0f, 1.2f)
+                val rawDipDropProgress = if (adaptiveDipTopHeight > 0.16f && torsoTilt <= 48f) {
+                    ((adaptiveDipTopHeight - currentDipHeight) / (adaptiveDipTopHeight * 0.32f)).coerceIn(0f, 1.20f)
                 } else {
                     0f
                 }
-                if (elbowAngle >= 156f && maxOf(lArmW, rArmW) >= 0.55f) {
-                    dipDropProgress = minOf(dipDropProgress, 0.16f)
-                }
+                // Anti-deadlock rule: locked-out elbows (>= 150°) always exit BOTTOM cleanly
+                val dipDropProgress = if (elbowAngle >= 150f) minOf(rawDipDropProgress, 0.16f) else rawDipDropProgress
 
                 val dipDepth = if (isStrict) dipElbowProgress else maxOf(dipElbowProgress, dipDropProgress * 0.94f)
                 romPct = (dipDepth * 100f).roundToInt().coerceIn(0, 100)
                 var elbowHint: Int? = null
-                if (torsoTilt > 38f) {
-                    val delta = (torsoTilt - 38f).roundToInt().coerceAtLeast(1)
-                    score -= 15
-                    faultMsg = "Gardez le buste contrôlé, épaules abaissées"
+                val maxDipTilt = if (variant.exemptsTorsoLean) 45f else 38f
+                if (torsoTilt > maxDipTilt) {
+                    val delta = (torsoTilt - maxDipTilt).roundToInt().coerceAtLeast(1)
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 24f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 38,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE -$delta°",
-                            instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤38°)",
-                            voiceCueFr = "Contrôlez l'inclinaison, épaules basses"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "DIP_TORSO",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = maxDipTilt.roundToInt(),
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE -$delta°",
+                                instructionFr = "Redressez le buste de $delta° (${torsoTilt.roundToInt()}° → ≤${maxDipTilt.roundToInt()}°)",
+                                voiceCueFr = "Contrôlez l'inclinaison, épaules basses"
+                            ),
+                            scorePenalty = 15,
+                            feedbackMsgFr = "Gardez le buste contrôlé, épaules abaissées"
                         )
                     )
                 }
 
-                // Shoulder shrug check when ears and shoulders visible in 3D
                 if (use3D && worldPts[LEFT_EAR].visibility >= 0.45f && worldPts[RIGHT_EAR].visibility >= 0.45f) {
                     val earY = (worldPts[LEFT_EAR].y + worldPts[RIGHT_EAR].y) * 0.5f
                     val shY = (worldPts[LEFT_SHOULDER].y + worldPts[RIGHT_SHOULDER].y) * 0.5f
                     if (shY - earY < 0.08f) {
-                        score -= 12
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = shIdx,
-                                jointLabelFr = "Épaules",
-                                currentDeg = ((shY - earY) * 100f).roundToInt(),
-                                targetMinDeg = 12,
-                                targetMaxDeg = 25,
-                                deltaDeg = 10,
-                                severity = FormQuality.CAUTION,
-                                arrowDx = 0f,
-                                arrowDy = 1f,
-                                shortBadgeFr = "ÉPAULES BAS",
-                                instructionFr = "Abaissez les épaules loin des oreilles",
-                                voiceCueFr = "Abaissez les épaules"
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "DIP_SHRUG",
+                                correction = AngleCorrection(
+                                    jointIndex = shIdx,
+                                    jointLabelFr = "Épaules",
+                                    currentDeg = ((shY - earY) * 100f).roundToInt(),
+                                    targetMinDeg = 12,
+                                    targetMaxDeg = 25,
+                                    deltaDeg = 10,
+                                    severity = FormQuality.CAUTION,
+                                    arrowDx = 0f,
+                                    arrowDy = 1f,
+                                    shortBadgeFr = "ÉPAULES BAS",
+                                    instructionFr = "Abaissez les épaules loin des oreilles",
+                                    voiceCueFr = "Abaissez les épaules"
+                                ),
+                                scorePenalty = 12
                             )
                         )
                     }
@@ -1922,47 +2106,54 @@ class BiomechanicsEngine(
                         bottomThreshold = dipElbowBottom,
                         finishThreshold = dipElbowFinish,
                         currentRom = romPct,
-                        fault = faultMsg,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
                         timestampMs = timestampMs
                     )
                 } else {
                     updateProgressCycle(
                         progress = dipDepth,
                         startThreshold = 0.20f,
-                        peakThreshold = 0.65f,
+                        peakThreshold = 0.64f,
                         finishThreshold = 0.24f,
                         currentRom = romPct,
-                        fault = faultMsg,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
                         timestampMs = timestampMs
                     )
                 }
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle)
 
-                if (!reachedBottom && elbowAngle in (dipElbowBottom + 3f)..128f) {
+                if (!reachedBottom && elbowAngle in (dipElbowBottom + 3f)..128f &&
+                    shouldEmitDepthHint(elbowAngle, metricTolerance = 3.5f)
+                ) {
                     val targetDeg = dipElbowBottom.roundToInt()
                     val delta = (elbowAngle - dipElbowBottom).roundToInt().coerceAtLeast(1)
                     elbowHint = targetDeg
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = elIdx,
-                            jointLabelFr = "Coude",
-                            currentDeg = elbowAngle.roundToInt(),
-                            targetMinDeg = 80,
-                            targetMaxDeg = targetDeg,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Descendez encore $delta° (${elbowAngle.roundToInt()}° → ≤$targetDeg°)",
-                            voiceCueFr = "Descendez jusqu'à 90 degrés"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "DIP_DEPTH",
+                            correction = AngleCorrection(
+                                jointIndex = elIdx,
+                                jointLabelFr = "Coude",
+                                currentDeg = elbowAngle.roundToInt(),
+                                targetMinDeg = 80,
+                                targetMaxDeg = targetDeg,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "COUDE -$delta°",
+                                instructionFr = "Descendez encore $delta° (${elbowAngle.roundToInt()}° → ≤$targetDeg°)",
+                                voiceCueFr = "Descendez jusqu'à 90 degrés"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftElbow, rightElbow, lArmW, rArmW,
                     active = elbowAngle < 140f,
                     jointLabel = "coudes",
@@ -1970,134 +2161,146 @@ class BiomechanicsEngine(
                     rightJointIdx = RIGHT_ELBOW
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
                         elIdx, elS.x, elS.y, elbowAngle.roundToInt(),
-                        if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
+                        if (elbowHint != null) FormQuality.CAUTION else FormQuality.GOOD,
                         parentIndex = shIdx,
                         childIndex = wrIdx,
                         targetRangeText = "≤${dipElbowBottom.roundToInt()}°",
                         targetDegHint = elbowHint
                     )
                 )
-                feedback = faultMsg ?: "Descendez contrôlé puis verrouillez proprement."
+                baseFeedback = "Dips $detectedVariantFr — descendez contrôlé puis verrouillez."
             }
 
             ExerciseType.PLANK -> {
-                val shSpanPlank = if (use3D) {
-                    dist3D(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]).coerceAtLeast(0.18f)
-                } else {
-                    dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.06f)
+                val isSidePlank = variant.id == "SIDE"
+                val isKneePlank = variant.usesKneeAlignment
+                val isThreePoint = variant.id == "THREE_POINT"
+                val groundedLeft = variant.preferredActiveLeft ?: useLeft
+
+                val effectivePlankAlign = when {
+                    isKneePlank -> {
+                        val lka = bodyAlign(LEFT_SHOULDER, LEFT_HIP, LEFT_KNEE)
+                        val rka = bodyAlign(RIGHT_SHOULDER, RIGHT_HIP, RIGHT_KNEE)
+                        fuseSide(lka, rka, minOf(lTorsoW, lLegW), minOf(rTorsoW, rLegW), useLeft, bothVisible)
+                    }
+                    isThreePoint -> if (groundedLeft) leftAlign else rightAlign
+                    else -> bodyLineAlign
                 }
-                val isSidePlank = bothVisible &&
-                    abs(geomPts[LEFT_SHOULDER].y - geomPts[RIGHT_SHOULDER].y) > shSpanPlank * 0.50f
-                val isForearmPlank = !isSidePlank && elbowAngle in 55f..120f
-                detectedVariantFr = when {
-                    isSidePlank -> "Latérale"
-                    isForearmPlank -> "Avant-bras"
-                    else -> "Haute"
-                }
+                val alignEndIdx = if (isKneePlank) knIdx else if (isThreePoint) (if (groundedLeft) LEFT_ANKLE else RIGHT_ANKLE) else anIdx
+                val alignEndS = screenPts[alignEndIdx]
 
                 val isHorizontal = if (use3D) {
-                    fullBodyTilt >= (if (isStrict) 55f else 42f) || isSidePlank || (!isStrict && frontFloorHorizontal)
+                    fullBodyTilt >= (if (isStrict) 55f else 42f) || isSidePlank || (isKneePlank && torsoTilt >= 44f) || (!isStrict && frontFloorHorizontal)
                 } else {
                     val classicHoriz = abs(shS.y - anS.y) < abs(shS.x - anS.x) * 0.78f
                     val bodyLen2D = dist2D(shS, anS).coerceAtLeast(0.05f)
                     val frontViewPlank = !isStrict &&
                         (frontFloorHorizontal ||
                             (abs(shS.y - anS.y) < maxOf(bodyLen2D * 0.35f, 0.28f) && abs(shS.y - hpS.y) < 0.16f))
-                    classicHoriz || frontViewPlank || isSidePlank
+                    classicHoriz || frontViewPlank || isSidePlank || isKneePlank
                 }
 
                 val validMin = if (isStrict) 160f else 155f
                 val validMax = if (isStrict) 195f else 202f
-                val aligned = isHorizontal && bodyLineAlign in validMin..validMax
+                val aligned = isHorizontal && effectivePlankAlign in validMin..validMax
                 var hipHint: Int? = null
                 if (aligned) {
                     plankHoldMs += dtMs
                     isometricDeltaSec = dtMs / 1000f
                     phase = MovementPhase.HOLD
                     romPct = 100
-                    val inOptimalGreen = bodyLineAlign in 166f..194f
-                    score = if (inOptimalGreen) {
-                        (98 - (abs(180f - bodyLineAlign) * 0.7f).roundToInt()).coerceIn(84, 100)
+                    val inOptimalGreen = effectivePlankAlign in 166f..194f
+                    plankScoreOverride = if (inOptimalGreen) {
+                        (98 - (abs(180f - effectivePlankAlign) * 0.7f).roundToInt()).coerceIn(84, 100)
                     } else {
-                        (82 - (abs(180f - bodyLineAlign) * 0.4f).roundToInt()).coerceIn(72, 81)
+                        (82 - (abs(180f - effectivePlankAlign) * 0.4f).roundToInt()).coerceIn(72, 81)
                     }
-                    feedback = if (inOptimalGreen) {
-                        "Alignement parfait (${bodyLineAlign.roundToInt()}°) — maintenez !"
+                    baseFeedback = if (inOptimalGreen) {
+                        "Planche $detectedVariantFr parfaite (${effectivePlankAlign.roundToInt()}°) — maintenez !"
                     } else {
-                        "Planche validée (${bodyLineAlign.roundToInt()}°) — affinez l'alignement."
+                        "Planche $detectedVariantFr validée (${effectivePlankAlign.roundToInt()}°) — affinez."
                     }
                     val sec = (plankHoldMs / 1000L).toInt()
                     if (sec > 0 && sec % 15 == 0 && (plankHoldMs - dtMs) / 1000L < sec) {
-                        voiceCue = "$sec secondes, tenez bon !"
+                        repVoiceCue = "$sec secondes, tenez bon !"
                     }
                 } else {
                     phase = MovementPhase.PAUSE
                     romPct = 40
                     if (!isHorizontal) {
-                        score = 60
-                        feedback = "Mettez-vous en position planche horizontale."
-                    } else if (bodyLineAlign < validMin) {
-                        val delta = (172f - bodyLineAlign).roundToInt().coerceAtLeast(1)
-                        score = 52
+                        plankScoreOverride = 60
+                        baseFeedback = "Mettez-vous en position planche horizontale."
+                    } else if (effectivePlankAlign < validMin) {
+                        val delta = (172f - effectivePlankAlign).roundToInt().coerceAtLeast(1)
+                        plankScoreOverride = 52
                         hipHint = 175
-                        faultMsg = "Remontez les hanches — bas du dos creusé"
-                        feedback = faultMsg
-                        val (gx, gy) = bodyLineGhost(shS, hpS, anS)
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = hpIdx,
-                                jointLabelFr = "Hanches",
-                                currentDeg = bodyLineAlign.roundToInt(),
-                                targetMinDeg = 166,
-                                targetMaxDeg = 194,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = 0f,
-                                arrowDy = -1f,
-                                ghostAnchorIndex = shIdx,
-                                ghostTargetX = gx,
-                                ghostTargetY = gy,
-                                shortBadgeFr = "HANCHES +$delta°",
-                                instructionFr = "Remontez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 166–194°)",
-                                voiceCueFr = "Remontez les hanches, bas du dos creusé"
+                        val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "PLANK_HIP_SAG",
+                                correction = AngleCorrection(
+                                    jointIndex = hpIdx,
+                                    jointLabelFr = "Hanches",
+                                    currentDeg = effectivePlankAlign.roundToInt(),
+                                    targetMinDeg = 166,
+                                    targetMaxDeg = 194,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = 0f,
+                                    arrowDy = -1f,
+                                    ghostAnchorIndex = shIdx,
+                                    ghostTargetX = gx,
+                                    ghostTargetY = gy,
+                                    shortBadgeFr = "HANCHES +$delta°",
+                                    instructionFr = "Remontez les hanches de $delta° (${effectivePlankAlign.roundToInt()}° → 166–194°)",
+                                    voiceCueFr = "Remontez les hanches, bas du dos creusé"
+                                ),
+                                scorePenalty = 48,
+                                feedbackMsgFr = "Remontez les hanches — bas du dos creusé"
                             )
                         )
+                        baseFeedback = "Remontez les hanches — bas du dos creusé"
                     } else {
-                        val delta = (bodyLineAlign - 185f).roundToInt().coerceAtLeast(1)
-                        score = 58
+                        val delta = (effectivePlankAlign - 185f).roundToInt().coerceAtLeast(1)
+                        plankScoreOverride = 58
                         hipHint = 180
-                        faultMsg = "Abaissez les hanches — fesses trop hautes"
-                        feedback = faultMsg
-                        val (gx, gy) = bodyLineGhost(shS, hpS, anS)
-                        corrections.add(
-                            AngleCorrection(
-                                jointIndex = hpIdx,
-                                jointLabelFr = "Hanches",
-                                currentDeg = bodyLineAlign.roundToInt(),
-                                targetMinDeg = 166,
-                                targetMaxDeg = 194,
-                                deltaDeg = delta,
-                                severity = FormQuality.FAULT,
-                                arrowDx = 0f,
-                                arrowDy = 1f,
-                                ghostAnchorIndex = shIdx,
-                                ghostTargetX = gx,
-                                ghostTargetY = gy,
-                                shortBadgeFr = "HANCHES -$delta°",
-                                instructionFr = "Abaissez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 166–194°)",
-                                voiceCueFr = "Abaissez les hanches"
+                        val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
+                        rawIssues.add(
+                            RawPostureIssue(
+                                key = "PLANK_HIP_PIKE",
+                                correction = AngleCorrection(
+                                    jointIndex = hpIdx,
+                                    jointLabelFr = "Hanches",
+                                    currentDeg = effectivePlankAlign.roundToInt(),
+                                    targetMinDeg = 166,
+                                    targetMaxDeg = 194,
+                                    deltaDeg = delta,
+                                    severity = FormQuality.FAULT,
+                                    arrowDx = 0f,
+                                    arrowDy = 1f,
+                                    ghostAnchorIndex = shIdx,
+                                    ghostTargetX = gx,
+                                    ghostTargetY = gy,
+                                    shortBadgeFr = "HANCHES -$delta°",
+                                    instructionFr = "Abaissez les hanches de $delta° (${effectivePlankAlign.roundToInt()}° → 166–194°)",
+                                    voiceCueFr = "Abaissez les hanches"
+                                ),
+                                scorePenalty = 42,
+                                feedbackMsgFr = "Abaissez les hanches — fesses trop hautes"
                             )
                         )
+                        baseFeedback = "Abaissez les hanches — fesses trop hautes"
                     }
                 }
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, bodyLineAlign.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = anIdx, targetRangeText = "166–194°", targetDegHint = hipHint
+                        hpIdx, hpS.x, hpS.y, effectivePlankAlign.roundToInt(),
+                        if (aligned) FormQuality.GOOD else FormQuality.FAULT,
+                        parentIndex = shIdx, childIndex = alignEndIdx, targetRangeText = "166–194°", targetDegHint = hipHint
                     )
                 )
                 badges.add(
@@ -2109,10 +2312,14 @@ class BiomechanicsEngine(
             }
 
             ExerciseType.BURPEE -> {
+                val shW2D = dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.06f)
+                val torsoLen2D = dist2D(shS, hpS)
                 val bodyHorizontal = if (use3D) {
                     torsoTilt >= (if (isStrict) 55f else 44f) || (!isStrict && frontFloorHorizontal)
                 } else {
-                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.60f || (!isStrict && frontFloorHorizontal)
+                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.65f ||
+                        (!isStrict && frontFloorHorizontal) ||
+                        (torsoLen2D < shW2D * 0.95f && abs(shS.y - anS.y) < shW2D * 1.9f)
                 }
                 val standAngleThresh = if (isStrict) 155f else 145f
                 val standingTall = hipAngle > standAngleThresh && kneeAngle > standAngleThresh && shS.y < hpS.y
@@ -2120,10 +2327,21 @@ class BiomechanicsEngine(
                     0 -> {
                         phase = if (kneeAngle < 130f) MovementPhase.ECCENTRIC else MovementPhase.READY
                         romPct = if (bodyHorizontal) 75 else mapRange(kneeAngle, 165f, 90f) / 2
-                        if (kneeAngle < 130f && repStartTsMs == 0L) repStartTsMs = timestampMs
+                        if (kneeAngle < 130f && repStartTsMs == 0L) {
+                            repStartTsMs = timestampMs
+                            phase1StartPosMeters = primaryPosMeters
+                            phase1PeakVelMps = 0f
+                        }
+                        if (phase == MovementPhase.ECCENTRIC && instantSpeedMps > phase1PeakVelMps) {
+                            phase1PeakVelMps = instantSpeedMps
+                        }
                         if (bodyHorizontal) {
                             burpeeStage = 1
                             burpeeBottomEnteredTsMs = timestampMs
+                            concentricLeftBottomTsMs = 0L
+                            phase1EndPosMeters = primaryPosMeters
+                            phase2StartPosMeters = primaryPosMeters
+                            phase2PeakVelMps = 0f
                             phase = MovementPhase.BOTTOM
                             if (repStartTsMs == 0L) repStartTsMs = timestampMs
                         }
@@ -2137,17 +2355,41 @@ class BiomechanicsEngine(
                             if (dwellMs >= MIN_BOTTOM_DWELL_MS && repDurMs >= minRepDurationMs()) {
                                 repCount++
                                 recordRom(100)
-                                repCompletedNow = true
-                                completedRepRom = 100
-                                completedRepDurSec = computeRepDurationSec(timestampMs)
-                                voiceCue = "$repCount"
+                                val totalDur = computeRepDurationSec(timestampMs)
+                                val concStart = if (concentricLeftBottomTsMs > 0L) concentricLeftBottomTsMs else burpeeBottomEnteredTsMs
+                                val concDur = ((timestampMs - concStart) / 1000f).coerceIn(0.25f, totalDur)
+                                val eccDur = ((burpeeBottomEnteredTsMs - repStartTsMs) / 1000f).coerceIn(0.20f, totalDur)
+                                val disp2 = if (phase2StartPosMeters.isFinite()) abs(primaryPosMeters - phase2StartPosMeters) else 0.75f
+                                val disp1 = if (phase1StartPosMeters.isFinite() && phase1EndPosMeters.isFinite()) abs(phase1EndPosMeters - phase1StartPosMeters) else 0.75f
+                                recordCompletedCycle(
+                                    CycleResult(
+                                        completed = true,
+                                        completedRom = 100,
+                                        durationSec = totalDur,
+                                        phase1DurationSec = eccDur,
+                                        phase2DurationSec = concDur,
+                                        phase1DispMeters = disp1,
+                                        phase2DispMeters = disp2,
+                                        phase1PeakVelMps = phase1PeakVelMps,
+                                        phase2PeakVelMps = phase2PeakVelMps
+                                    )
+                                )
+                                repVoiceCue = "$repCount"
                             }
                             repStartTsMs = 0L
                             burpeeBottomEnteredTsMs = 0L
+                            concentricLeftBottomTsMs = 0L
                             burpeeStage = 0
                             phase = MovementPhase.READY
                         } else if (!bodyHorizontal && shS.y < hpS.y) {
                             if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                                if (concentricLeftBottomTsMs == 0L) {
+                                    concentricLeftBottomTsMs = timestampMs
+                                    phase2StartPosMeters = primaryPosMeters
+                                    phase2PeakVelMps = 0f
+                                }
+                                if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                                velocityEstimator.updateLiveVelocity(instantSpeedMps)
                                 phase = MovementPhase.CONCENTRIC
                             } else {
                                 burpeeStage = 0
@@ -2160,38 +2402,41 @@ class BiomechanicsEngine(
                 }
                 if (bodyHorizontal && bodyLineAlign < 152f) {
                     val delta = (168f - bodyLineAlign).roundToInt().coerceAtLeast(1)
-                    score -= 22
-                    faultMsg = "Gainez le bassin en position planche"
                     val (gx, gy) = bodyLineGhost(shS, hpS, anS)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Gainage",
-                            currentDeg = bodyLineAlign.roundToInt(),
-                            targetMinDeg = 160,
-                            targetMaxDeg = 195,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            ghostAnchorIndex = shIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BASSIN +$delta°",
-                            instructionFr = "Remontez le bassin de $delta° en planche (${bodyLineAlign.roundToInt()}° → ≥160°)",
-                            voiceCueFr = "Gainez le bassin en planche"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "BURPEE_SAG",
+                            correction = AngleCorrection(
+                                jointIndex = hpIdx,
+                                jointLabelFr = "Gainage",
+                                currentDeg = bodyLineAlign.roundToInt(),
+                                targetMinDeg = 160,
+                                targetMaxDeg = 195,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                ghostAnchorIndex = shIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BASSIN +$delta°",
+                                instructionFr = "Remontez le bassin de $delta° en planche (${bodyLineAlign.roundToInt()}° → ≥160°)",
+                                voiceCueFr = "Gainez le bassin en planche"
+                            ),
+                            scorePenalty = 22,
+                            feedbackMsgFr = "Gainez le bassin en position planche"
                         )
                     )
                 }
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), scoreToQuality(score),
+                        hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), FormQuality.GOOD,
                         parentIndex = shIdx, childIndex = knIdx, targetRangeText = "160–180°"
                     )
                 )
-                feedback = faultMsg ?: when (burpeeStage) {
-                    1 -> "Remontez explosif et sautez !"
-                    else -> "Descendez en planche gainée puis enchaînez."
+                baseFeedback = when (burpeeStage) {
+                    1 -> "Burpee $detectedVariantFr — remontez explosif !"
+                    else -> "Burpee $detectedVariantFr — descendez en planche gainée."
                 }
             }
 
@@ -2212,27 +2457,29 @@ class BiomechanicsEngine(
                 val legsSpread = ankleW > shoulderW * 1.15f
                 romPct = mapRange(armFullAngle, 22f, if (isStrict) 152f else 142f)
 
-                if (anklesClearlyVisible && armFullAngle > 130f && !legsSpread) {
-                    score -= 14
-                    faultMsg = "Écartez davantage les jambes en synchronisant"
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = anIdx,
-                            jointLabelFr = "Appuis",
-                            currentDeg = ((ankleW / shoulderW) * 100f).roundToInt(),
-                            targetMinDeg = 115,
-                            targetMaxDeg = 180,
-                            deltaDeg = 20,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = if (useLeft) -1f else 1f,
-                            arrowDy = 0f,
-                            shortBadgeFr = "PIEDS +LARGE",
-                            instructionFr = "Écartez davantage les pieds au sommet des bras",
-                            voiceCueFr = "Écartez davantage les jambes"
+                if (anklesClearlyVisible && armFullAngle > 130f && !legsSpread && variant.id != "LOW_IMPACT") {
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "JJ_LEGS",
+                            correction = AngleCorrection(
+                                jointIndex = anIdx,
+                                jointLabelFr = "Appuis",
+                                currentDeg = ((ankleW / shoulderW) * 100f).roundToInt(),
+                                targetMinDeg = 115,
+                                targetMaxDeg = 180,
+                                deltaDeg = 20,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = if (useLeft) -1f else 1f,
+                                arrowDy = 0f,
+                                shortBadgeFr = "PIEDS +LARGE",
+                                instructionFr = "Écartez davantage les pieds au sommet des bras",
+                                voiceCueFr = "Écartez davantage les jambes"
+                            ),
+                            scorePenalty = 14,
+                            feedbackMsgFr = "Écartez davantage les jambes en synchronisant"
                         )
                     )
                 }
-                // Never block rep counting on legsSpread when in ADAPTIVE or when ankles are occluded / side-view
                 val requireLegsGate = isStrict && anklesClearlyVisible
                 val cycle = updateUpDownCycle(
                     metric = armFullAngle,
@@ -2241,14 +2488,13 @@ class BiomechanicsEngine(
                     finishThreshold = if (isStrict) 42f else 48f,
                     extraTopCondition = if (requireLegsGate) legsSpread else true,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle)
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftArmFull, rightArmFull, lArmW, rArmW,
                     active = armFullAngle > 60f,
                     jointLabel = "bras",
@@ -2256,17 +2502,25 @@ class BiomechanicsEngine(
                     rightJointIdx = RIGHT_SHOULDER
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        shIdx, shS.x, shS.y, armFullAngle.roundToInt(), scoreToQuality(score),
+                        shIdx, shS.x, shS.y, armFullAngle.roundToInt(), FormQuality.GOOD,
                         parentIndex = hpIdx, childIndex = wrIdx, targetRangeText = if (isStrict) "≥138°" else "≥128°"
                     )
                 )
-                feedback = faultMsg ?: "Rythme fluide — bras hauts et pieds écartés."
+                baseFeedback = "Jumping Jack $detectedVariantFr — rythme fluide !"
             }
 
             ExerciseType.PULL_UP -> {
+                val isArcher = variant.id == "ARCHER"
+                val activeLeft = if (isArcher) (variant.preferredActiveLeft ?: (leftElbow <= rightElbow)) else useLeft
+                val activePullElbow = if (isArcher) minOf(leftElbow, rightElbow) else elbowAngle
+                val activeElIdx = if (isArcher) (if (activeLeft) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
+                val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
+                val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
+                val activeElS = screenPts[activeElIdx]
+
                 val noseY = geomPts[NOSE].y
                 val midWristY = (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
                 val chinMargin = if (use3D) 0.06f else 0.035f
@@ -2275,15 +2529,14 @@ class BiomechanicsEngine(
                 val finishThresh = if (isStrict) 155f else 142f
                 val startThresh = if (isStrict) 148f else 140f
 
-                // Wide-grip pull-ups reach chin-over-bar at ~95-110° elbows -> fuse chinOverHands with elbow flexion
-                val effectivePullMetric = if (chinOverHands && elbowAngle < 122f) {
-                    minOf(elbowAngle, bottomThresh - 2f)
+                val effectivePullMetric = if (chinOverHands && activePullElbow < 122f) {
+                    minOf(activePullElbow, bottomThresh - 2f)
                 } else {
-                    elbowAngle
+                    activePullElbow
                 }
                 romPct = maxOf(
-                    mapRange(elbowAngle, 160f, if (isStrict) 58f else 76f),
-                    if (chinOverHands && elbowAngle < 122f) 96 else 0
+                    mapRange(activePullElbow, 160f, if (isStrict) 58f else 76f),
+                    if (chinOverHands && activePullElbow < 122f) 96 else 0
                 )
 
                 val cycle = updateDownUpCycle(
@@ -2292,114 +2545,124 @@ class BiomechanicsEngine(
                     bottomThreshold = bottomThresh,
                     finishThreshold = finishThresh,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isArcher) activeLeft else null)
 
-                if (reachedBottom && !chinOverHands && elbowAngle < bottomThresh + 12f) {
-                    val delta = (elbowAngle - 62f).roundToInt().coerceAtLeast(8)
-                    score -= 15
-                    faultMsg = "Tirez la poitrine plus haut vers la barre"
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Tirage",
-                            currentDeg = elbowAngle.roundToInt(),
-                            targetMinDeg = 45,
-                            targetMaxDeg = bottomThresh.roundToInt(),
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            shortBadgeFr = "TIREZ +HAUT",
-                            instructionFr = "Tirez le menton au-dessus des mains (encore -$delta° coude)",
-                            voiceCueFr = "Tirez la poitrine plus haut"
+                if (reachedBottom && !chinOverHands && activePullElbow < bottomThresh + 12f &&
+                    shouldEmitDepthHint(activePullElbow, metricTolerance = 3.5f)
+                ) {
+                    val delta = (activePullElbow - 62f).roundToInt().coerceAtLeast(8)
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "PULLUP_CHIN",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Tirage",
+                                currentDeg = activePullElbow.roundToInt(),
+                                targetMinDeg = 45,
+                                targetMaxDeg = bottomThresh.roundToInt(),
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                shortBadgeFr = "TIREZ +HAUT",
+                                instructionFr = "Tirez le menton au-dessus des mains (encore -$delta° coude)",
+                                voiceCueFr = "Tirez la poitrine plus haut"
+                            ),
+                            scorePenalty = 15,
+                            feedbackMsgFr = "Tirez la poitrine plus haut vers la barre",
+                            isDepthCue = true
                         )
                     )
                 }
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftElbow, rightElbow, lArmW, rArmW,
-                    active = elbowAngle < 135f,
+                    active = activePullElbow < 135f,
                     jointLabel = "bras",
                     leftJointIdx = LEFT_ELBOW,
                     rightJointIdx = RIGHT_ELBOW
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        elIdx, elS.x, elS.y, elbowAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤${bottomThresh.roundToInt()}°"
+                        activeElIdx, activeElS.x, activeElS.y, activePullElbow.roundToInt(), FormQuality.GOOD,
+                        parentIndex = activeShIdx, childIndex = activeWrIdx, targetRangeText = "≤${bottomThresh.roundToInt()}°"
                     )
                 )
-                feedback = faultMsg ?: "Tirez les coudes vers les hanches, amplitude complète."
+                baseFeedback = "Tractions ($detectedVariantFr) — coudes vers les hanches."
             }
 
             ExerciseType.BENT_ROW -> {
-                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
-                val isUnilateral = bothVisible && bothArmsVis && abs(leftElbow - rightElbow) > 32f
-                val activeLeftRow = if (isUnilateral) leftElbow <= rightElbow else useLeft
+                val isUnilateral = variant.usesUnilateralLimb
+                val activeLeftRow = if (isUnilateral) (variant.preferredActiveLeft ?: (leftElbow <= rightElbow)) else useLeft
                 val activeRowElbow = if (isUnilateral) minOf(leftElbow, rightElbow) else elbowAngle
                 val activeElIdx = if (isUnilateral) (if (activeLeftRow) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
                 val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
                 val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
                 val activeElS = screenPts[activeElIdx]
-                if (isUnilateral) detectedVariantFr = "Unilatéral"
 
                 romPct = mapRange(activeRowElbow, 155f, if (isStrict) 72f else 88f)
                 var torsoHint: Int? = null
+                val maxRowTilt = if (variant.exemptsTorsoLean) 88f else 80f
                 if (torsoTilt < 24f) {
                     val delta = (40f - torsoTilt).roundToInt().coerceAtLeast(1)
-                    score -= 22
                     torsoHint = 45
-                    faultMsg = "Penchez davantage le buste (35–55°)"
                     val (gx, gy) = hingeTorsoGhost(hpS, shS, 45f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 35,
-                            targetMaxDeg = 55,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE +$delta°",
-                            instructionFr = "Penchez le buste de $delta° (${torsoTilt.roundToInt()}° → 35–55°)",
-                            voiceCueFr = "Penchez davantage le buste"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "ROW_TOO_UPRIGHT",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 35,
+                                targetMaxDeg = 55,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE +$delta°",
+                                instructionFr = "Penchez le buste de $delta° (${torsoTilt.roundToInt()}° → 35–55°)",
+                                voiceCueFr = "Penchez davantage le buste"
+                            ),
+                            scorePenalty = 22,
+                            feedbackMsgFr = "Penchez davantage le buste (35–55°)"
                         )
                     )
-                } else if (torsoTilt > 80f) {
+                } else if (torsoTilt > maxRowTilt) {
                     val delta = (torsoTilt - 55f).roundToInt().coerceAtLeast(1)
-                    score -= 16
                     torsoHint = 50
-                    faultMsg = "Relevez légèrement le buste, dos plat"
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 50f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 35,
-                            targetMaxDeg = 55,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE -$delta°",
-                            instructionFr = "Relevez le buste de $delta° (${torsoTilt.roundToInt()}° → 35–55°)",
-                            voiceCueFr = "Relevez légèrement le buste"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "ROW_TOO_LOW",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 35,
+                                targetMaxDeg = 55,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE -$delta°",
+                                instructionFr = "Relevez le buste de $delta° (${torsoTilt.roundToInt()}° → 35–55°)",
+                                voiceCueFr = "Relevez légèrement le buste"
+                            ),
+                            scorePenalty = 16,
+                            feedbackMsgFr = "Relevez légèrement le buste, dos plat"
                         )
                     )
                 }
@@ -2411,27 +2674,24 @@ class BiomechanicsEngine(
                     bottomThreshold = rowBottomThresh,
                     finishThreshold = if (isStrict) 150f else 140f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isUnilateral) activeLeftRow else null)
 
-                if (!isUnilateral) {
-                    addSymmetryCorrectionIfNeeded(
-                        leftElbow, rightElbow, lArmW, rArmW,
-                        active = activeRowElbow < 135f,
-                        jointLabel = "tirage",
-                        leftJointIdx = LEFT_ELBOW,
-                        rightJointIdx = RIGHT_ELBOW
-                    )
-                }
+                addSymmetryIssueIfNeeded(
+                    leftElbow, rightElbow, lArmW, rArmW,
+                    active = activeRowElbow < 135f,
+                    jointLabel = "tirage",
+                    leftJointIdx = LEFT_ELBOW,
+                    rightJointIdx = RIGHT_ELBOW
+                )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        activeElIdx, activeElS.x, activeElS.y, activeRowElbow.roundToInt(), scoreToQuality(score),
+                        activeElIdx, activeElS.x, activeElS.y, activeRowElbow.roundToInt(), FormQuality.GOOD,
                         parentIndex = activeShIdx,
                         childIndex = activeWrIdx,
                         targetRangeText = "≤${rowBottomThresh.roundToInt()}°"
@@ -2440,279 +2700,318 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         hpIdx, hpS.x, hpS.y, torsoTilt.roundToInt(),
-                        if (torsoTilt in 24f..80f) FormQuality.GOOD else FormQuality.FAULT,
+                        if (torsoTilt in 24f..maxRowTilt) FormQuality.GOOD else FormQuality.FAULT,
                         parentIndex = shIdx, childIndex = knIdx, targetRangeText = "35–55°", targetDegHint = torsoHint
                     )
                 )
-                feedback = faultMsg ?: if (isUnilateral) {
-                    "Rowing unilatéral (${torsoTilt.roundToInt()}°) — tirez le coude vers la hanche."
-                } else {
-                    "Buste fixe (${torsoTilt.roundToInt()}°) — serrez les omoplates."
-                }
+                baseFeedback = "Rowing $detectedVariantFr (${torsoTilt.roundToInt()}°) — serrez les omoplates."
             }
 
             ExerciseType.GLUTE_BRIDGE -> {
-                romPct = mapRange(hipAngle, if (isStrict) 115f else 128f, if (isStrict) 172f else 164f)
+                val isSingleLeg = variant.usesUnilateralLimb
+                val groundedLeft = variant.preferredActiveLeft ?: useLeft
+                val activeHip = if (isSingleLeg) (if (groundedLeft) leftHip else rightHip) else hipAngle
+                val activeHpIdx = if (isSingleLeg) (if (groundedLeft) LEFT_HIP else RIGHT_HIP) else hpIdx
+                val activeKnIdx = if (isSingleLeg) (if (groundedLeft) LEFT_KNEE else RIGHT_KNEE) else knIdx
+                val activeHpS = screenPts[activeHpIdx]
+
+                romPct = mapRange(activeHip, if (isStrict) 115f else 128f, if (isStrict) 172f else 164f)
                 var hipHint: Int? = null
                 val supineAlign = if (use3D) {
-                    bodyLineAlignment3D(geomPts[shIdx], geomPts[hpIdx], geomPts[knIdx])
+                    bodyLineAlignment3D(geomPts[shIdx], geomPts[activeHpIdx], geomPts[activeKnIdx])
                 } else {
-                    bodyLineAlignmentDegrees(shS, hpS, knS)
+                    bodyLineAlignmentDegrees(shS, activeHpS, screenPts[activeKnIdx])
                 }
                 if (supineAlign > 194f) {
                     val cur = supineAlign.roundToInt()
                     val delta = (cur - 180).coerceAtLeast(6)
-                    score -= 20
                     hipHint = 175
-                    faultMsg = "Ne cambrez pas les lombaires en haut"
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Bassin",
-                            currentDeg = cur,
-                            targetMinDeg = 165,
-                            targetMaxDeg = 182,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "BASSIN -$delta°",
-                            instructionFr = "Stoppez l'extension à 175° sans cambrer (-$delta°)",
-                            voiceCueFr = "Ne cambrez pas le bas du dos"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "BRIDGE_HYPEREXT",
+                            correction = AngleCorrection(
+                                jointIndex = activeHpIdx,
+                                jointLabelFr = "Bassin",
+                                currentDeg = cur,
+                                targetMinDeg = 165,
+                                targetMaxDeg = 182,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "BASSIN -$delta°",
+                                instructionFr = "Stoppez l'extension à 175° sans cambrer (-$delta°)",
+                                voiceCueFr = "Ne cambrez pas le bas du dos"
+                            ),
+                            scorePenalty = 20,
+                            feedbackMsgFr = "Ne cambrez pas les lombaires en haut"
                         )
                     )
                 }
 
                 val bridgeTopThresh = if (isStrict) 162f else 156f
                 val cycle = updateUpDownCycle(
-                    metric = hipAngle,
+                    metric = activeHip,
                     startThreshold = if (isStrict) 128f else 136f,
                     topThreshold = bridgeTopThresh,
                     finishThreshold = if (isStrict) 125f else 136f,
                     extraTopCondition = true,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isSingleLeg) groundedLeft else null)
 
-                if (!reachedBottom && hipAngle in 138f..(bridgeTopThresh - 2f)) {
+                if (!reachedBottom && activeHip in 138f..(bridgeTopThresh - 2f) &&
+                    shouldEmitDepthHint(activeHip, metricTolerance = 3.0f)
+                ) {
                     val targetDeg = bridgeTopThresh.roundToInt()
-                    val delta = (bridgeTopThresh - hipAngle).roundToInt().coerceAtLeast(1)
+                    val delta = (bridgeTopThresh - activeHip).roundToInt().coerceAtLeast(1)
                     hipHint = targetDeg
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Hanches",
-                            currentDeg = hipAngle.roundToInt(),
-                            targetMinDeg = targetDeg,
-                            targetMaxDeg = 180,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            shortBadgeFr = "HANCHES +$delta°",
-                            instructionFr = "Montez encore les hanches (+$delta° : ${hipAngle.roundToInt()}° → ≥$targetDeg°)",
-                            voiceCueFr = "Montez les hanches plus haut"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "BRIDGE_HEIGHT",
+                            correction = AngleCorrection(
+                                jointIndex = activeHpIdx,
+                                jointLabelFr = "Hanches",
+                                currentDeg = activeHip.roundToInt(),
+                                targetMinDeg = targetDeg,
+                                targetMaxDeg = 180,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                shortBadgeFr = "HANCHES +$delta°",
+                                instructionFr = "Montez encore les hanches (+$delta° : ${activeHip.roundToInt()}° → ≥$targetDeg°)",
+                                voiceCueFr = "Montez les hanches plus haut"
+                            ),
+                            scorePenalty = 4,
+                            isDepthCue = true
                         )
                     )
                 }
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(),
-                        if (hipHint != null && score < 82) FormQuality.FAULT else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "≥${bridgeTopThresh.roundToInt()}°", targetDegHint = hipHint
+                        activeHpIdx, activeHpS.x, activeHpS.y, activeHip.roundToInt(), FormQuality.GOOD,
+                        parentIndex = shIdx, childIndex = activeKnIdx, targetRangeText = "≥${bridgeTopThresh.roundToInt()}°", targetDegHint = hipHint
                     )
                 )
-                feedback = faultMsg ?: "Extension complète des hanches (${hipAngle.roundToInt()}°), serrez 1s."
+                baseFeedback = "Pont fessier $detectedVariantFr (${activeHip.roundToInt()}°) — serrez en haut."
             }
 
             ExerciseType.LEG_RAISE -> {
-                romPct = mapRange(hipAngle, if (isStrict) 168f else 156f, if (isStrict) 92f else 102f)
+                val isAlternating = variant.usesUnilateralLimb
+                val isBentKneeVariant = variant.id == "BENT_KNEE"
+                val activeLeft = variant.preferredActiveLeft ?: useLeft
+                val activeHip = if (isAlternating) minOf(leftHip, rightHip) else hipAngle
+                val activeKnee = if (isAlternating) (if (activeLeft) leftKnee else rightKnee) else kneeAngle
+                val activeHpIdx = if (isAlternating) (if (activeLeft) LEFT_HIP else RIGHT_HIP) else hpIdx
+                val activeKnIdx = if (isAlternating) (if (activeLeft) LEFT_KNEE else RIGHT_KNEE) else knIdx
+                val activeAnIdx = if (isAlternating) (if (activeLeft) LEFT_ANKLE else RIGHT_ANKLE) else anIdx
+                val activeHpS = screenPts[activeHpIdx]
+                val activeKnS = screenPts[activeKnIdx]
+                val activeAnS = screenPts[activeAnIdx]
+
+                romPct = mapRange(activeHip, if (isStrict) 168f else 156f, if (isStrict) 92f else 102f)
                 var kneeHint: Int? = null
-                if (kneeAngle < 135f) {
-                    val delta = (155f - kneeAngle).roundToInt().coerceAtLeast(1)
-                    score -= 18
+                if (activeKnee < 135f && (isStrict || !isBentKneeVariant)) {
+                    val delta = (155f - activeKnee).roundToInt().coerceAtLeast(1)
                     kneeHint = 155
-                    faultMsg = "Gardez les jambes plus tendues"
-                    val (gx, gy) = straightenLimbGhost(hpS, knS, anS)
-                    val dx = gx - anS.x
-                    val dy = gy - anS.y
+                    val (gx, gy) = straightenLimbGhost(activeHpS, activeKnS, activeAnS)
+                    val dx = gx - activeAnS.x
+                    val dy = gy - activeAnS.y
                     val n = hypot(dx, dy).coerceAtLeast(0.001f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = knIdx,
-                            jointLabelFr = "Genoux",
-                            currentDeg = kneeAngle.roundToInt(),
-                            targetMinDeg = 150,
-                            targetMaxDeg = 180,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = dx / n,
-                            arrowDy = dy / n,
-                            ghostAnchorIndex = knIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "GENOU +$delta°",
-                            instructionFr = "Tendez davantage les jambes (+$delta° : ${kneeAngle.roundToInt()}° → ≥150°)",
-                            voiceCueFr = "Tendez davantage les jambes"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "LEGRAISE_KNEE",
+                            correction = AngleCorrection(
+                                jointIndex = activeKnIdx,
+                                jointLabelFr = "Genoux",
+                                currentDeg = activeKnee.roundToInt(),
+                                targetMinDeg = 150,
+                                targetMaxDeg = 180,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = dx / n,
+                                arrowDy = dy / n,
+                                ghostAnchorIndex = activeKnIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "GENOU +$delta°",
+                                instructionFr = "Tendez davantage les jambes (+$delta° : ${activeKnee.roundToInt()}° → ≥150°)",
+                                voiceCueFr = "Tendez davantage les jambes"
+                            ),
+                            scorePenalty = 18,
+                            feedbackMsgFr = "Gardez les jambes plus tendues"
                         )
                     )
                 }
 
                 val legBottomThresh = if (isStrict) 104f else 112f
                 val cycle = updateDownUpCycle(
-                    metric = hipAngle,
+                    metric = activeHip,
                     startThreshold = if (isStrict) 152f else 145f,
                     bottomThreshold = legBottomThresh,
                     finishThreshold = if (isStrict) 156f else 145f,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isAlternating) activeLeft else null)
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "≤${legBottomThresh.roundToInt()}°"
+                        activeHpIdx, activeHpS.x, activeHpS.y, activeHip.roundToInt(), FormQuality.GOOD,
+                        parentIndex = shIdx, childIndex = activeKnIdx, targetRangeText = "≤${legBottomThresh.roundToInt()}°"
                     )
                 )
                 badges.add(
                     JointAngleBadge(
-                        knIdx, knS.x, knS.y, kneeAngle.roundToInt(),
+                        activeKnIdx, activeKnS.x, activeKnS.y, activeKnee.roundToInt(),
                         if (kneeHint != null) FormQuality.FAULT else FormQuality.GOOD,
-                        parentIndex = hpIdx, childIndex = anIdx, targetRangeText = "≥150°", targetDegHint = kneeHint
+                        parentIndex = activeHpIdx, childIndex = activeAnIdx, targetRangeText = if (isBentKneeVariant) "Fléchis" else "≥150°", targetDegHint = kneeHint
                     )
                 )
-                feedback = faultMsg ?: "Contrôlez la descente, lombaires collées au sol."
+                baseFeedback = "Relevé de jambes ($detectedVariantFr) — descente lente et contrôlée."
             }
 
             ExerciseType.LATERAL_RAISE -> {
-                romPct = mapRange(shoulderAngle, if (isStrict) 15f else 24f, if (isStrict) 90f else 84f)
+                val isUnilateral = variant.usesUnilateralLimb
+                val activeLeft = variant.preferredActiveLeft ?: useLeft
+                val activeShoulder = if (isUnilateral) maxOf(leftShoulder, rightShoulder) else shoulderAngle
+                val activeShIdx = if (isUnilateral) (if (activeLeft) LEFT_SHOULDER else RIGHT_SHOULDER) else shIdx
+                val activeElIdx = if (isUnilateral) (if (activeLeft) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
+                val activeHpIdx = if (isUnilateral) (if (activeLeft) LEFT_HIP else RIGHT_HIP) else hpIdx
+                val activeShS = screenPts[activeShIdx]
+
+                romPct = mapRange(activeShoulder, if (isStrict) 15f else 24f, if (isStrict) 90f else 84f)
                 var shHint: Int? = null
-                if (shoulderAngle > 108f) {
-                    val delta = (shoulderAngle - 92f).roundToInt().coerceAtLeast(1)
-                    score -= 18
+                if (activeShoulder > 108f) {
+                    val delta = (activeShoulder - 92f).roundToInt().coerceAtLeast(1)
                     shHint = 90
-                    faultMsg = "Stoppez à l'horizontale (90°) sans hausser les trapèzes"
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Épaule",
-                            currentDeg = shoulderAngle.roundToInt(),
-                            targetMinDeg = 80,
-                            targetMaxDeg = 95,
-                            deltaDeg = delta,
-                            severity = FormQuality.CAUTION,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            shortBadgeFr = "ÉPAULE -$delta°",
-                            instructionFr = "Stoppez à 90° (-$delta° : ${shoulderAngle.roundToInt()}° → 85–95°)",
-                            voiceCueFr = "Stoppez à 90 degrés, épaules basses"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "LATRAISE_HIGH",
+                            correction = AngleCorrection(
+                                jointIndex = activeShIdx,
+                                jointLabelFr = "Épaule",
+                                currentDeg = activeShoulder.roundToInt(),
+                                targetMinDeg = 80,
+                                targetMaxDeg = 95,
+                                deltaDeg = delta,
+                                severity = FormQuality.CAUTION,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                shortBadgeFr = "ÉPAULE -$delta°",
+                                instructionFr = "Stoppez à 90° (-$delta° : ${activeShoulder.roundToInt()}° → 85–95°)",
+                                voiceCueFr = "Stoppez à 90 degrés, épaules basses"
+                            ),
+                            scorePenalty = 18,
+                            feedbackMsgFr = "Stoppez à l'horizontale (90°) sans hausser les trapèzes"
                         )
                     )
                 }
-                if (torsoTilt > 15f) {
+                if (!variant.exemptsTorsoLean && torsoTilt > 17f) {
                     val delta = (torsoTilt - 15f).roundToInt().coerceAtLeast(1)
-                    score -= 20
-                    faultMsg = "Ne balancez pas le buste"
                     val (gx, gy, adx, ady) = uprightTorsoGhost(hpS, shS, 6f)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = shIdx,
-                            jointLabelFr = "Buste",
-                            currentDeg = torsoTilt.roundToInt(),
-                            targetMinDeg = 0,
-                            targetMaxDeg = 15,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = adx,
-                            arrowDy = ady,
-                            ghostAnchorIndex = hpIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "BUSTE -$delta°",
-                            instructionFr = "Stabilisez le buste (-$delta° : ${torsoTilt.roundToInt()}° → ≤15°)",
-                            voiceCueFr = "Ne balancez pas le buste"
+                    rawIssues.add(
+                        RawPostureIssue(
+                            key = "LATRAISE_SWING",
+                            correction = AngleCorrection(
+                                jointIndex = shIdx,
+                                jointLabelFr = "Buste",
+                                currentDeg = torsoTilt.roundToInt(),
+                                targetMinDeg = 0,
+                                targetMaxDeg = 15,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = adx,
+                                arrowDy = ady,
+                                ghostAnchorIndex = hpIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "BUSTE -$delta°",
+                                instructionFr = "Stabilisez le buste (-$delta° : ${torsoTilt.roundToInt()}° → ≤15°)",
+                                voiceCueFr = "Ne balancez pas le buste"
+                            ),
+                            scorePenalty = 20,
+                            feedbackMsgFr = "Ne balancez pas le buste"
                         )
                     )
                 }
 
                 val latTopThresh = if (isStrict) 78f else 72f
                 val cycle = updateUpDownCycle(
-                    metric = shoulderAngle,
+                    metric = activeShoulder,
                     startThreshold = if (isStrict) 28f else 34f,
                     topThreshold = latTopThresh,
                     finishThreshold = if (isStrict) 26f else 34f,
                     extraTopCondition = true,
                     currentRom = romPct,
-                    fault = faultMsg,
+                    primaryPosMeters = primaryPosMeters,
+                    instantSpeedMps = instantSpeedMps,
                     timestampMs = timestampMs
                 )
-                repCompletedNow = cycle.completed
-                completedRepRom = cycle.completedRom
-                completedRepDurSec = cycle.durationSec
+                recordCompletedCycle(cycle, if (isUnilateral) activeLeft else null)
 
-                addSymmetryCorrectionIfNeeded(
+                addSymmetryIssueIfNeeded(
                     leftShoulder, rightShoulder, lArmW, rArmW,
-                    active = shoulderAngle > 35f,
+                    active = activeShoulder > 38f,
                     jointLabel = "épaules",
                     leftJointIdx = LEFT_SHOULDER,
                     rightJointIdx = RIGHT_SHOULDER
                 )
 
-                if (repCompletedNow) voiceCue = "$repCount"
+                if (repCompletedNow) repVoiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        shIdx, shS.x, shS.y, shoulderAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = hpIdx, childIndex = elIdx, targetRangeText = "${latTopThresh.roundToInt()}–95°", targetDegHint = shHint
+                        activeShIdx, activeShS.x, activeShS.y, activeShoulder.roundToInt(), FormQuality.GOOD,
+                        parentIndex = activeHpIdx, childIndex = activeElIdx, targetRangeText = "${latTopThresh.roundToInt()}–95°", targetDegHint = shHint
                     )
                 )
-                feedback = faultMsg ?: "Élevez jusqu'à 90° (${shoulderAngle.roundToInt()}°), épaules basses."
+                baseFeedback = "Élévations $detectedVariantFr (${activeShoulder.roundToInt()}°), épaules basses."
             }
         }
 
-        // Update Velocity-Based Training (VBT) telemetry (concentric m/s, 3-phase tempo, velocity loss %, RIR)
-        val vbtMetrics = vbtEngine.onFrame(
-            exercise = currentExercise,
-            phase = phase,
-            repCompletedNow = repCompletedNow,
-            screenPts = screenPts,
-            worldPts = worldPts,
-            use3D = use3D,
-            timestampMs = timestampMs
-        )
-        if (repCompletedNow && vbtMetrics.alertVoiceCueFr != null) {
-            voiceCue = "$repCount. ${vbtMetrics.alertVoiceCueFr}"
-        }
-
-        // Order corrections: FAULT first, then largest angle delta
-        val orderedCorrections = corrections.sortedWith(
-            compareBy<AngleCorrection> {
-                when (it.severity) {
-                    FormQuality.FAULT -> 0
-                    FormQuality.CAUTION -> 1
-                    FormQuality.GOOD -> 2
-                }
-            }.thenByDescending { abs(it.deltaDeg) }
+        // Apply Pro Anti-Spam Posture Coaching Gate (temporal persistence + display hold + voice cooldowns!)
+        val postureResult = postureCoach.evaluate(
+            rawIssues = rawIssues,
+            timestampMs = timestampMs,
+            repCount = repCount,
+            isIsometric = currentExercise.isIsometric,
+            deterministicPassThrough = isDeterministicPassThrough
         )
 
-        val clampedScore = score.coerceIn(0, 100)
+        val clampedScore = (plankScoreOverride ?: (100 - postureResult.totalScorePenalty)).coerceIn(0, 100)
         formScoreSum += clampedScore
         formScoreSamples++
-        if (faultMsg != null) {
-            faultCounts[faultMsg] = (faultCounts[faultMsg] ?: 0) + 1
-            if (voiceCue == null) voiceCue = orderedCorrections.firstOrNull()?.voiceCueFr ?: faultMsg
-        } else if (voiceCue == null && orderedCorrections.isNotEmpty() && orderedCorrections.first().severity == FormQuality.FAULT) {
-            voiceCue = orderedCorrections.first().voiceCueFr
+
+        for (confirmedMsg in postureResult.newlyConfirmedFaultMessages) {
+            faultCounts[confirmedMsg] = (faultCounts[confirmedMsg] ?: 0) + 1
+        }
+
+        val finalFeedback = postureResult.primaryFaultMsgFr
+            ?: postureResult.confirmedCorrections.firstOrNull()?.instructionFr
+            ?: baseFeedback
+        val finalVoiceCue = repVoiceCue ?: postureResult.postureVoiceCueFr
+
+        // Refresh angle badge colors to reflect ONLY confirmed (non-spam!) posture quality
+        val confirmedByJoint = postureResult.confirmedCorrections.associateBy { it.jointIndex }
+        val finalBadges = badges.map { b ->
+            val confirmedCorr = confirmedByJoint[b.landmarkIndex]
+            when {
+                confirmedCorr != null -> b.copy(quality = confirmedCorr.severity)
+                b.quality == FormQuality.FAULT && postureResult.confirmedCorrections.none { it.severity == FormQuality.FAULT } ->
+                    b.copy(quality = FormQuality.GOOD, targetDegHint = null)
+                b.quality == FormQuality.CAUTION && postureResult.confirmedCorrections.isEmpty() ->
+                    b.copy(quality = FormQuality.GOOD, targetDegHint = null)
+                else -> b
+            }
         }
 
         return BiomechanicsFrame(
@@ -2724,64 +3023,253 @@ class BiomechanicsEngine(
             romPct = romPct.coerceIn(0, 100),
             formScore = clampedScore,
             formQuality = scoreToQuality(clampedScore),
-            feedbackFr = feedback,
-            voiceCueFr = voiceCue,
-            angleBadges = badges,
+            feedbackFr = finalFeedback,
+            voiceCueFr = finalVoiceCue,
+            angleBadges = finalBadges,
             avgFormScore = computeAvgForm(),
             avgRomPct = computeAvgRom(),
             topFaults = computeTopFaults(),
             poseDetected = true,
             worldLandmarks = worldPts,
             viewpointInfo = viewpointInfo,
-            corrections = orderedCorrections,
+            corrections = postureResult.confirmedCorrections,
             repCompletedNow = repCompletedNow,
             completedRepRomPct = completedRepRom,
             completedRepDurationSec = completedRepDurSec,
             isometricDeltaSec = isometricDeltaSec,
             detectedVariantFr = detectedVariantFr,
-            vbt = vbtMetrics
+            detectedVariantId = variant.id,
+            velocityTelemetry = velocityEstimator.currentTelemetry(),
+            completedRepVelocityMps = completedRepVelMps
         )
+    }
+
+    /**
+     * Evaluates viewpoint-invariant physical posture sanity gates without breaking Front/3/4/Rear/Incline/Decline camera setups.
+     */
+    private fun evaluatePostureGate(
+        exercise: ExerciseType,
+        use3D: Boolean,
+        bothVisible: Boolean,
+        useLeft: Boolean,
+        geomPts: List<PosePoint>,
+        screenPts: List<PosePoint>,
+        torsoTilt: Float,
+        fullBodyTilt: Float,
+        lArmW: Float,
+        rArmW: Float,
+        frontFloorHorizontal: Boolean,
+        activeWrSY: Float,
+        activeShSY: Float,
+        midShSAll: PosePoint,
+        torsoVert2DGlobal: Float,
+        shWidth2DGlobal: Float
+    ): String? {
+        val shIdx = if (useLeft) LEFT_SHOULDER else RIGHT_SHOULDER
+        val wrIdx = if (useLeft) LEFT_WRIST else RIGHT_WRIST
+        val hpIdx = if (useLeft) LEFT_HIP else RIGHT_HIP
+        val anIdx = if (useLeft) LEFT_ANKLE else RIGHT_ANKLE
+        val bothArmsVis = lArmW >= 0.40f && rArmW >= 0.40f
+
+        val midShG = if (bothVisible) midpoint(geomPts[LEFT_SHOULDER], geomPts[RIGHT_SHOULDER]) else geomPts[shIdx]
+        val midHpG = if (bothVisible) midpoint(geomPts[LEFT_HIP], geomPts[RIGHT_HIP]) else geomPts[hpIdx]
+        val midWrG = if (bothArmsVis) midpoint(geomPts[LEFT_WRIST], geomPts[RIGHT_WRIST]) else geomPts[wrIdx]
+        val torsoLenG = (if (use3D) dist3D(midShG, midHpG) else dist2D(midShG, midHpG)).coerceAtLeast(if (use3D) 0.25f else 0.08f)
+
+        return when (exercise) {
+            ExerciseType.PUSHUP -> {
+                if (use3D) {
+                    val bodyInclinedOrProne = fullBodyTilt >= 22f || torsoTilt >= 22f || frontFloorHorizontal
+                    val wristsNotHighOverhead = (midShG.y - midWrG.y) / torsoLenG <= 0.28f ||
+                        activeWrSY >= activeShSY - 0.12f
+                    if (!bodyInclinedOrProne || !wristsNotHighOverhead) {
+                        "Mettez-vous en position pompes (sol ou inclinées)."
+                    } else null
+                } else {
+                    val shW2D = dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.05f)
+                    val torso2D = dist2D(screenPts[shIdx], screenPts[hpIdx])
+                    val bodyHeight2D = abs(screenPts[shIdx].y - screenPts[anIdx].y)
+                    val frontForeshortenedProne = frontFloorHorizontal || (torso2D < shW2D * 1.15f && bodyHeight2D < shW2D * 2.35f)
+                    val bodyOk = fullBodyTilt >= 22f || torsoTilt >= 22f || frontForeshortenedProne
+                    val wristsNotWayAboveHead = activeWrSY >= activeShSY - 0.14f
+                    if (!bodyOk || !wristsNotWayAboveHead) {
+                        "Mettez-vous en position pompes (sol ou inclinées)."
+                    } else null
+                }
+            }
+            ExerciseType.SQUAT,
+            ExerciseType.LUNGE,
+            ExerciseType.BULGARIAN_SQUAT,
+            ExerciseType.DEADLIFT,
+            ExerciseType.OVERHEAD_PRESS,
+            ExerciseType.BICEP_CURL,
+            ExerciseType.LATERAL_RAISE,
+            ExerciseType.JUMPING_JACK -> {
+                if (fullBodyTilt >= 68f && torsoTilt >= 65f) {
+                    "Redressez-vous debout pour cet exercice."
+                } else null
+            }
+            ExerciseType.GLUTE_BRIDGE -> {
+                val frontFloorSupine = (torsoVert2DGlobal / shWidth2DGlobal) < 0.85f && midShSAll.y >= 0.48f
+                if (torsoTilt < 32f && !frontFloorSupine) {
+                    "Allongez-vous sur le dos pour cet exercice."
+                } else null
+            }
+            ExerciseType.LEG_RAISE -> {
+                // Allow BOTH lying supine floor leg raises AND hanging leg raises (wrists clearly overhead)!
+                val wristsOverhead = (midShG.y - midWrG.y) / torsoLenG >= 0.30f
+                val frontFloorSupine = (torsoVert2DGlobal / shWidth2DGlobal) < 0.85f && midShSAll.y >= 0.48f
+                if (torsoTilt < 32f && !wristsOverhead && !frontFloorSupine) {
+                    "Allongez-vous sur le dos (ou suspendez-vous à la barre)."
+                } else null
+            }
+            ExerciseType.PULL_UP -> {
+                // Prevent counting fake pull-ups when standing with hands relaxed down at waist
+                val minWrY = minOf(geomPts[LEFT_WRIST].y, geomPts[RIGHT_WRIST].y)
+                val shY = midShG.y
+                val handsNearOrAboveShoulders = (shY - minWrY) / torsoLenG >= -0.22f
+                if (!isMidRep && !handsNearOrAboveShoulders) {
+                    "Saisissez la barre bras au-dessus des épaules."
+                } else null
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Computes the primary moving landmark height/coordinate in meters (positive = upward against gravity)
+     * using true 3D world meters when active or athlete-height-calibrated 2D scale in 2D fallback.
+     */
+    private fun computePrimaryMoverPositionMeters(
+        exercise: ExerciseType,
+        geomPts: List<PosePoint>,
+        screenPts: List<PosePoint>,
+        use3D: Boolean,
+        bothVisible: Boolean,
+        useLeft: Boolean
+    ): Float {
+        val shIdx = if (useLeft) LEFT_SHOULDER else RIGHT_SHOULDER
+        val wrIdx = if (useLeft) LEFT_WRIST else RIGHT_WRIST
+        val hpIdx = if (useLeft) LEFT_HIP else RIGHT_HIP
+        val anIdx = if (useLeft) LEFT_ANKLE else RIGHT_ANKLE
+
+        val midSh = if (bothVisible) midpoint(geomPts[LEFT_SHOULDER], geomPts[RIGHT_SHOULDER]) else geomPts[shIdx]
+        val midHp = if (bothVisible) midpoint(geomPts[LEFT_HIP], geomPts[RIGHT_HIP]) else geomPts[hpIdx]
+        val midWr = if (bothVisible) midpoint(geomPts[LEFT_WRIST], geomPts[RIGHT_WRIST]) else geomPts[wrIdx]
+        val midAn = if (bothVisible) midpoint(geomPts[LEFT_ANKLE], geomPts[RIGHT_ANKLE]) else geomPts[anIdx]
+
+        // Scale factor converts normalized 2D coords to meters via anatomical torso length (~29% of stature)
+        val scaleToMeters = if (use3D) {
+            1.0f
+        } else {
+            val shS = if (bothVisible) midpoint(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]) else screenPts[shIdx]
+            val hpS = if (bothVisible) midpoint(screenPts[LEFT_HIP], screenPts[RIGHT_HIP]) else screenPts[hpIdx]
+            val shW2D = dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER])
+            val ref2D = maxOf(dist2D(shS, hpS), shW2D * 1.35f).coerceAtLeast(0.08f)
+            (athleteHeightMeters * 0.29f) / ref2D
+        }
+
+        // In MediaPipe, +Y points DOWN toward floor, so upward height = (lowerAnchor.y - movingPoint.y)
+        val rawCoord = when (exercise) {
+            ExerciseType.SQUAT,
+            ExerciseType.LUNGE,
+            ExerciseType.BULGARIAN_SQUAT,
+            ExerciseType.DEADLIFT,
+            ExerciseType.BURPEE -> (midAn.y - midHp.y)
+            ExerciseType.PUSHUP,
+            ExerciseType.TRICEP_DIP -> (midWr.y - midSh.y)
+            ExerciseType.PULL_UP -> (midWr.y - midSh.y) * -1f // pulling shoulders UP toward anchored wrists
+            ExerciseType.OVERHEAD_PRESS,
+            ExerciseType.LATERAL_RAISE,
+            ExerciseType.JUMPING_JACK,
+            ExerciseType.BICEP_CURL,
+            ExerciseType.BENT_ROW -> (midHp.y - midWr.y)
+            ExerciseType.GLUTE_BRIDGE -> (midSh.y - midHp.y)
+            ExerciseType.LEG_RAISE -> (midHp.y - midAn.y)
+            ExerciseType.PLANK -> 0f
+        }
+        return rawCoord * scaleToMeters
     }
 
     private data class CycleResult(
         val completed: Boolean,
         val completedRom: Int,
-        val durationSec: Float
+        val durationSec: Float,
+        val phase1DurationSec: Float = 0f,
+        val phase2DurationSec: Float = 0f,
+        val phase1DispMeters: Float = 0f,
+        val phase2DispMeters: Float = 0f,
+        val phase1PeakVelMps: Float = 0f,
+        val phase2PeakVelMps: Float = 0f
     )
 
-    private fun minRepDurationMs(): Long = 180L
+    private fun requiredBottomDwellMs(): Long =
+        if (enteredBottomFromRamp) FAST_TOUCH_BOTTOM_DWELL_MS else MIN_BOTTOM_DWELL_MS
 
-    private fun completeRepOrAbort(timestampMs: Long, checkBottomDwell: Boolean): CycleResult {
+    private fun minRepDurationMs(): Long = when {
+        emaAlpha >= 0.999f && !useOneEuroFilter -> 180L
+        enteredBottomFromRamp -> 180L
+        currentExercise == ExerciseType.JUMPING_JACK -> 240L
+        else -> 360L
+    }
+
+    private fun completeRepOrAbort(
+        timestampMs: Long,
+        checkBottomDwell: Boolean,
+        currentPosMeters: Float
+    ): CycleResult {
         val dwellOk = !checkBottomDwell ||
-            (bottomEnteredTsMs > 0L && (timestampMs - bottomEnteredTsMs) >= MIN_BOTTOM_DWELL_MS)
+            (bottomEnteredTsMs > 0L && (timestampMs - bottomEnteredTsMs) >= requiredBottomDwellMs())
         val durOk = repStartTsMs > 0L && (timestampMs - repStartTsMs) >= minRepDurationMs()
         if (dwellOk && durOk) {
             val peakRom = repRomPeak
-            val durSec = computeRepDurationSec(timestampMs)
+            val totalDurSec = computeRepDurationSec(timestampMs)
+            val p1EndTs = if (bottomEnteredTsMs > repStartTsMs) bottomEnteredTsMs else repStartTsMs + ((timestampMs - repStartTsMs) / 2L)
+            val p2StartTs = if (concentricLeftBottomTsMs >= p1EndTs) concentricLeftBottomTsMs else p1EndTs
+
+            val p1Dur = ((p1EndTs - repStartTsMs) / 1000f).coerceIn(0.18f, totalDurSec)
+            val p2Dur = ((timestampMs - p2StartTs) / 1000f).coerceIn(0.18f, totalDurSec)
+            val p1Disp = if (phase1StartPosMeters.isFinite() && phase1EndPosMeters.isFinite()) {
+                abs(phase1EndPosMeters - phase1StartPosMeters)
+            } else 0f
+            val p2Disp = if (phase2StartPosMeters.isFinite()) {
+                abs(currentPosMeters - phase2StartPosMeters)
+            } else p1Disp
+            val p1Peak = phase1PeakVelMps
+            val p2Peak = phase2PeakVelMps
+
             repCount++
             recordRom(peakRom)
+            reachedBottom = true // avoid triggering early-reversal hint on a valid completed rep!
             abortIncompleteRepCycle()
-            return CycleResult(true, peakRom, durSec)
+            return CycleResult(
+                completed = true,
+                completedRom = peakRom,
+                durationSec = totalDurSec,
+                phase1DurationSec = p1Dur,
+                phase2DurationSec = p2Dur,
+                phase1DispMeters = p1Disp,
+                phase2DispMeters = p2Disp,
+                phase1PeakVelMps = p1Peak,
+                phase2PeakVelMps = p2Peak
+            )
         }
-        abortIncompleteRepCycle()
+        abortIncompleteRepCycle(timestampMs)
         return CycleResult(false, 0, 0f)
     }
 
-    /**
-     * Multi-signal normalized progress cycle (0.0 = rest/top -> 1.0 = full bottom/peak -> 0.0 = rep completed).
-     * Used by fused multi-signal exercises (Push-ups, Dips) to work seamlessly across all variants & camera angles.
-     */
     private fun updateProgressCycle(
         progress: Float,
         startThreshold: Float,
         peakThreshold: Float,
         finishThreshold: Float,
         currentRom: Int,
-        fault: String?,
+        primaryPosMeters: Float,
+        instantSpeedMps: Float,
         timestampMs: Long
     ): CycleResult {
         if (currentRom > repRomPeak) repRomPeak = currentRom
-        if (fault != null) currentRepFault = fault
+        val isConcFirst = VelocityEstimator.specFor(currentExercise).isConcentricFirst
 
         when (phase) {
             MovementPhase.READY -> {
@@ -2789,41 +3277,62 @@ class BiomechanicsEngine(
                     val hitPeak = progress >= peakThreshold
                     phase = if (hitPeak) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
                     reachedBottom = hitPeak
+                    enteredBottomFromRamp = false
                     bottomEnteredTsMs = if (hitPeak) timestampMs else 0L
+                    concentricLeftBottomTsMs = 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
-                    currentRepFault = fault
+                    phase1StartPosMeters = primaryPosMeters
+                    phase1EndPosMeters = primaryPosMeters
+                    phase1PeakVelMps = instantSpeedMps
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 }
             }
             MovementPhase.ECCENTRIC -> {
+                if (instantSpeedMps > phase1PeakVelMps) phase1PeakVelMps = instantSpeedMps
+                if (isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (progress >= peakThreshold) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    enteredBottomFromRamp = true
                     bottomEnteredTsMs = timestampMs
+                    phase1EndPosMeters = primaryPosMeters
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 } else if (progress < startThreshold * 0.60f) {
-                    abortIncompleteRepCycle()
+                    abortIncompleteRepCycle(timestampMs)
                 }
             }
             MovementPhase.BOTTOM -> {
                 val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (progress <= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
+                    if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true, currentPosMeters = primaryPosMeters)
                 } else if (progress < peakThreshold - 0.12f) {
-                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                    if (dwellMs >= requiredBottomDwellMs()) {
                         phase = MovementPhase.CONCENTRIC
+                        concentricLeftBottomTsMs = timestampMs
+                        phase2StartPosMeters = primaryPosMeters
+                        phase2PeakVelMps = instantSpeedMps
+                        if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                     } else {
                         reachedBottom = false
+                        enteredBottomFromRamp = false
                         bottomEnteredTsMs = 0L
                         phase = MovementPhase.ECCENTRIC
                     }
                 }
             }
             MovementPhase.CONCENTRIC -> {
+                if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (progress <= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false, currentPosMeters = primaryPosMeters)
                 } else if (progress >= peakThreshold) {
                     phase = MovementPhase.BOTTOM
                     if (bottomEnteredTsMs == 0L) bottomEnteredTsMs = timestampMs
+                    phase2StartPosMeters = primaryPosMeters
                 }
             }
             else -> phase = MovementPhase.READY
@@ -2831,19 +3340,19 @@ class BiomechanicsEngine(
         return CycleResult(false, 0, 0f)
     }
 
-    /** State machine for movements whose active bottom phase decreases the primary angle (Squat, Curl, Pull-up...). */
     private fun updateDownUpCycle(
         metric: Float,
         startThreshold: Float,
         bottomThreshold: Float,
         finishThreshold: Float,
         currentRom: Int,
-        fault: String?,
+        primaryPosMeters: Float,
+        instantSpeedMps: Float,
         timestampMs: Long
     ): CycleResult {
         if (currentRom > repRomPeak) repRomPeak = currentRom
-        if (fault != null) currentRepFault = fault
         val abortThreshold = maxOf(startThreshold, finishThreshold) + 4f
+        val isConcFirst = VelocityEstimator.specFor(currentExercise).isConcentricFirst
 
         when (phase) {
             MovementPhase.READY -> {
@@ -2851,38 +3360,58 @@ class BiomechanicsEngine(
                     val hitBottom = metric <= bottomThreshold
                     phase = if (hitBottom) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
                     reachedBottom = hitBottom
+                    enteredBottomFromRamp = false
                     bottomEnteredTsMs = if (hitBottom) timestampMs else 0L
+                    concentricLeftBottomTsMs = 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
-                    currentRepFault = fault
+                    phase1StartPosMeters = primaryPosMeters
+                    phase1EndPosMeters = primaryPosMeters
+                    phase1PeakVelMps = instantSpeedMps
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 }
             }
             MovementPhase.ECCENTRIC -> {
+                if (instantSpeedMps > phase1PeakVelMps) phase1PeakVelMps = instantSpeedMps
+                if (isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (metric <= bottomThreshold) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    enteredBottomFromRamp = true
                     bottomEnteredTsMs = timestampMs
+                    phase1EndPosMeters = primaryPosMeters
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 } else if (metric >= abortThreshold) {
-                    abortIncompleteRepCycle()
+                    abortIncompleteRepCycle(timestampMs)
                 }
             }
             MovementPhase.BOTTOM -> {
                 val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (metric >= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
+                    if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true, currentPosMeters = primaryPosMeters)
                 } else if (metric > bottomThreshold + 10f) {
-                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                    if (dwellMs >= requiredBottomDwellMs()) {
                         phase = MovementPhase.CONCENTRIC
+                        concentricLeftBottomTsMs = timestampMs
+                        phase2StartPosMeters = primaryPosMeters
+                        phase2PeakVelMps = instantSpeedMps
+                        if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                     } else {
                         reachedBottom = false
+                        enteredBottomFromRamp = false
                         bottomEnteredTsMs = 0L
                         phase = MovementPhase.ECCENTRIC
                     }
                 }
             }
             MovementPhase.CONCENTRIC -> {
+                if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (metric >= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false, currentPosMeters = primaryPosMeters)
                 }
             }
             else -> phase = MovementPhase.READY
@@ -2890,7 +3419,6 @@ class BiomechanicsEngine(
         return CycleResult(false, 0, 0f)
     }
 
-    /** State machine for movements whose active peak phase increases the primary angle (OHP, Lateral Raise, Glute Bridge...). */
     private fun updateUpDownCycle(
         metric: Float,
         startThreshold: Float,
@@ -2898,12 +3426,13 @@ class BiomechanicsEngine(
         finishThreshold: Float,
         extraTopCondition: Boolean,
         currentRom: Int,
-        fault: String?,
+        primaryPosMeters: Float,
+        instantSpeedMps: Float,
         timestampMs: Long
     ): CycleResult {
         if (currentRom > repRomPeak) repRomPeak = currentRom
-        if (fault != null) currentRepFault = fault
         val abortThreshold = minOf(startThreshold, finishThreshold) - 4f
+        val isConcFirst = VelocityEstimator.specFor(currentExercise).isConcentricFirst
 
         when (phase) {
             MovementPhase.READY -> {
@@ -2911,38 +3440,58 @@ class BiomechanicsEngine(
                     val hitTop = metric >= topThreshold && extraTopCondition
                     phase = if (hitTop) MovementPhase.BOTTOM else MovementPhase.CONCENTRIC
                     reachedBottom = hitTop
+                    enteredBottomFromRamp = false
                     bottomEnteredTsMs = if (hitTop) timestampMs else 0L
+                    concentricLeftBottomTsMs = 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
-                    currentRepFault = fault
+                    phase1StartPosMeters = primaryPosMeters
+                    phase1EndPosMeters = primaryPosMeters
+                    phase1PeakVelMps = instantSpeedMps
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 }
             }
             MovementPhase.CONCENTRIC -> {
+                if (instantSpeedMps > phase1PeakVelMps) phase1PeakVelMps = instantSpeedMps
+                if (isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (metric >= topThreshold && extraTopCondition) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    enteredBottomFromRamp = true
                     bottomEnteredTsMs = timestampMs
+                    phase1EndPosMeters = primaryPosMeters
+                    phase2StartPosMeters = primaryPosMeters
+                    phase2PeakVelMps = 0f
                 } else if (metric <= abortThreshold) {
-                    abortIncompleteRepCycle()
+                    abortIncompleteRepCycle(timestampMs)
                 }
             }
             MovementPhase.BOTTOM -> {
                 val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (metric <= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
+                    if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true, currentPosMeters = primaryPosMeters)
                 } else if (metric < topThreshold - 10f) {
-                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                    if (dwellMs >= requiredBottomDwellMs()) {
                         phase = MovementPhase.ECCENTRIC
+                        concentricLeftBottomTsMs = timestampMs
+                        phase2StartPosMeters = primaryPosMeters
+                        phase2PeakVelMps = instantSpeedMps
+                        if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                     } else {
                         reachedBottom = false
+                        enteredBottomFromRamp = false
                         bottomEnteredTsMs = 0L
                         phase = MovementPhase.CONCENTRIC
                     }
                 }
             }
             MovementPhase.ECCENTRIC -> {
+                if (instantSpeedMps > phase2PeakVelMps) phase2PeakVelMps = instantSpeedMps
+                if (!isConcFirst) velocityEstimator.updateLiveVelocity(instantSpeedMps)
                 if (metric <= finishThreshold && reachedBottom) {
-                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false, currentPosMeters = primaryPosMeters)
                 }
             }
             else -> phase = MovementPhase.READY
@@ -2952,7 +3501,7 @@ class BiomechanicsEngine(
 
     private fun computeRepDurationSec(nowMs: Long): Float {
         if (repStartTsMs <= 0L || nowMs <= repStartTsMs) return 2.4f
-        return ((nowMs - repStartTsMs) / 1000f).coerceIn(0.6f, 12.0f)
+        return ((nowMs - repStartTsMs) / 1000f).coerceIn(0.4f, 12.0f)
     }
 
     private fun fuseSide(
@@ -2970,7 +3519,6 @@ class BiomechanicsEngine(
     }
 
     private fun smoothLandmarks(raw: List<PosePoint>, timestampMs: Long, isWorld: Boolean): List<PosePoint> {
-        // Explicit pass-through mode when emaAlpha >= 0.999 (used in deterministic keyframe unit tests)
         if (emaAlpha >= 0.999f && !useOneEuroFilter) {
             return raw
         }
@@ -3008,7 +3556,6 @@ class BiomechanicsEngine(
         val len = dist2D(hipS, shS).coerceAtLeast(0.14f)
         val dx = shS.x - hipS.x
         if (abs(dx) < 0.015f) {
-            // Frontal view: forward lean foreshortens screen Y -> pull chest straight UP
             val ty = (hipS.y - (len * 1.25f).coerceAtLeast(0.18f)).coerceIn(0.04f, 0.96f)
             return GhostVector(hipS.x, ty, 0f, -1f)
         }
@@ -3093,7 +3640,7 @@ class BiomechanicsEngine(
 
     private fun computeTopFaults(): List<String> =
         faultCounts.entries
-            .filter { it.value >= 3 }
+            .filter { it.value >= 1 }
             .sortedByDescending { it.value }
             .take(3)
             .map { it.key }

@@ -14,7 +14,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
 
     companion object {
         private const val DB_NAME = "kinetix_user.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
     }
 
     private val _sessions = MutableStateFlow<List<WorkoutSession>>(emptyList())
@@ -46,7 +46,11 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
                 avg_rom_pct INTEGER NOT NULL,
                 top_faults_json TEXT NOT NULL,
                 notes TEXT NOT NULL,
-                calories_kcal REAL NOT NULL DEFAULT 0.0
+                calories_kcal REAL NOT NULL DEFAULT 0.0,
+                detected_variant TEXT NOT NULL DEFAULT '',
+                estimated_max_reps INTEGER NOT NULL DEFAULT 0,
+                peak_velocity_mps REAL NOT NULL DEFAULT 0.0,
+                velocity_loss_pct INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -123,6 +127,12 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
                 """.trimIndent()
             )
         }
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE workout_sessions ADD COLUMN detected_variant TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE workout_sessions ADD COLUMN estimated_max_reps INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE workout_sessions ADD COLUMN peak_velocity_mps REAL NOT NULL DEFAULT 0.0")
+            db.execSQL("ALTER TABLE workout_sessions ADD COLUMN velocity_loss_pct INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     fun refreshAll() {
@@ -143,6 +153,10 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
             put("top_faults_json", JSONArray(session.topFaults).toString())
             put("notes", session.notes)
             put("calories_kcal", session.caloriesKcal)
+            put("detected_variant", session.detectedVariant)
+            put("estimated_max_reps", session.estimatedMaxReps)
+            put("peak_velocity_mps", session.peakVelocityMps)
+            put("velocity_loss_pct", session.velocityLossPct)
         }
         val id = writableDatabase.insert("workout_sessions", null, cv)
         _sessions.value = loadSessions()
@@ -157,7 +171,12 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
     private fun loadSessions(): List<WorkoutSession> {
         val list = mutableListOf<WorkoutSession>()
         readableDatabase.rawQuery(
-            "SELECT id, timestamp_ms, exercise_id, reps, duration_sec, avg_form_score, avg_rom_pct, top_faults_json, notes, calories_kcal FROM workout_sessions ORDER BY timestamp_ms DESC LIMIT 100",
+            """
+            SELECT id, timestamp_ms, exercise_id, reps, duration_sec, avg_form_score, avg_rom_pct,
+                   top_faults_json, notes, calories_kcal, detected_variant, estimated_max_reps,
+                   peak_velocity_mps, velocity_loss_pct
+            FROM workout_sessions ORDER BY timestamp_ms DESC LIMIT 100
+            """.trimIndent(),
             null
         ).use { c ->
             while (c.moveToNext()) {
@@ -177,7 +196,11 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
                         avgRomPct = c.getInt(6),
                         topFaults = faults,
                         notes = c.getString(8),
-                        caloriesKcal = c.getDouble(9)
+                        caloriesKcal = c.getDouble(9),
+                        detectedVariant = c.getString(10),
+                        estimatedMaxReps = c.getInt(11),
+                        peakVelocityMps = c.getFloat(12),
+                        velocityLossPct = c.getInt(13)
                     )
                 )
             }

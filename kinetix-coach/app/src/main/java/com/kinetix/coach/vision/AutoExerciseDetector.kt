@@ -23,10 +23,12 @@ data class AutoDetectResult(
 )
 
 /**
- * Viewpoint-invariant real-time automatic exercise detector across all 16 KINETIX exercises.
- * Maintains a sliding temporal ring buffer (~2.4 s / up to 72 frames) of normalized 3D posture
+ * Viewpoint-invariant real-time automatic exercise detector across all 16 KINETIX exercises
+ * and all major exercise variants (including 9 push-up variants, Sumo squat vs lunge,
+ * alternating/unilateral upper & lower body movements, and hanging leg raises).
+ * Maintains a sliding temporal ring buffer (~2.6 s / up to 72 frames) of normalized 3D posture
  * and kinematic features, applies continuous confidence scoring across all 16 exercises, and uses
- * multi-frame stability hysteresis to prevent flicker while enabling fast posture-family switches.
+ * asymmetric stability hysteresis to prevent flicker while unlocking fast transitions (e.g. Plank -> Push-up).
  */
 class AutoExerciseDetector(
     private val maxBufferFrames: Int = 72,
@@ -41,9 +43,13 @@ class AutoExerciseDetector(
         val posture: BodyPosture,
         val kneeDeg: Float,
         val hipDeg: Float,
+        val minHipDeg: Float,
+        val maxHipDeg: Float,
         val elbowDeg: Float,
         val minElbowDeg: Float,
+        val maxElbowDeg: Float,
         val shoulderDeg: Float,
+        val maxShoulderDeg: Float,
         val armFullDeg: Float,
         val torsoTiltDeg: Float,
         val bodyTiltDeg: Float,
@@ -53,8 +59,10 @@ class AutoExerciseDetector(
         val wristAboveShTl: Float,
         val shAboveWristTl: Float,
         val wristAboveHipTl: Float,
+        val wristAboveAnkleTl: Float,
         val ankleAboveHipTl: Float,
         val footDistTl: Float,
+        val foreAftFootSplitTl: Float,
         val ankleYDiffTl: Float,
         val ankleToShoulderRatio: Float,
         val screenShY: Float,
@@ -203,16 +211,17 @@ class AutoExerciseDetector(
             pendingCandidate = currentLocked
             pendingStreak = 0
         } else {
-            // Candidate differs from currently locked exercise: apply asymmetric sticky hysteresis.
-            // Special fast-path: starting dynamic push-ups out of a static plank unlocks immediately!
-            val isPlankToPushup = currentLocked == ExerciseType.PLANK && topEx == ExerciseType.PUSHUP
+            // Fast unlock: if user paused in Plank setup before starting Push-ups, switch immediately!
+            val isPlankToPushupWakeup = currentLocked == ExerciseType.PLANK && topEx == ExerciseType.PUSHUP
+
+            // Candidate differs from currently locked exercise: apply asymmetric sticky hysteresis
             val reqConf = when {
-                isPlankToPushup -> 0.62f
+                isPlankToPushupWakeup -> confirmThreshold
                 hasActiveSetReps -> ACTIVE_SET_MIN_CONFIDENCE
                 else -> confirmThreshold
             }
             val reqMargin = when {
-                isPlankToPushup -> 0.05f
+                isPlankToPushupWakeup -> 0.06f
                 hasActiveSetReps -> ACTIVE_SET_MIN_MARGIN
                 else -> 0.06f
             }
@@ -227,7 +236,7 @@ class AutoExerciseDetector(
 
                 val sameFamily = postureFamily(currentLocked) == postureFamily(topEx)
                 val requiredStreak = when {
-                    isPlankToPushup -> 5
+                    isPlankToPushupWakeup -> fastPostureSwitchFrames
                     hasActiveSetReps -> if (sameFamily) ACTIVE_SET_SAME_FAMILY_STREAK else ACTIVE_SET_CROSS_POSTURE_STREAK
                     else -> {
                         val isCrossPostureSwitch = !sameFamily && topConf >= 0.72f
@@ -235,7 +244,7 @@ class AutoExerciseDetector(
                     }
                 }
 
-                val cooldownOk = isPlankToPushup ||
+                val cooldownOk = isPlankToPushupWakeup ||
                     !hasActiveSetReps ||
                     lastSwitchTsMs == Long.MIN_VALUE ||
                     (timestampMs - lastSwitchTsMs) >= ACTIVE_SET_SWITCH_COOLDOWN_MS
@@ -245,8 +254,7 @@ class AutoExerciseDetector(
                 } else {
                     0L
                 }
-                // Always protect PUSHUP -> PLANK with 3.2s continuous static hold (even before rep 1!)
-                val pushupToPlankOk = !(currentLocked == ExerciseType.PUSHUP && topEx == ExerciseType.PLANK) ||
+                val pushupToPlankOk = !(hasActiveSetReps && currentLocked == ExerciseType.PUSHUP && topEx == ExerciseType.PLANK) ||
                     continuousPlankHoldMs >= PUSHUP_TO_PLANK_MIN_HOLD_MS
 
                 if (pendingStreak >= requiredStreak && cooldownOk && pushupToPlankOk) {
@@ -346,9 +354,13 @@ class AutoExerciseDetector(
         // For split lower-body movements (lunge/bulgarian), minOf tracks active bending knee cleanly
         val kneeDeg = if (both) minOf(leftKnee, rightKnee) * 0.6f + ((leftKnee + rightKnee) * 0.5f) * 0.4f else if (useLeft) leftKnee else rightKnee
         val hipDeg = if (both) (leftHip + rightHip) * 0.5f else if (useLeft) leftHip else rightHip
+        val minHipDeg = if (both) minOf(leftHip, rightHip) else hipDeg
+        val maxHipDeg = if (both) maxOf(leftHip, rightHip) else hipDeg
         val elbowDeg = if (both) (leftElbow + rightElbow) * 0.5f else if (useLeft) leftElbow else rightElbow
         val minElbowDeg = if (both) minOf(leftElbow, rightElbow) else elbowDeg
+        val maxElbowDeg = if (both) maxOf(leftElbow, rightElbow) else elbowDeg
         val shoulderDeg = if (both) (leftSh + rightSh) * 0.5f else if (useLeft) leftSh else rightSh
+        val maxShoulderDeg = if (both) maxOf(leftSh, rightSh) else shoulderDeg
         val armFullDeg = if (both) (leftArm + rightArm) * 0.5f else if (useLeft) leftArm else rightArm
 
         val torsoTiltDeg = if (use3D) {
@@ -373,37 +385,45 @@ class AutoExerciseDetector(
         val wristAboveShTl = (midSh.y - midWrist.y) / torsoLen
         val shAboveWristTl = (midWrist.y - midSh.y) / torsoLen
         val wristAboveHipTl = (midHip.y - midWrist.y) / torsoLen
+        val wristAboveAnkleTl = (midAnkle.y - midWrist.y) / torsoLen
         val ankleAboveHipTl = (midHip.y - midAnkle.y) / torsoLen
         val kneeAboveShTl = (midSh.y - midKnee.y) / torsoLen
 
-        val footDistTl = dist(lAnkle, rAnkle) / torsoLen
+        val footDist = dist(lAnkle, rAnkle)
+        val footDistTl = footDist / torsoLen
+
+        // Separate lateral foot spread (Sumo squat!) from fore-aft split stance (Lunge / Bulgarian!)
+        val foreAftFootSplitTl = if (use3D) {
+            val pelvisAxis = BiomechanicsEngine.computePelvisRightAxis(lHip, rHip)
+            val dx = rAnkle.x - lAnkle.x
+            val dy = rAnkle.y - lAnkle.y
+            val dz = rAnkle.z - lAnkle.z
+            val latProj = dx * pelvisAxis.x + dy * pelvisAxis.y + dz * pelvisAxis.z
+            val horizSq = (dx * dx + dz * dz - latProj * latProj).coerceAtLeast(0f)
+            sqrt(horizSq.toDouble()).toFloat() / torsoLen
+        } else {
+            footDistTl
+        }
+
         val ankleYDiffTl = abs(lAnkle.y - rAnkle.y) / torsoLen
         val shWidth = dist(lSh, rSh).coerceAtLeast(torsoLen * 0.45f)
-        val ankleToShoulderRatio = dist(lAnkle, rAnkle) / shWidth
+        val ankleToShoulderRatio = footDist / shWidth
 
         val screenMidShY = (screenPts[BiomechanicsEngine.LEFT_SHOULDER].y + screenPts[BiomechanicsEngine.RIGHT_SHOULDER].y) * 0.5f
-        val screenMidHipY = (screenPts[BiomechanicsEngine.LEFT_HIP].y + screenPts[BiomechanicsEngine.RIGHT_HIP].y) * 0.5f
         val screenMidWristY = (screenPts[BiomechanicsEngine.LEFT_WRIST].y + screenPts[BiomechanicsEngine.RIGHT_WRIST].y) * 0.5f
-        val screenShWidth = BiomechanicsEngine.dist2D(
-            screenPts[BiomechanicsEngine.LEFT_SHOULDER],
-            screenPts[BiomechanicsEngine.RIGHT_SHOULDER]
-        ).coerceAtLeast(0.06f)
-        val frontFloorProne = (abs(screenMidHipY - screenMidShY) / screenShWidth) < 0.85f &&
-            screenMidWristY >= screenMidShY - 0.10f &&
-            screenMidShY >= 0.25f &&
-            hipAboveAnklesTl <= 0.90f
 
         val posture = classifyPosture(
             bodyTiltDeg = bodyTiltDeg,
             torsoTiltDeg = torsoTiltDeg,
+            bodyAlignDeg = bodyAlignDeg,
             wristAboveShTl = wristAboveShTl,
             wristAboveHipTl = wristAboveHipTl,
+            wristAboveAnkleTl = wristAboveAnkleTl,
             kneeAboveShTl = kneeAboveShTl,
             ankleAboveHipTl = ankleAboveHipTl,
             hipAboveAnklesTl = hipAboveAnklesTl,
             shAboveAnklesTl = shAboveAnklesTl,
-            kneeDeg = kneeDeg,
-            frontFloorProne = frontFloorProne
+            kneeDeg = kneeDeg
         )
 
         return FrameSample(
@@ -411,9 +431,13 @@ class AutoExerciseDetector(
             posture = posture,
             kneeDeg = kneeDeg,
             hipDeg = hipDeg,
+            minHipDeg = minHipDeg,
+            maxHipDeg = maxHipDeg,
             elbowDeg = elbowDeg,
             minElbowDeg = minElbowDeg,
+            maxElbowDeg = maxElbowDeg,
             shoulderDeg = shoulderDeg,
+            maxShoulderDeg = maxShoulderDeg,
             armFullDeg = armFullDeg,
             torsoTiltDeg = torsoTiltDeg,
             bodyTiltDeg = bodyTiltDeg,
@@ -423,8 +447,10 @@ class AutoExerciseDetector(
             wristAboveShTl = wristAboveShTl,
             shAboveWristTl = shAboveWristTl,
             wristAboveHipTl = wristAboveHipTl,
+            wristAboveAnkleTl = wristAboveAnkleTl,
             ankleAboveHipTl = ankleAboveHipTl,
             footDistTl = footDistTl,
+            foreAftFootSplitTl = foreAftFootSplitTl,
             ankleYDiffTl = ankleYDiffTl,
             ankleToShoulderRatio = ankleToShoulderRatio,
             screenShY = screenMidShY,
@@ -435,14 +461,15 @@ class AutoExerciseDetector(
     private fun classifyPosture(
         bodyTiltDeg: Float,
         torsoTiltDeg: Float,
+        bodyAlignDeg: Float,
         wristAboveShTl: Float,
         wristAboveHipTl: Float,
+        wristAboveAnkleTl: Float,
         kneeAboveShTl: Float,
         ankleAboveHipTl: Float,
         hipAboveAnklesTl: Float,
         shAboveAnklesTl: Float,
-        kneeDeg: Float,
-        frontFloorProne: Boolean = false
+        kneeDeg: Float
     ): BodyPosture {
         // Supine floor: shoulders down on floor, knees raised above shoulders (glute bridge) OR torso flat & legs rising (leg raise)
         val looksSupineBridge = torsoTiltDeg >= 45f && kneeAboveShTl >= 0.10f && kneeDeg <= 135f && abs(shAboveAnklesTl) < 0.70f
@@ -451,16 +478,25 @@ class AutoExerciseDetector(
             return BodyPosture.SUPINE_FLOOR
         }
 
-        // Prone floor: horizontal, knee, pike, or tilted front-floor push-up posture (including chest-to-floor bottom where wristAboveShTl ≈ 0!)
-        val looksProne = (bodyTiltDeg >= 36f || torsoTiltDeg >= 40f || frontFloorProne) &&
-            wristAboveShTl <= 0.14f &&
-            hipAboveAnklesTl <= 1.05f &&
-            shAboveAnklesTl <= 1.35f
-        if (looksProne) {
+        // Prone floor: horizontal / pike / knee / decline push-ups (including deep bottom where shoulders touch wrist height!)
+        val looksFloorProne = (bodyTiltDeg >= 46f || torsoTiltDeg >= 50f) &&
+            wristAboveShTl <= 0.18f &&
+            hipAboveAnklesTl <= 1.15f &&
+            shAboveAnklesTl <= 1.45f
+
+        // Incline push-up: straight inclined plank body with elevated hands on bench/box/wall
+        val looksInclineProne = bodyTiltDeg in 26f..58f &&
+            torsoTiltDeg >= 26f &&
+            bodyAlignDeg in 148f..212f &&
+            kneeDeg >= 136f &&
+            wristAboveAnkleTl >= 0.28f &&
+            wristAboveShTl <= 0.14f
+
+        if (looksFloorProne || looksInclineProne) {
             return BodyPosture.PRONE_FLOOR
         }
 
-        // Suspended high hands (pull-up hang)
+        // Suspended high hands (pull-up hang / hanging leg raise)
         if (torsoTiltDeg < 35f && wristAboveShTl >= 0.35f) {
             return BodyPosture.SUSPENDED
         }
@@ -478,9 +514,13 @@ class AutoExerciseDetector(
 
         val knees = FloatArray(buffer.size)
         val hips = FloatArray(buffer.size)
+        val minHips = FloatArray(buffer.size)
+        val maxHips = FloatArray(buffer.size)
         val elbows = FloatArray(buffer.size)
         val minElbows = FloatArray(buffer.size)
+        val maxElbows = FloatArray(buffer.size)
         val shoulders = FloatArray(buffer.size)
+        val maxShoulders = FloatArray(buffer.size)
         val armsFull = FloatArray(buffer.size)
         val torsoTilts = FloatArray(buffer.size)
         val bodyTilts = FloatArray(buffer.size)
@@ -492,6 +532,7 @@ class AutoExerciseDetector(
         val wristAboveHip = FloatArray(buffer.size)
         val ankleAboveHip = FloatArray(buffer.size)
         val footDists = FloatArray(buffer.size)
+        val foreAftSplits = FloatArray(buffer.size)
         val ankleYDiffs = FloatArray(buffer.size)
         val ankleShRatios = FloatArray(buffer.size)
         val screenShYs = FloatArray(buffer.size)
@@ -507,9 +548,13 @@ class AutoExerciseDetector(
             }
             knees[i] = s.kneeDeg
             hips[i] = s.hipDeg
+            minHips[i] = s.minHipDeg
+            maxHips[i] = s.maxHipDeg
             elbows[i] = s.elbowDeg
             minElbows[i] = s.minElbowDeg
+            maxElbows[i] = s.maxElbowDeg
             shoulders[i] = s.shoulderDeg
+            maxShoulders[i] = s.maxShoulderDeg
             armsFull[i] = s.armFullDeg
             torsoTilts[i] = s.torsoTiltDeg
             bodyTilts[i] = s.bodyTiltDeg
@@ -521,6 +566,7 @@ class AutoExerciseDetector(
             wristAboveHip[i] = s.wristAboveHipTl
             ankleAboveHip[i] = s.ankleAboveHipTl
             footDists[i] = s.footDistTl
+            foreAftSplits[i] = s.foreAftFootSplitTl
             ankleYDiffs[i] = s.ankleYDiffTl
             ankleShRatios[i] = s.ankleToShoulderRatio
             screenShYs[i] = s.screenShY
@@ -530,12 +576,17 @@ class AutoExerciseDetector(
         val standingRatio = (standingCount + suspendedCount) / n
         val proneRatio = proneCount / n
         val supineRatio = supineCount / n
+        val suspendedRatio = suspendedCount / n
 
         val kneeS = stats(knees)
         val hipS = stats(hips)
+        val minHipS = stats(minHips)
+        val maxHipS = stats(maxHips)
         val elbowS = stats(elbows)
         val minElbowS = stats(minElbows)
+        val maxElbowS = stats(maxElbows)
         val shS = stats(shoulders)
+        val maxShS = stats(maxShoulders)
         val armS = stats(armsFull)
         val torsoS = stats(torsoTilts)
         val bodyTiltS = stats(bodyTilts)
@@ -547,6 +598,7 @@ class AutoExerciseDetector(
         val wrHipS = stats(wristAboveHip)
         val ankHipS = stats(ankleAboveHip)
         val footS = stats(footDists)
+        val foreAftS = stats(foreAftSplits)
         val ankYDiffS = stats(ankleYDiffs)
         val ankRatioS = stats(ankleShRatios)
         val scrShS = stats(screenShYs)
@@ -556,27 +608,28 @@ class AutoExerciseDetector(
 
         val scores = LinkedHashMap<ExerciseType, Float>(16)
 
-        // 1. SQUAT: Standing bilateral deep knee bend, symmetric feet, moderate torso lean
+        // 1. SQUAT: Standing bilateral deep knee bend (supports Standard, Sumo, Narrow, ATG!)
+        // Uses foreAftFootSplitTl instead of total footDistTl so Sumo Squat is NEVER misclassified as Lunge!
         scores[ExerciseType.SQUAT] = product(
             rampUp(standingRatio, 0.55f, 0.85f),
             rampUp(kneeS.range, 24f, 55f),
             rampDown(kneeS.min, 112f, 138f),
             rampUp(hipAnkS.range, 0.16f, 0.42f),
-            rampDown(footS.mean, 0.72f, 1.05f), // narrow/shoulder stance, not split lunge
+            rampDown(foreAftS.mean, 0.55f, 0.92f), // zero fore-aft split (allows wide lateral Sumo!)
             rampDown(ankYDiffS.mean, 0.14f, 0.28f), // both feet on floor
             rampDown(torsoS.mean, 38f, 56f),
-            rampUp(kneeS.range / (hipS.range + 1f), 0.50f, 0.82f), // knees bend well vs pure deadlift
+            rampUp(kneeS.range / (hipS.range + 1f), 0.50f, 0.82f),
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
-        // 2. LUNGE: Split stance fore-aft (wide 3D foot distance), both feet near floor, knee bend
+        // 2. LUNGE: Split stance fore-aft (large foreAftFootSplitTl), both feet near floor, knee bend
         scores[ExerciseType.LUNGE] = product(
             rampUp(standingRatio, 0.55f, 0.85f),
             rampUp(kneeS.range, 22f, 50f),
             rampDown(kneeS.min, 112f, 138f),
-            rampUp(footS.mean, 0.78f, 1.15f), // clear split stance
+            rampUp(foreAftS.mean, 0.65f, 1.05f), // clear fore-aft split stance
             rampDown(ankYDiffS.mean, 0.16f, 0.30f), // rear foot on floor (not elevated like Bulgarian)
-            rampDown(torsoS.mean, 26f, 44f),
+            rampDown(torsoS.mean, 28f, 46f),
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
@@ -585,60 +638,53 @@ class AutoExerciseDetector(
             rampUp(standingRatio, 0.55f, 0.85f),
             rampUp(kneeS.range, 20f, 48f),
             rampDown(kneeS.min, 115f, 140f),
-            rampUp(footS.mean, 0.58f, 0.95f),
+            rampUp(foreAftS.mean, 0.48f, 0.88f),
             rampUp(ankYDiffS.mean, 0.24f, 0.48f), // rear foot elevated on bench
             rampDown(torsoS.mean, 34f, 52f),
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
-        // 4. DEADLIFT: Dominant hip hinge, torso tilts strongly, knees less flexed, straight arms below hips
+        // 4. DEADLIFT: Dominant hip hinge (Conventional, Sumo, RDL, Single-leg), knees stay higher, straight arms
         scores[ExerciseType.DEADLIFT] = product(
             rampUp(standingRatio, 0.55f, 0.85f),
-            rampUp(hipS.range, 26f, 55f),
-            rampDown(hipS.min, 115f, 138f),
+            rampUp(maxOf(hipS.range, minHipS.range), 26f, 55f),
+            rampDown(minOf(hipS.min, minHipS.min), 115f, 138f),
             rampUp(torsoS.max, 34f, 55f),
             rampUp(torsoS.range, 18f, 40f),
-            rampUp(kneeS.min, 108f, 132f), // knees stay high compared to squat
-            rampUp(hipS.range / (kneeS.range + 1f), 1.10f, 1.60f),
+            rampUp(kneeS.min, 102f, 128f),
+            rampUp(hipS.range / (kneeS.range + 1f), 1.08f, 1.55f),
             rampDown(wrHipS.mean, 0.10f, 0.35f),
             rampUp(elbowS.mean, 130f, 155f),
             rampDown(elbowS.range, 28f, 50f),
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
-        // 5. PUSHUP: Prone/pike/knee/front-floor + dynamic elbow flexion OR vertical shoulder-to-wrist drop (wide/diamond/archer/front!)
-        val screenChestDropSignal = rampUp(scrShS.range, 0.06f, 0.15f) * rampUp(scrShMotionRatio, 0.52f, 0.72f)
+        // 5. PUSHUP: Prone/Incline/Decline/Pike/Knee + dynamic elbow flexion OR chest vertical drop
         val pushupDynamicMotion = maxOf(
-            rampUp(maxOf(elbowS.range, minElbowS.range), 16f, 40f),
-            rampUp(shWrS.range, 0.14f, 0.34f),
-            screenChestDropSignal
+            rampUp(maxOf(elbowS.range, minElbowS.range), 16f, 42f),
+            rampUp(shWrS.range, 0.13f, 0.32f),
+            rampUp(scrShS.range, 0.055f, 0.13f) * rampDown(scrWrS.range, 0.03f, 0.07f)
         )
         val pushupDepthFactor = maxOf(
-            rampDown(minElbowS.min, 122f, 146f),
-            rampUp(shWrS.range, 0.16f, 0.36f),
-            screenChestDropSignal
-        )
-        val proneAttitudeScore = maxOf(
-            rampUp(maxOf(bodyTiltS.mean, torsoS.mean), 34f, 56f),
-            rampUp(proneRatio, 0.75f, 0.92f)
+            rampDown(minElbowS.min, 124f, 148f),
+            rampUp(shWrS.range, 0.15f, 0.34f)
         )
         scores[ExerciseType.PUSHUP] = product(
-            rampUp(proneRatio, 0.50f, 0.82f),
-            proneAttitudeScore,
+            rampUp(proneRatio, 0.55f, 0.85f),
+            rampUp(maxOf(bodyTiltS.mean, torsoS.mean), 28f, 54f), // supports incline (30°+) AND floor (70°+)
             pushupDynamicMotion,
             pushupDepthFactor,
-            rampDown(wrShS.mean, 0.06f, 0.24f),
-            rampDown(standingRatio, 0.15f, 0.35f)
+            rampDown(wrShS.mean, 0.06f, 0.28f), // allows deep chest-to-floor & pike push-ups!
+            rampDown(standingRatio, 0.15f, 0.34f)
         )
 
-        // 6. PLANK: Prone horizontal + strict isometric stability (low elbow, shoulder-to-wrist, AND screen chest bobbing)
+        // 6. PLANK: Prone horizontal + strict isometric stability (low elbow AND shoulder-to-wrist excursion)
         scores[ExerciseType.PLANK] = product(
             rampUp(proneRatio, 0.65f, 0.90f),
-            rampUp(bodyTiltS.mean, 44f, 66f),
+            rampUp(bodyTiltS.mean, 50f, 68f),
             band(alignS.mean, 130f, 155f, 200f, 225f),
-            rampDown(maxOf(elbowS.range, minElbowS.range), 12f, 24f),
-            rampDown(shWrS.range, 0.08f, 0.20f),
-            rampDown(scrShS.range, 0.05f, 0.11f),
+            rampDown(maxOf(elbowS.range, minElbowS.range), 11f, 22f),
+            rampDown(shWrS.range, 0.07f, 0.18f),
             rampDown(hipS.range, 12f, 24f),
             rampDown(kneeS.range, 12f, 24f),
             rampDown(bodyTiltS.range, 10f, 22f),
@@ -646,7 +692,7 @@ class AutoExerciseDetector(
         )
 
         // 7. BURPEE: Requires genuine sustained round-trip STANDING <-> PRONE_FLOOR <-> STANDING
-        // (or PRONE <-> STANDING <-> PRONE); 1-way getting down/up onto floor MUST score 0.0f!
+        // (1-way getting down/up onto floor MUST score 0.0f!)
         val hasBothPostures = minOf(standingRatio, proneRatio)
         scores[ExerciseType.BURPEE] = if (hasBurpeeRoundTrip()) {
             product(
@@ -658,28 +704,32 @@ class AutoExerciseDetector(
             0f
         }
 
-        // 8. OVERHEAD_PRESS: Standing upright, dynamic elbows pressing wrists high above shoulders, shoulders static
+        // 8. OVERHEAD_PRESS: Upright press (bilateral OR alternating/unilateral) pushing wrists overhead
+        val ohpElbowRange = maxOf(elbowS.range, maxElbowS.range)
+        val ohpElbowMax = maxOf(elbowS.max, maxElbowS.max)
         scores[ExerciseType.OVERHEAD_PRESS] = product(
             rampUp(standingRatio, 0.70f, 0.92f),
             rampDown(torsoS.mean, 18f, 34f),
-            rampDown(kneeS.range, 16f, 32f),
-            rampUp(elbowS.range, 30f, 62f),
-            rampUp(elbowS.max, 132f, 158f),
-            rampDown(elbowS.min, 105f, 130f),
-            rampUp(wrShS.max, 0.45f, 0.85f),
-            rampUp(wrShS.range, 0.30f, 0.65f),
+            rampDown(kneeS.range, 20f, 38f), // allows slight Push Press dip
+            rampUp(ohpElbowRange, 28f, 60f),
+            rampUp(ohpElbowMax, 132f, 158f),
+            rampDown(minOf(elbowS.min, minElbowS.min), 106f, 132f),
+            rampUp(wrShS.max, 0.42f, 0.82f),
+            rampUp(wrShS.range, 0.26f, 0.60f),
             rampDown(scrShMotionRatio, 0.32f, 0.55f), // wrists move, shoulders stay still
             rampDown(footS.range, 0.24f, 0.45f)
         )
 
-        // 9. BICEP_CURL: Standing upright, dynamic elbow flexion, upper arms tucked close to ribs, wrists stay low
+        // 9. BICEP_CURL: Standing upright, bilateral OR alternating/unilateral elbow flexion, upper arms tucked
+        val curlElbowRange = maxOf(elbowS.range, minElbowS.range)
+        val curlElbowMin = minOf(elbowS.min, minElbowS.min)
         scores[ExerciseType.BICEP_CURL] = product(
             rampUp(standingRatio, 0.70f, 0.92f),
             rampDown(torsoS.mean, 18f, 32f),
             rampDown(kneeS.range, 16f, 32f),
-            rampUp(elbowS.range, 32f, 65f),
-            rampDown(elbowS.min, 85f, 112f),
-            rampUp(elbowS.max, 122f, 148f),
+            rampUp(curlElbowRange, 30f, 62f),
+            rampDown(curlElbowMin, 86f, 114f),
+            rampUp(maxOf(elbowS.max, maxElbowS.max), 122f, 148f),
             rampDown(shS.max, 38f, 60f),
             rampDown(shS.range, 22f, 42f),
             rampDown(wrShS.max, 0.22f, 0.45f),
@@ -689,13 +739,13 @@ class AutoExerciseDetector(
         // 10. TRICEP_DIP: Upright/slight lean, wrists anchored near hips, dynamic elbows, shoulders move vertically
         scores[ExerciseType.TRICEP_DIP] = product(
             rampUp(standingRatio, 0.55f, 0.85f),
-            rampDown(torsoS.mean, 34f, 50f),
+            rampDown(torsoS.mean, 38f, 54f),
             rampDown(kneeS.range, 18f, 36f),
-            rampUp(elbowS.range, 26f, 55f),
+            rampUp(elbowS.range, 24f, 52f),
             rampDown(elbowS.min, 108f, 130f),
-            rampDown(wrShS.mean, -0.30f, -0.08f),
-            band(wrHipS.mean, -0.55f, -0.35f, 0.28f, 0.50f),
-            rampUp(scrShMotionRatio, 0.42f, 0.68f) // body dips down/up while hands stay planted
+            rampDown(wrShS.mean, -0.28f, -0.06f),
+            band(wrHipS.mean, -0.55f, -0.35f, 0.30f, 0.52f),
+            rampUp(scrShMotionRatio, 0.40f, 0.66f)
         )
 
         // 11. JUMPING_JACK: Standing upright, high arm abduction + dynamic leg abduction
@@ -707,7 +757,7 @@ class AutoExerciseDetector(
             rampUp(elbowS.mean, 110f, 140f),
             rampUp(footS.range, 0.28f, 0.62f),
             rampUp(ankRatioS.max, 1.02f, 1.32f),
-            rampDown(kneeS.range, 22f, 42f)
+            rampDown(kneeS.range, 24f, 44f)
         )
 
         // 12. PULL_UP: Upright body, hands fixed high overhead, dynamic elbows pulling body upward
@@ -715,56 +765,68 @@ class AutoExerciseDetector(
             rampUp(standingRatio, 0.65f, 0.90f),
             rampDown(torsoS.mean, 24f, 42f),
             rampDown(kneeS.range, 22f, 42f),
-            rampUp(elbowS.range, 30f, 62f),
-            rampDown(elbowS.min, 98f, 122f),
+            rampUp(maxOf(elbowS.range, minElbowS.range), 28f, 60f),
+            rampDown(minOf(elbowS.min, minElbowS.min), 100f, 124f),
             rampUp(wrShS.max, 0.55f, 0.95f),
             rampUp(wrShS.mean, 0.15f, 0.45f),
-            rampUp(scrShMotionRatio, 0.45f, 0.72f) // body pulls toward anchored hands
+            rampUp(scrShMotionRatio, 0.45f, 0.72f)
         )
 
-        // 13. BENT_ROW: Sustained forward torso hinge + dynamic elbow rowing pull
+        // 13. BENT_ROW: Sustained forward torso hinge + bilateral OR unilateral rowing elbow pull
+        val rowElbowRange = maxOf(elbowS.range, minElbowS.range)
+        val rowElbowMin = minOf(elbowS.min, minElbowS.min)
         scores[ExerciseType.BENT_ROW] = product(
             rampUp(standingRatio, 0.55f, 0.85f),
-            band(torsoS.mean, 20f, 32f, 68f, 84f),
+            band(torsoS.mean, 20f, 32f, 72f, 88f), // accommodates Yates (28°) through Pendlay (80°)
             rampUp(torsoS.min, 16f, 28f),
-            rampDown(torsoS.range, 22f, 38f), // torso held fixed unlike deadlift
+            rampDown(torsoS.range, 22f, 38f),
             rampDown(kneeS.range, 18f, 34f),
-            rampUp(elbowS.range, 26f, 55f),
-            rampDown(elbowS.min, 102f, 126f),
+            rampUp(rowElbowRange, 26f, 54f),
+            rampDown(rowElbowMin, 102f, 126f),
             rampDown(wrShS.mean, -0.10f, 0.12f)
         )
 
-        // 14. GLUTE_BRIDGE: Supine on floor, knees bent, dynamic hip extension with feet grounded below hips
+        // 14. GLUTE_BRIDGE: Supine on floor, knees bent, bilateral OR single-leg hip extension
         scores[ExerciseType.GLUTE_BRIDGE] = product(
             rampUp(supineRatio, 0.45f, 0.80f),
             band(kneeS.mean, 40f, 65f, 118f, 138f),
-            rampUp(hipS.range, 18f, 42f),
-            rampUp(hipS.max, 140f, 162f),
-            rampDown(ankHipS.max, 0.14f, 0.36f) // feet stay grounded on floor, never lifting high above hips
+            rampUp(maxOf(hipS.range, maxHipS.range), 18f, 42f),
+            rampUp(maxOf(hipS.max, maxHipS.max), 140f, 162f),
+            rampDown(ankHipS.max, 0.14f, 0.36f)
         )
 
-        // 15. LEG_RAISE: Supine flat on floor, straight legs lifting ankles high above hips dynamically
-        scores[ExerciseType.LEG_RAISE] = product(
+        // 15. LEG_RAISE: Supine flat on floor OR Hanging from bar, straight/alternating leg hip flexion
+        val supineLegRaiseScore = product(
             rampUp(supineRatio, 0.45f, 0.80f),
             rampUp(torsoS.mean, 56f, 74f),
-            rampUp(kneeS.mean, 120f, 148f),
-            rampUp(hipS.range, 24f, 55f),
-            rampDown(hipS.min, 115f, 142f),
+            rampUp(kneeS.mean, 115f, 145f),
+            rampUp(maxOf(hipS.range, minHipS.range), 24f, 55f),
+            rampDown(minOf(hipS.min, minHipS.min), 115f, 142f),
             rampUp(ankHipS.range, 0.40f, 0.85f),
             rampUp(ankHipS.max, 0.35f, 0.72f)
         )
+        val hangingLegRaiseScore = product(
+            rampUp(suspendedRatio, 0.55f, 0.85f),
+            rampUp(elbowS.mean, 138f, 160f),
+            rampDown(elbowS.range, 18f, 34f),
+            rampUp(maxOf(hipS.range, minHipS.range), 28f, 60f),
+            rampDown(minOf(hipS.min, minHipS.min), 115f, 138f)
+        )
+        scores[ExerciseType.LEG_RAISE] = maxOf(supineLegRaiseScore, hangingLegRaiseScore)
 
-        // 16. LATERAL_RAISE: Standing upright, arms abduct to ~90° with straight elbows, stationary legs
+        // 16. LATERAL_RAISE: Standing upright (or hinged rear-delt), bilateral OR alternating arm elevation
+        val latShRange = maxOf(shS.range, maxShS.range)
+        val latShMax = maxOf(shS.max, maxShS.max)
         scores[ExerciseType.LATERAL_RAISE] = product(
             rampUp(standingRatio, 0.70f, 0.92f),
-            rampDown(torsoS.mean, 18f, 32f),
+            rampDown(torsoS.mean, 22f, 42f),
             rampDown(kneeS.range, 16f, 32f),
-            rampUp(shS.range, 28f, 58f),
-            band(shS.max, 55f, 74f, 104f, 124f),
+            rampUp(latShRange, 28f, 58f),
+            band(latShMax, 55f, 74f, 106f, 126f),
             rampDown(shS.min, 36f, 56f),
             rampUp(elbowS.mean, 118f, 145f),
             rampDown(elbowS.range, 26f, 46f),
-            rampDown(wrShS.max, 0.22f, 0.46f),
+            rampDown(wrShS.max, 0.24f, 0.48f),
             rampDown(footS.range, 0.20f, 0.38f)
         )
 

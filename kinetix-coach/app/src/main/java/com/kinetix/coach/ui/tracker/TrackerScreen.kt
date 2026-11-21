@@ -521,12 +521,32 @@ private fun SessionHistoryCard(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = session.exerciseType.labelFr.uppercase(),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = CrispWhite,
-                    fontWeight = FontWeight.Bold
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = session.exerciseType.labelFr.uppercase(),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = CrispWhite,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (session.detectedVariant.isNotBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = SignalOrangeDim,
+                            border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f))
+                        ) {
+                            Text(
+                                text = session.detectedVariant,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SignalOrange,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                }
                 Text(
                     text = if (session.notes.isNotBlank()) "$dateStr · ${session.notes}" else dateStr,
                     style = MaterialTheme.typography.labelSmall,
@@ -594,6 +614,43 @@ private fun SessionHistoryCard(
                 value = "${session.durationSec}",
                 unit = "s"
             )
+        }
+        if (!session.exerciseType.isIsometric && (session.estimatedMaxReps > 0 || session.peakVelocityMps > 0.05f)) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (session.peakVelocityMps > 0.05f) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = ObsidianBg,
+                        border = BorderStroke(1.dp, BorderHairline)
+                    ) {
+                        Text(
+                            text = String.format(Locale.US, "Pic %.2f m/s · -%d%%", session.peakVelocityMps, session.velocityLossPct),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CrispWhite,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+                if (session.estimatedMaxReps > 0) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = SignalOrangeDim,
+                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f))
+                    ) {
+                        Text(
+                            text = "Max estimé ~${session.estimatedMaxReps} reps",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SignalOrange,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+            }
         }
         if (session.topFaults.isNotEmpty()) {
             Spacer(Modifier.height(10.dp))
