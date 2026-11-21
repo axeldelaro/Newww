@@ -15,6 +15,7 @@ import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class PoseLandmarkerHelper(
@@ -31,7 +32,12 @@ class PoseLandmarkerHelper(
     companion object {
         private const val TAG = "KinetixPoseHelper"
         private const val MODEL_ASSET_PATH = "models/pose_landmarker_full.task"
-        private const val MIN_CONFIDENCE = 0.55f
+        // Tuned specifically so horizontal/prone floor poses (push-ups, plank, burpees)
+        // maintain rock-solid continuous tracking without mid-rep frame dropouts
+        private const val MIN_DETECTION_CONFIDENCE = 0.45f
+        private const val MIN_PRESENCE_CONFIDENCE = 0.42f
+        private const val MIN_TRACKING_CONFIDENCE = 0.42f
+        private const val INFERENCE_WATCHDOG_MS = 1200L
     }
 
     @Volatile
@@ -44,12 +50,20 @@ class PoseLandmarkerHelper(
     @Volatile
     private var isFrontCameraCurrent: Boolean = true
 
+    @Volatile
+    private var lastDispatchUptimeMs: Long = 0L
+
     private val isInferring = AtomicBoolean(false)
     private val bitmapLock = Any()
 
     private var reusableRawBitmap: Bitmap? = null
-    private var reusableOrientedBitmap: Bitmap? = null
-    private var reusableCanvas: Canvas? = null
+    private var packedRgbaBuffer: ByteBuffer? = null
+    private var rowCopyBytes: ByteArray = ByteArray(0)
+
+    // Double-buffered oriented bitmaps so MediaPipe GPU/CPU async pipeline never reads a bitmap being overwritten
+    private val orientedBitmaps = arrayOfNulls<Bitmap>(2)
+    private val orientedCanvases = arrayOfNulls<Canvas>(2)
+    private var orientedSlot = 0
     private val rotationMatrix = Matrix()
 
     private var lastTimestampMs: Long = 0L
@@ -76,9 +90,9 @@ class PoseLandmarkerHelper(
                 .setBaseOptions(baseOptions)
                 .setRunningMode(RunningMode.LIVE_STREAM)
                 .setNumPoses(1)
-                .setMinPoseDetectionConfidence(MIN_CONFIDENCE)
-                .setMinPosePresenceConfidence(MIN_CONFIDENCE)
-                .setMinTrackingConfidence(MIN_CONFIDENCE)
+                .setMinPoseDetectionConfidence(MIN_DETECTION_CONFIDENCE)
+                .setMinPosePresenceConfidence(MIN_PRESENCE_CONFIDENCE)
+                .setMinTrackingConfidence(MIN_TRACKING_CONFIDENCE)
                 .setResultListener { result: PoseLandmarkerResult, input: MPImage ->
                     val frontCameraForFrame = isFrontCameraCurrent
                     try {
@@ -140,6 +154,12 @@ class PoseLandmarkerHelper(
 
     fun detectLiveStream(imageProxy: ImageProxy, isFrontCamera: Boolean) {
         val landmarker = poseLandmarker
+        val now = SystemClock.uptimeMillis()
+        // Watchdog: recover automatically if an async frame was ever silently dropped by the GPU driver
+        if (isInferring.get() && lastDispatchUptimeMs > 0L && (now - lastDispatchUptimeMs) > INFERENCE_WATCHDOG_MS) {
+            Log.w(TAG, "Inference watchdog reset after ${now - lastDispatchUptimeMs}ms")
+            isInferring.set(false)
+        }
         if (landmarker == null || !isInferring.compareAndSet(false, true)) {
             imageProxy.close()
             return
@@ -150,9 +170,9 @@ class PoseLandmarkerHelper(
             isFrontCameraCurrent = isFrontCamera
             val orientedBitmap = prepareOrientedBitmap(imageProxy)
 
-            val now = SystemClock.uptimeMillis()
             val ts = if (now > lastTimestampMs) now else lastTimestampMs + 1L
             lastTimestampMs = ts
+            lastDispatchUptimeMs = now
 
             val mpImage = BitmapImageBuilder(orientedBitmap).build()
             landmarker.detectAsync(mpImage, ts)
@@ -168,8 +188,9 @@ class PoseLandmarkerHelper(
     }
 
     /**
-     * Converts and rotates [imageProxy] into a pre-allocated reusable ARGB_8888 [Bitmap]
+     * Converts and rotates [imageProxy] into a double-buffered ARGB_8888 [Bitmap]
      * without horizontal mirroring so MediaPipe retains 100% anatomical Left/Right & 3D fidelity.
+     * Handles both tightly-packed and hardware-padded RGBA rowStride buffers with zero per-frame allocations.
      */
     private fun prepareOrientedBitmap(imageProxy: ImageProxy): Bitmap = synchronized(bitmapLock) {
         val srcW = imageProxy.width
@@ -180,39 +201,59 @@ class PoseLandmarkerHelper(
         val srcBitmap: Bitmap = if (
             imageProxy.format == PixelFormat.RGBA_8888 &&
             imageProxy.planes.isNotEmpty() &&
-            imageProxy.planes[0].pixelStride == 4 &&
-            imageProxy.planes[0].rowStride == srcW * 4
+            imageProxy.planes[0].pixelStride == 4
         ) {
+            val plane = imageProxy.planes[0]
+            val rowStride = plane.rowStride
+            val tightRowBytes = srcW * 4
             val rawBmp = ensureRawBitmap(srcW, srcH)
-            val buf = imageProxy.planes[0].buffer
+            val buf = plane.buffer
             buf.rewind()
-            rawBmp.copyPixelsFromBuffer(buf)
-            rawBmp
+
+            if (rowStride == tightRowBytes) {
+                rawBmp.copyPixelsFromBuffer(buf)
+                rawBmp
+            } else if (rowStride > tightRowBytes && buf.remaining() >= rowStride * (srcH - 1) + tightRowBytes) {
+                // Strip Snapdragon/Adreno hardware row padding cleanly with zero per-frame GC allocations
+                val packed = ensurePackedBuffer(tightRowBytes * srcH)
+                if (rowCopyBytes.size < tightRowBytes) {
+                    rowCopyBytes = ByteArray(tightRowBytes)
+                }
+                packed.clear()
+                for (row in 0 until srcH) {
+                    buf.position(row * rowStride)
+                    buf.get(rowCopyBytes, 0, tightRowBytes)
+                    packed.put(rowCopyBytes, 0, tightRowBytes)
+                }
+                packed.rewind()
+                rawBmp.copyPixelsFromBuffer(packed)
+                rawBmp
+            } else {
+                imageProxy.toBitmap().also { tempBitmapToRecycle = it }
+            }
         } else {
             imageProxy.toBitmap().also { tempBitmapToRecycle = it }
         }
 
-        if (rotationDeg == 0) {
-            if (tempBitmapToRecycle == null) {
-                return@synchronized srcBitmap
-            }
-            val dst = ensureOrientedBitmap(srcW, srcH)
-            reusableCanvas?.drawBitmap(srcBitmap, 0f, 0f, null)
-            tempBitmapToRecycle?.recycle()
-            return@synchronized dst
-        }
+        val slot = orientedSlot
+        orientedSlot = slot xor 1
 
         val swapDims = rotationDeg == 90 || rotationDeg == 270
         val dstW = if (swapDims) srcH else srcW
         val dstH = if (swapDims) srcW else srcH
-        val dstBitmap = ensureOrientedBitmap(dstW, dstH)
+        val dstBitmap = ensureOrientedBitmap(slot, dstW, dstH)
+        val canvas = orientedCanvases[slot]
 
-        rotationMatrix.reset()
-        rotationMatrix.postTranslate(-srcW * 0.5f, -srcH * 0.5f)
-        rotationMatrix.postRotate(rotationDeg.toFloat())
-        rotationMatrix.postTranslate(dstW * 0.5f, dstH * 0.5f)
+        if (rotationDeg == 0) {
+            canvas?.drawBitmap(srcBitmap, 0f, 0f, null)
+        } else {
+            rotationMatrix.reset()
+            rotationMatrix.postTranslate(-srcW * 0.5f, -srcH * 0.5f)
+            rotationMatrix.postRotate(rotationDeg.toFloat())
+            rotationMatrix.postTranslate(dstW * 0.5f, dstH * 0.5f)
+            canvas?.drawBitmap(srcBitmap, rotationMatrix, null)
+        }
 
-        reusableCanvas?.drawBitmap(srcBitmap, rotationMatrix, null)
         tempBitmapToRecycle?.recycle()
         return@synchronized dstBitmap
     }
@@ -228,31 +269,46 @@ class PoseLandmarkerHelper(
         }
     }
 
-    private fun ensureOrientedBitmap(width: Int, height: Int): Bitmap {
-        val existing = reusableOrientedBitmap
+    private fun ensurePackedBuffer(sizeBytes: Int): ByteBuffer {
+        val existing = packedRgbaBuffer
+        if (existing != null && existing.capacity() >= sizeBytes) {
+            return existing
+        }
+        return ByteBuffer.allocateDirect(sizeBytes).also {
+            packedRgbaBuffer = it
+        }
+    }
+
+    private fun ensureOrientedBitmap(slot: Int, width: Int, height: Int): Bitmap {
+        val existing = orientedBitmaps[slot]
         if (existing != null && !existing.isRecycled && existing.width == width && existing.height == height) {
             return existing
         }
         existing?.recycle()
         return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bmp ->
-            reusableOrientedBitmap = bmp
-            reusableCanvas = Canvas(bmp)
+            orientedBitmaps[slot] = bmp
+            orientedCanvases[slot] = Canvas(bmp)
         }
     }
 
     fun close() {
         isInferring.set(false)
+        lastDispatchUptimeMs = 0L
         try {
             poseLandmarker?.close()
         } catch (_: Throwable) {
         }
         poseLandmarker = null
         synchronized(bitmapLock) {
-            reusableCanvas = null
             reusableRawBitmap?.recycle()
             reusableRawBitmap = null
-            reusableOrientedBitmap?.recycle()
-            reusableOrientedBitmap = null
+            packedRgbaBuffer = null
+            rowCopyBytes = ByteArray(0)
+            for (i in orientedBitmaps.indices) {
+                orientedCanvases[i] = null
+                orientedBitmaps[i]?.recycle()
+                orientedBitmaps[i] = null
+            }
         }
     }
 }

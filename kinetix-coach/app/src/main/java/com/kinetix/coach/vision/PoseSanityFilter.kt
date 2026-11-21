@@ -26,8 +26,9 @@ data class SanityFilterResult(
  * Stateful physics-based landmark sanity gate running BEFORE [PoseOneEuroSmoother]:
  * 1. Teleportation Spike Rejection: clamps single-frame low-confidence MediaPipe jumps.
  * 2. Brief Occlusion Hold (< 180 ms): holds last valid coordinates with decaying visibility.
- * 3. Global Horizontal Translation & Camera Zoom Guard: blocks phantom reps & switches
- *    while walking to/from the phone without blocking vertical exercise movement.
+ * 3. Foreshortening-Safe Motion Guard: blocks phantom reps & switches when walking laterally
+ *    across frame or rushing right into the camera lens, while NEVER falsely freezing prone
+ *    floor exercises (push-ups, plank, burpees) filmed from Front, 3/4, or Side Profile!
  */
 class PoseSanityFilter(
     private val landmarkCount: Int = 33
@@ -43,11 +44,14 @@ class PoseSanityFilter(
         private const val OCCLUSION_HOLD_MS = 180L
         private const val RESET_GAP_MS = 450L
 
-        private const val CORE_VIS_MIN = 0.52f
-        private const val HIP_HORIZ_SPEED_THRESHOLD = 0.42f
-        private const val BODY_SCALE_RATE_THRESHOLD = 0.70f
-        private const val SUSTAINED_MOTION_FRAMES = 3
-        private const val STABILIZATION_COOLDOWN_MS = 650L
+        // Best-side torso visibility (never penalizes occluded far side in profile or hips behind chest in front push-ups!)
+        private const val CORE_VIS_MIN = 0.38f
+        private const val COHERENT_WALK_SPEED_THRESHOLD = 0.42f
+        private const val SHOULDER_ZOOM_RATE_THRESHOLD = 1.35f
+        private const val LENS_FILL_SHOULDER_WIDTH = 0.84f
+        private const val SUSTAINED_WALK_FRAMES = 3
+        private const val SUSTAINED_ZOOM_FRAMES = 4
+        private const val STABILIZATION_COOLDOWN_MS = 480L
     }
 
     private var lastValidScreen = arrayOfNulls<PosePoint>(landmarkCount)
@@ -59,8 +63,10 @@ class PoseSanityFilter(
     private var lastOutputWorld: List<PosePoint> = emptyList()
     private var lastFrameTsMs: Long = Long.MIN_VALUE
 
+    private var prevMidShX: Float = Float.NaN
     private var prevMidHipX: Float = Float.NaN
-    private var prevBodyScale: Float = Float.NaN
+    private var prevShoulderWidth: Float = Float.NaN
+    private var prevZoomSign: Int = 0
     private var horizontalWalkStreak: Int = 0
     private var scaleZoomStreak: Int = 0
     private var lastUnstableTsMs: Long = Long.MIN_VALUE
@@ -75,8 +81,10 @@ class PoseSanityFilter(
         lastOutputScreen = emptyList()
         lastOutputWorld = emptyList()
         lastFrameTsMs = Long.MIN_VALUE
+        prevMidShX = Float.NaN
         prevMidHipX = Float.NaN
-        prevBodyScale = Float.NaN
+        prevShoulderWidth = Float.NaN
+        prevZoomSign = 0
         horizontalWalkStreak = 0
         scaleZoomStreak = 0
         lastUnstableTsMs = Long.MIN_VALUE
@@ -118,13 +126,16 @@ class PoseSanityFilter(
 
         val dtMs = if (lastFrameTsMs != Long.MIN_VALUE) (timestampMs - lastFrameTsMs).coerceAtLeast(1L) else 0L
 
-        // Compute raw core visibility BEFORE occlusion hold so exiting frame triggers guard immediately
-        val meanCoreVis = (
-            rawScreen[BiomechanicsEngine.LEFT_SHOULDER].visibility +
-                rawScreen[BiomechanicsEngine.RIGHT_SHOULDER].visibility +
-                rawScreen[BiomechanicsEngine.LEFT_HIP].visibility +
-                rawScreen[BiomechanicsEngine.RIGHT_HIP].visibility
-            ) * 0.25f
+        // Best-side core visibility BEFORE occlusion hold:
+        // Side-profile exercises naturally occlude the far shoulder/hip, and front-floor push-ups
+        // often occlude hips behind the chest — checking the clearest side + upper shoulders prevents false freezes.
+        val rawLShVis = rawScreen[BiomechanicsEngine.LEFT_SHOULDER].visibility
+        val rawRShVis = rawScreen[BiomechanicsEngine.RIGHT_SHOULDER].visibility
+        val rawLHipVis = rawScreen[BiomechanicsEngine.LEFT_HIP].visibility
+        val rawRHipVis = rawScreen[BiomechanicsEngine.RIGHT_HIP].visibility
+        val bestSideTorsoVis = maxOf(minOf(rawLShVis, rawLHipVis), minOf(rawRShVis, rawRHipVis))
+        val upperShouldersVis = minOf(rawLShVis, rawRShVis)
+        val effectiveCoreVis = maxOf(bestSideTorsoVis, upperShouldersVis * 0.90f)
 
         val filteredScreen = filterPointList(
             raw = rawScreen,
@@ -147,50 +158,70 @@ class PoseSanityFilter(
             emptyList()
         }
 
-        // Global horizontal translation & camera-zoom motion guard (vertical exercise motion stays unblocked)
         val lSh = filteredScreen[BiomechanicsEngine.LEFT_SHOULDER]
         val rSh = filteredScreen[BiomechanicsEngine.RIGHT_SHOULDER]
         val lHip = filteredScreen[BiomechanicsEngine.LEFT_HIP]
         val rHip = filteredScreen[BiomechanicsEngine.RIGHT_HIP]
 
         val midShX = (lSh.x + rSh.x) * 0.5f
-        val midShY = (lSh.y + rSh.y) * 0.5f
         val midHipX = (lHip.x + rHip.x) * 0.5f
-        val midHipY = (lHip.y + rHip.y) * 0.5f
-        val bodyScale = hypot(midShX - midHipX, midShY - midHipY)
+        // Shoulder width is foreshortening-immune to vertical push-up chest drop, squat hinge, and deadlift!
+        val shoulderWidth = hypot(lSh.x - rSh.x, lSh.y - rSh.y)
 
-        var hipHorizSpeed = 0f
-        var bodyScaleRate = 0f
+        var coherentHorizSpeed = 0f
+        var shoulderZoomRate = 0f
 
-        if (dtMs > 0L && prevMidHipX.isFinite() && prevBodyScale.isFinite()) {
+        if (dtMs > 0L && prevMidShX.isFinite() && prevMidHipX.isFinite() && prevShoulderWidth.isFinite()) {
             val dtSec = (dtMs / 1000f).coerceIn(1f / 240f, 0.45f)
-            hipHorizSpeed = abs(midHipX - prevMidHipX) / dtSec
-            bodyScaleRate = abs(bodyScale - prevBodyScale) / prevBodyScale.coerceAtLeast(0.05f) / dtSec
+            val shVelX = (midShX - prevMidShX) / dtSec
+            val hipVelX = (midHipX - prevMidHipX) / dtSec
 
-            if (hipHorizSpeed > HIP_HORIZ_SPEED_THRESHOLD) {
+            // True walking moves BOTH shoulders AND hips laterally in the same X direction
+            if (shVelX * hipVelX > 0f) {
+                coherentHorizSpeed = minOf(abs(shVelX), abs(hipVelX))
+            }
+            if (coherentHorizSpeed > COHERENT_WALK_SPEED_THRESHOLD) {
                 horizontalWalkStreak++
             } else {
                 horizontalWalkStreak = 0
             }
 
-            if (bodyScaleRate > BODY_SCALE_RATE_THRESHOLD) {
-                scaleZoomStreak++
+            // Camera proximity zoom: only track sustained monotonic rapid shoulder-width expansion/contraction
+            if (prevShoulderWidth >= 0.16f && shoulderWidth >= 0.16f) {
+                val signedZoom = (shoulderWidth - prevShoulderWidth) / prevShoulderWidth / dtSec
+                shoulderZoomRate = abs(signedZoom)
+                val zoomSign = if (signedZoom >= 0f) 1 else -1
+                if (shoulderZoomRate > SHOULDER_ZOOM_RATE_THRESHOLD) {
+                    if (zoomSign == prevZoomSign) {
+                        scaleZoomStreak++
+                    } else {
+                        scaleZoomStreak = 1
+                        prevZoomSign = zoomSign
+                    }
+                } else {
+                    scaleZoomStreak = 0
+                    prevZoomSign = 0
+                }
             } else {
                 scaleZoomStreak = 0
+                prevZoomSign = 0
             }
         } else {
             horizontalWalkStreak = 0
             scaleZoomStreak = 0
+            prevZoomSign = 0
         }
 
+        prevMidShX = midShX
         prevMidHipX = midHipX
-        prevBodyScale = bodyScale
+        prevShoulderWidth = shoulderWidth
         lastFrameTsMs = timestampMs
 
+        val lensBlockedByProximity = shoulderWidth > LENS_FILL_SHOULDER_WIDTH && upperShouldersVis >= 0.45f
         val unstableReason: String? = when {
-            meanCoreVis < CORE_VIS_MIN -> "Visibilité faible"
-            horizontalWalkStreak >= SUSTAINED_MOTION_FRAMES -> "Déplacement latéral"
-            scaleZoomStreak >= SUSTAINED_MOTION_FRAMES -> "Changement de distance"
+            effectiveCoreVis < CORE_VIS_MIN -> "Visibilité faible"
+            horizontalWalkStreak >= SUSTAINED_WALK_FRAMES -> "Déplacement latéral"
+            scaleZoomStreak >= SUSTAINED_ZOOM_FRAMES || lensBlockedByProximity -> "Changement de distance"
             else -> null
         }
 
@@ -208,9 +239,9 @@ class PoseSanityFilter(
 
         val guard = MotionGuardState(
             isUnstableTransition = isUnstable,
-            meanCoreVisibility = meanCoreVis,
-            hipHorizontalSpeed = hipHorizSpeed,
-            bodyScaleRate = bodyScaleRate,
+            meanCoreVisibility = effectiveCoreVis,
+            hipHorizontalSpeed = coherentHorizSpeed,
+            bodyScaleRate = shoulderZoomRate,
             reasonFr = if (isUnstable) lastUnstableReasonFr else null
         )
 

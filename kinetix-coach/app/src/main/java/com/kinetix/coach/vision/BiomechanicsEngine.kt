@@ -89,14 +89,15 @@ data class BiomechanicsFrame(
     val completedRepDurationSec: Float = 0f,
     val isometricDeltaSec: Float = 0f,
     val detectedVariantFr: String? = null,
-    val isStabilizing: Boolean = false
+    val isStabilizing: Boolean = false,
+    val vbt: VbtMetrics = VbtMetrics()
 )
 
 /**
  * Pure-Kotlin real-time 3D multi-angle biomechanics analyzer for all 16 KINETIX exercises.
  * Uses MediaPipe 33-landmark screen & 3D metric world coordinates with adaptive Casiez One-Euro
  * filtering, viewpoint-invariant 3D joint geometry, multi-signal fused depth tracking,
- * automatic variant recognition, bilateral symmetry checks, and degree-exact corrections.
+ * automatic variant recognition, bilateral symmetry checks, degree-exact corrections, and VBT.
  */
 class BiomechanicsEngine(
     initialExercise: ExerciseType = ExerciseType.SQUAT,
@@ -123,7 +124,11 @@ class BiomechanicsEngine(
         const val RIGHT_ANKLE = 28
 
         private const val SYMMETRY_THRESHOLD_DEG = 13f
-        private const val MIN_BOTTOM_DWELL_MS = 55L
+        // 25 ms allows fast touch-and-go explosive push-ups at 25-30 FPS (33-40 ms/frame) while
+        // minRepDurationMs (300 ms live / 180 ms deterministic) still rejects 1-frame spikes.
+        private const val MIN_BOTTOM_DWELL_MS = 25L
+        private const val POSTURE_ABORT_GRACE_FRAMES = 4
+        private const val PUSHUP_WINDOW_MS = 4200L
 
         /** Classic 2D screen-space joint angle in degrees (0..180). */
         fun angleDegrees(a: PosePoint, b: PosePoint, c: PosePoint): Float {
@@ -285,10 +290,18 @@ class BiomechanicsEngine(
 
     private val sanityFilter = PoseSanityFilter()
     private val viewpointTracker = CameraViewpointTracker()
+    private val vbtEngine = VbtEngine()
     private val screenSmoother = PoseOneEuroSmoother()
     private val worldSmoother = PoseOneEuroSmoother()
     private var legacySmoothedScreen: MutableList<PosePoint>? = null
     private var legacySmoothedWorld: MutableList<PosePoint>? = null
+
+    private data class PushupHeightSample(
+        val timestampMs: Long,
+        val normHeight: Float,
+        val wristY: Float,
+        val elbowDeg: Float
+    )
 
     private var repCount: Int = 0
     private var phase: MovementPhase = MovementPhase.READY
@@ -300,9 +313,12 @@ class BiomechanicsEngine(
     private var lastFrameTsMs: Long = 0L
     private var repStartTsMs: Long = 0L
     private var lastMotionGuard: MotionGuardState = MotionGuardState()
+    private var postureGateRejectStreak: Int = 0
 
-    // Adaptive multi-signal vertical drop & variant latch trackers
+    // Self-healing multi-signal vertical drop & variant latch trackers
+    private val pushupHeightWindow = ArrayDeque<PushupHeightSample>(128)
     private var adaptivePushupTopHeight: Float = 0f
+    private var pushupStraightArmStreak: Int = 0
     private var adaptiveDipTopHeight: Float = 0f
     private var latchedPushupVariant: PushupVariant? = null
 
@@ -325,6 +341,10 @@ class BiomechanicsEngine(
 
     val currentMotionGuard: MotionGuardState
         get() = lastMotionGuard
+
+    fun setAthleteHeightCm(heightCm: Int) {
+        vbtEngine.setAthleteHeightCm(heightCm)
+    }
 
     fun setStrictness(mode: DetectionStrictness) {
         strictness = mode
@@ -357,6 +377,7 @@ class BiomechanicsEngine(
         legacySmoothedWorld = null
         lastFrameTsMs = 0L
         lastMotionGuard = MotionGuardState()
+        postureGateRejectStreak = 0
     }
 
     fun resetSession() {
@@ -373,9 +394,13 @@ class BiomechanicsEngine(
         burpeeBottomEnteredTsMs = 0L
         plankHoldMs = 0L
         repStartTsMs = 0L
+        postureGateRejectStreak = 0
+        pushupHeightWindow.clear()
         adaptivePushupTopHeight = 0f
+        pushupStraightArmStreak = 0
         adaptiveDipTopHeight = 0f
         latchedPushupVariant = null
+        vbtEngine.resetSet()
         formScoreSum = 0L
         formScoreSamples = 0
         repRomPeak = 0
@@ -413,7 +438,8 @@ class BiomechanicsEngine(
         worldLandmarks = emptyList(),
         viewpointInfo = ViewpointInfo(),
         corrections = emptyList(),
-        isStabilizing = false
+        isStabilizing = false,
+        vbt = vbtEngine.currentMetrics()
     )
 
     /** Backward-compatible 2D-only entry point. */
@@ -466,6 +492,7 @@ class BiomechanicsEngine(
             abortIncompleteRepCycle()
             burpeeStage = 0
             burpeeBottomEnteredTsMs = 0L
+            postureGateRejectStreak = 0
             return BiomechanicsFrame(
                 exercise = currentExercise,
                 landmarks = screenPts,
@@ -485,7 +512,8 @@ class BiomechanicsEngine(
                 worldLandmarks = worldPts,
                 viewpointInfo = viewpointInfo,
                 corrections = emptyList(),
-                isStabilizing = true
+                isStabilizing = true,
+                vbt = vbtEngine.currentMetrics()
             )
         }
 
@@ -575,6 +603,25 @@ class BiomechanicsEngine(
             verticalTiltDegrees(shS, anS)
         }
 
+        // Screen-space foreshortened horizontal floor posture detector:
+        // Essential when phone is propped on floor in front of user (tilted 15-45° upward) or in 2D front view!
+        val midShSAll = midpoint(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER])
+        val midHpSAll = midpoint(screenPts[LEFT_HIP], screenPts[RIGHT_HIP])
+        val bothArmsVisGlobal = lArmW >= 0.40f && rArmW >= 0.40f
+        val activeWrSY = if (bothArmsVisGlobal) {
+            (screenPts[LEFT_WRIST].y + screenPts[RIGHT_WRIST].y) * 0.5f
+        } else if (lArmW >= rArmW) {
+            screenPts[LEFT_WRIST].y
+        } else {
+            screenPts[RIGHT_WRIST].y
+        }
+        val activeShSY = if (bothArmsVisGlobal) midShSAll.y else shS.y
+        val shWidth2DGlobal = dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.05f)
+        val torsoVert2DGlobal = abs(midHpSAll.y - midShSAll.y)
+        val frontFloorHorizontal = (torsoVert2DGlobal / shWidth2DGlobal) < 0.90f &&
+            midShSAll.y >= 0.22f &&
+            activeWrSY >= activeShSY - 0.12f
+
         val pelvisAxis = if (use3D) computePelvisRightAxis(worldPts[LEFT_HIP], worldPts[RIGHT_HIP]) else PosePoint(1f, 0f, 0f)
 
         var score = 100
@@ -631,10 +678,12 @@ class BiomechanicsEngine(
         }
 
         // Physical posture sanity gate: prevent out-of-position phantom reps & fault spam
+        // while allowing ALL real-world camera placements (front-floor tilted phone, 3/4, side profile).
         val postureGateFeedback: String? = when (currentExercise) {
             ExerciseType.PUSHUP -> {
-                val pushupBodyOk = fullBodyTilt >= 28f || torsoTilt >= 32f
-                val wristsNotOverhead = wrS.y > shS.y - 0.04f
+                val pushupBodyOk = fullBodyTilt >= 24f || torsoTilt >= 26f || frontFloorHorizontal
+                // Allow chest to descend slightly below wrist perspective line on low floor cameras (-0.12f)
+                val wristsNotOverhead = activeWrSY >= activeShSY - 0.12f
                 if (!pushupBodyOk || !wristsNotOverhead) {
                     "Mettez-vous en position pompes au sol."
                 } else {
@@ -657,7 +706,8 @@ class BiomechanicsEngine(
             }
             ExerciseType.GLUTE_BRIDGE,
             ExerciseType.LEG_RAISE -> {
-                if (torsoTilt < 32f) {
+                val frontFloorSupine = (torsoVert2DGlobal / shWidth2DGlobal) < 0.85f && midShSAll.y >= 0.48f
+                if (torsoTilt < 32f && !frontFloorSupine) {
                     "Allongez-vous sur le dos pour cet exercice."
                 } else {
                     null
@@ -667,28 +717,36 @@ class BiomechanicsEngine(
         }
 
         if (postureGateFeedback != null) {
-            abortIncompleteRepCycle()
-            return BiomechanicsFrame(
-                exercise = currentExercise,
-                landmarks = screenPts,
-                repCount = repCount,
-                isometricHoldSec = plankHoldMs / 1000f,
-                phase = MovementPhase.READY,
-                romPct = 0,
-                formScore = 100,
-                formQuality = FormQuality.GOOD,
-                feedbackFr = postureGateFeedback,
-                voiceCueFr = null,
-                angleBadges = emptyList(),
-                avgFormScore = computeAvgForm(),
-                avgRomPct = computeAvgRom(),
-                topFaults = computeTopFaults(),
-                poseDetected = true,
-                worldLandmarks = worldPts,
-                viewpointInfo = viewpointInfo,
-                corrections = emptyList(),
-                isStabilizing = false
-            )
+            postureGateRejectStreak++
+            // If mid-rep, tolerate brief 1-3 frame MediaPipe jitter before aborting an active rep!
+            val shouldRejectNow = !isMidRep || postureGateRejectStreak >= POSTURE_ABORT_GRACE_FRAMES
+            if (shouldRejectNow) {
+                abortIncompleteRepCycle()
+                return BiomechanicsFrame(
+                    exercise = currentExercise,
+                    landmarks = screenPts,
+                    repCount = repCount,
+                    isometricHoldSec = plankHoldMs / 1000f,
+                    phase = MovementPhase.READY,
+                    romPct = 0,
+                    formScore = 100,
+                    formQuality = FormQuality.GOOD,
+                    feedbackFr = postureGateFeedback,
+                    voiceCueFr = null,
+                    angleBadges = emptyList(),
+                    avgFormScore = computeAvgForm(),
+                    avgRomPct = computeAvgRom(),
+                    topFaults = computeTopFaults(),
+                    poseDetected = true,
+                    worldLandmarks = worldPts,
+                    viewpointInfo = viewpointInfo,
+                    corrections = emptyList(),
+                    isStabilizing = false,
+                    vbt = vbtEngine.currentMetrics()
+                )
+            }
+        } else {
+            postureGateRejectStreak = 0
         }
 
         when (currentExercise) {
@@ -918,13 +976,31 @@ class BiomechanicsEngine(
             }
 
             ExerciseType.PUSHUP -> {
-                // 1. Auto-detect Push-up Variant cleanly across 3D & 2D viewpoints
-                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
-                val minElbow = minOf(leftElbow, rightElbow)
-                val maxElbow = maxOf(leftElbow, rightElbow)
-                val bestElbow = if (bothArmsVis) minElbow else if (lArmW >= rArmW) leftElbow else rightElbow
+                // 1. Cross-checked 3D + 2D elbow angles (immune to MediaPipe prone 3D flattening in side profile)
+                val bothArmsVis = lArmW >= 0.40f && rArmW >= 0.40f
+                val isProfileView = viewpointInfo.viewpoint == CameraViewpoint.PROFILE_LEFT ||
+                    viewpointInfo.viewpoint == CameraViewpoint.PROFILE_RIGHT
 
-                val isProneBody = torsoTilt >= 34f || fullBodyTilt >= 42f
+                val leftElbow2D = angleDegrees(screenPts[LEFT_SHOULDER], screenPts[LEFT_ELBOW], screenPts[LEFT_WRIST])
+                val rightElbow2D = angleDegrees(screenPts[RIGHT_SHOULDER], screenPts[RIGHT_ELBOW], screenPts[RIGHT_WRIST])
+
+                val effLeftElbow = if (use3D && isProfileView && useLeft && !isStrict) {
+                    minOf(leftElbow, leftElbow2D * 1.04f)
+                } else {
+                    leftElbow
+                }
+                val effRightElbow = if (use3D && isProfileView && !useLeft && !isStrict) {
+                    minOf(rightElbow, rightElbow2D * 1.04f)
+                } else {
+                    rightElbow
+                }
+                val effElbowAngle = fuseSide(effLeftElbow, effRightElbow, lArmW, rArmW, useLeft, bothVisible)
+                val minElbow = minOf(effLeftElbow, effRightElbow)
+                val maxElbow = maxOf(effLeftElbow, effRightElbow)
+                val bestElbow = if (bothArmsVis) minElbow else if (lArmW >= rArmW) effLeftElbow else effRightElbow
+
+                // 2. Auto-detect Push-up Variant cleanly across 3D, 2D & tilted front-floor viewpoints
+                val isProneBody = torsoTilt >= 26f || fullBodyTilt >= 24f || frontFloorHorizontal
                 val leftAnkleAboveKnee = screenPts[LEFT_ANKLE].visibility >= 0.35f &&
                     screenPts[LEFT_KNEE].visibility >= 0.35f &&
                     geomPts[LEFT_ANKLE].y < geomPts[LEFT_KNEE].y - 0.03f
@@ -936,7 +1012,8 @@ class BiomechanicsEngine(
                     useLeft -> leftAnkleAboveKnee
                     else -> rightAnkleAboveKnee
                 }
-                val isKnee = isProneBody && (ankleLifted || kneeAngle < 125f)
+                val legsVisibleEnoughForKneeCheck = maxOf(lLegW, rLegW) >= 0.42f
+                val isKnee = isProneBody && legsVisibleEnoughForKneeCheck && (ankleLifted || kneeAngle < 125f)
 
                 val midWristYGeom = if (bothArmsVis) {
                     (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
@@ -948,8 +1025,8 @@ class BiomechanicsEngine(
                 } else {
                     geomPts[shIdx].y
                 }
-                val handsNearFloor = midWristYGeom >= midShYGeom - (if (use3D) 0.05f else 0.02f)
-                val isPike = !isKnee && hipAngle < 125f && bodyLineAlign > 205f && handsNearFloor
+                val handsNearFloor = midWristYGeom >= midShYGeom - (if (use3D) 0.08f else 0.05f)
+                val isPike = !isKnee && legsVisibleEnoughForKneeCheck && hipAngle < 125f && bodyLineAlign > 205f && handsNearFloor
 
                 val isArcherNow = bothArmsVis && maxElbow > 145f && minElbow < 115f
                 if (isArcherNow) {
@@ -985,7 +1062,7 @@ class BiomechanicsEngine(
                 }
                 detectedVariantFr = pushupVariant.labelFr
 
-                // 2. Variant-aware alignment check (shoulder-hip-knee for Knee push-ups; exempt Pike from high-hip fault)
+                // 3. Occlusion- & angle-safe body alignment check (never spams false hip faults on front-floor push-ups!)
                 val effectiveAlign = if (isKnee) {
                     val lKneeAlign = bodyAlign(LEFT_SHOULDER, LEFT_HIP, LEFT_KNEE)
                     val rKneeAlign = bodyAlign(RIGHT_SHOULDER, RIGHT_HIP, RIGHT_KNEE)
@@ -995,12 +1072,23 @@ class BiomechanicsEngine(
                 }
                 val alignEndIdx = if (isKnee) knIdx else anIdx
                 val alignEndS = if (isKnee) knS else anS
+                val alignVis = if (isKnee) {
+                    maxOf(
+                        minOf(lTorsoW, screenPts[LEFT_KNEE].visibility),
+                        minOf(rTorsoW, screenPts[RIGHT_KNEE].visibility)
+                    )
+                } else {
+                    maxOf(minOf(lTorsoW, lLegW), minOf(rTorsoW, rLegW))
+                }
+                val canJudgeBodyAlign = !isPike &&
+                    alignVis >= 0.45f &&
+                    (viewpointInfo.azimuthDeg >= 24 || (use3D && alignVis >= 0.65f))
 
                 var elbowHint: Int? = null
                 var hipHint: Int? = null
 
-                if (!isPike) {
-                    if (effectiveAlign < 156f) {
+                if (canJudgeBodyAlign) {
+                    if (effectiveAlign < 155f) {
                         val delta = (172f - effectiveAlign).roundToInt().coerceAtLeast(1)
                         score -= 28
                         faultMsg = "Gainez les abdos : ne creusez pas le bas du dos"
@@ -1025,7 +1113,7 @@ class BiomechanicsEngine(
                                 voiceCueFr = "Gainez les abdos, remontez les hanches"
                             )
                         )
-                    } else if (effectiveAlign > 204f) {
+                    } else if (effectiveAlign > 205f) {
                         val delta = (effectiveAlign - 188f).roundToInt().coerceAtLeast(1)
                         score -= 20
                         faultMsg = "Abaissez légèrement les hanches"
@@ -1054,7 +1142,7 @@ class BiomechanicsEngine(
                 }
 
                 // Elbow flare check (exempt Wide, Pike, and Archer variants where wider abduction is expected)
-                if (!isWide && !isPike && !isArcher && use3D && bothVisible && elbowAngle < 125f && shoulderAngle > 78f) {
+                if (!isWide && !isPike && !isArcher && use3D && bothVisible && effElbowAngle < 125f && shoulderAngle > 78f) {
                     val delta = (shoulderAngle - 55f).roundToInt().coerceAtLeast(1)
                     score -= 12
                     corrections.add(
@@ -1075,12 +1163,15 @@ class BiomechanicsEngine(
                     )
                 }
 
-                // 3. Multi-Signal Fused Push-Up Depth (Signal A: Active Elbow + Signal B: Adaptive Vertical Chest Drop)
+                // 4. Bulletproof 3-Signal Fused Push-Up Depth (Zero Lockup, All Angles, All Variants):
+                //    Signal A: Active Elbow Flexion (3D + 2D profile cross-check)
+                //    Signal B: Camera-Tilt-Invariant 3D Arm Chord Compression (self-normalized, zero calibration)
+                //    Signal C: Sliding-Window Screen Vertical Chest+Head Drop (works even with occluded elbows on floor)
                 val activeElbow = when {
                     isArcher -> bestElbow
                     !isStrict && !bothVisible -> bestElbow
-                    !isStrict && bothArmsVis -> 0.35f * elbowAngle + 0.65f * minElbow
-                    else -> elbowAngle
+                    !isStrict && bothArmsVis -> 0.35f * effElbowAngle + 0.65f * minElbow
+                    else -> effElbowAngle
                 }
                 val elbowBottomTarget = when {
                     isStrict && isWide -> 106f
@@ -1091,40 +1182,130 @@ class BiomechanicsEngine(
                 val elbowProgress = ((148f - activeElbow) / (148f - elbowBottomTarget).coerceAtLeast(10f))
                     .coerceIn(0f, 1.25f)
 
-                val pushupTorsoLen = if (use3D) {
-                    val midShW = if (bothVisible) midpoint(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]) else worldPts[shIdx]
-                    val midHpW = if (bothVisible) midpoint(worldPts[LEFT_HIP], worldPts[RIGHT_HIP]) else worldPts[hpIdx]
-                    dist3D(midShW, midHpW).coerceAtLeast(0.28f)
-                } else {
-                    val midShS = if (bothVisible) midpoint(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]) else shS
-                    val midHpS = if (bothVisible) midpoint(screenPts[LEFT_HIP], screenPts[RIGHT_HIP]) else hpS
-                    dist2D(midShS, midHpS).coerceAtLeast(0.10f)
-                }
-                val currentPushupHeight = ((midWristYGeom - midShYGeom) / pushupTorsoLen).coerceAtLeast(0f)
-                val inPushupAttitude = isProneBody || isPike
-                if (inPushupAttitude && currentPushupHeight > 0.05f) {
-                    if (adaptivePushupTopHeight <= 0.01f || currentPushupHeight > adaptivePushupTopHeight) {
-                        adaptivePushupTopHeight = currentPushupHeight
-                    } else if (phase == MovementPhase.READY) {
-                        adaptivePushupTopHeight = adaptivePushupTopHeight * 0.996f + currentPushupHeight * 0.004f
+                // Signal B: Self-normalized 3D arm compression ratio (shoulder-to-wrist chord / anatomical arm length)
+                val bestArmVis = maxOf(lArmW, rArmW)
+                val armCompProgress = if (use3D && bestArmVis >= 0.42f) {
+                    fun compForSide(sI: Int, eI: Int, wI: Int): Float {
+                        val totalLen = (dist3D(worldPts[sI], worldPts[eI]) + dist3D(worldPts[eI], worldPts[wI]))
+                            .coerceAtLeast(0.24f)
+                        val chord = dist3D(worldPts[sI], worldPts[wI])
+                        val ratio = (chord / totalLen).coerceIn(0.40f, 1.0f)
+                        val span = if (isStrict) 0.22f else 0.16f
+                        return ((0.96f - ratio) / span).coerceIn(0f, 1.25f)
                     }
-                }
-                val chestDropProgress = if (inPushupAttitude && adaptivePushupTopHeight > 0.12f) {
-                    ((adaptivePushupTopHeight - currentPushupHeight) / (adaptivePushupTopHeight * 0.36f))
-                        .coerceIn(0f, 1.2f)
+                    val lComp = compForSide(LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST)
+                    val rComp = compForSide(RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST)
+                    when {
+                        isArcher && bothArmsVis -> maxOf(lComp, rComp)
+                        bothArmsVis -> 0.40f * ((lComp + rComp) * 0.5f) + 0.60f * maxOf(lComp, rComp)
+                        lArmW >= rArmW -> lComp
+                        else -> rComp
+                    }
                 } else {
                     0f
                 }
 
-                val pushupDepth = maxOf(elbowProgress, chestDropProgress * 0.96f)
+                // Signal C: Anti-lockup sliding-window screen-space Chest+Head vertical drop relative to planted wrists
+                val noseS = screenPts[NOSE]
+                val chestHeadY = if (noseS.visibility >= 0.35f) {
+                    0.65f * activeShSY + 0.35f * noseS.y
+                } else {
+                    activeShSY
+                }
+                val refScale2D = maxOf(shWidth2DGlobal, dist2D(midShSAll, midHpSAll), 0.14f)
+                val currentScreenHeight = ((activeWrSY - chestHeadY) / refScale2D).coerceIn(-0.35f, 2.20f)
+                val inPushupAttitude = isProneBody || isPike
+
+                if (inPushupAttitude) {
+                    pushupHeightWindow.addLast(
+                        PushupHeightSample(
+                            timestampMs = timestampMs,
+                            normHeight = currentScreenHeight,
+                            wristY = activeWrSY,
+                            elbowDeg = activeElbow
+                        )
+                    )
+                    while (pushupHeightWindow.size > 120 ||
+                        (pushupHeightWindow.size > 2 && (timestampMs - pushupHeightWindow.first().timestampMs) > PUSHUP_WINDOW_MS)
+                    ) {
+                        pushupHeightWindow.removeFirst()
+                    }
+
+                    // Track sustained straight-arm top frames to self-heal if user just stepped down from standing!
+                    if (activeElbow >= 148f && bestArmVis >= 0.45f) {
+                        pushupStraightArmStreak++
+                    } else {
+                        pushupStraightArmStreak = 0
+                    }
+
+                    if (pushupStraightArmStreak >= 4) {
+                        // Purge any stale higher samples from before settling into push-up plank
+                        val maxAllowed = currentScreenHeight + 0.18f
+                        while (pushupHeightWindow.size > 4 && pushupHeightWindow.first().normHeight > maxAllowed) {
+                            pushupHeightWindow.removeFirst()
+                        }
+                    }
+
+                    var maxStraightH = Float.NEGATIVE_INFINITY
+                    var maxAnyH = Float.NEGATIVE_INFINITY
+                    for (s in pushupHeightWindow) {
+                        if (s.normHeight > maxAnyH) maxAnyH = s.normHeight
+                        if (s.elbowDeg >= 134f && s.normHeight > maxStraightH) maxStraightH = s.normHeight
+                    }
+                    val windowTop = if (maxStraightH.isFinite() && maxStraightH > 0.10f) maxStraightH else maxAnyH
+
+                    if (windowTop.isFinite() && windowTop > 0.08f) {
+                        adaptivePushupTopHeight = if (adaptivePushupTopHeight <= 0.01f) {
+                            windowTop
+                        } else if (pushupStraightArmStreak >= 3 && currentScreenHeight < adaptivePushupTopHeight) {
+                            // Fast convergence (~0.3s) whenever arms are visibly straight at top: ZERO permanent lockup!
+                            adaptivePushupTopHeight * 0.72f + currentScreenHeight * 0.28f
+                        } else {
+                            // Track sliding window peak cleanly
+                            maxOf(currentScreenHeight, adaptivePushupTopHeight * 0.96f + windowTop * 0.04f)
+                                .coerceAtMost(windowTop)
+                        }
+                    }
+                }
+
+                // Verify wrists stayed planted on floor (prevents waving hands from faking chest drop)
+                var minWrY = activeWrSY
+                var maxWrY = activeWrSY
+                for (s in pushupHeightWindow) {
+                    if ((timestampMs - s.timestampMs) <= 1500L) {
+                        if (s.wristY < minWrY) minWrY = s.wristY
+                        if (s.wristY > maxWrY) maxWrY = s.wristY
+                    }
+                }
+                val handsPlanted = (maxWrY - minWrY) <= 0.14f
+
+                var chestDropProgress = if (inPushupAttitude && handsPlanted && adaptivePushupTopHeight > 0.14f) {
+                    val dropDenom = maxOf(adaptivePushupTopHeight * 0.34f, 0.16f)
+                    ((adaptivePushupTopHeight - currentScreenHeight) / dropDenom).coerceIn(0f, 1.20f)
+                } else {
+                    0f
+                }
+
+                // Straight-arm lockout guard: if arms are clearly straight and uncompressed, NEVER allow
+                // a stale height baseline to keep pushupDepth stuck in BOTTOM!
+                if (activeElbow >= 156f && bestArmVis >= 0.55f && armCompProgress < 0.15f) {
+                    chestDropProgress = minOf(chestDropProgress, 0.16f)
+                }
+
+                val pushupDepth = if (isStrict) {
+                    maxOf(elbowProgress, if (bestArmVis >= 0.50f) armCompProgress * 0.85f else chestDropProgress * 0.88f)
+                } else {
+                    maxOf(elbowProgress, armCompProgress * 0.94f, chestDropProgress * 0.96f)
+                }
                 romPct = (pushupDepth * 100f).roundToInt().coerceIn(0, 100)
 
                 val peakThresh = if (isStrict) 0.80f else 0.62f
+                val finishThresh = if (isStrict) 0.26f else 0.34f
                 val cycle = updateProgressCycle(
                     progress = pushupDepth,
                     startThreshold = 0.22f,
                     peakThreshold = peakThresh,
-                    finishThreshold = 0.26f,
+                    finishThreshold = finishThresh,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1134,7 +1315,7 @@ class BiomechanicsEngine(
                 completedRepDurSec = cycle.durationSec
 
                 val activeElIdx = if (isArcher && bothArmsVis) {
-                    if (leftElbow <= rightElbow) LEFT_ELBOW else RIGHT_ELBOW
+                    if (effLeftElbow <= effRightElbow) LEFT_ELBOW else RIGHT_ELBOW
                 } else {
                     elIdx
                 }
@@ -1167,7 +1348,7 @@ class BiomechanicsEngine(
 
                 if (!isArcher) {
                     addSymmetryCorrectionIfNeeded(
-                        leftElbow, rightElbow, lArmW, rArmW,
+                        effLeftElbow, effRightElbow, lArmW, rArmW,
                         active = activeElbow < 138f,
                         jointLabel = "coudes",
                         leftJointIdx = LEFT_ELBOW,
@@ -1186,17 +1367,19 @@ class BiomechanicsEngine(
                         targetDegHint = elbowHint
                     )
                 )
-                badges.add(
-                    JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y,
-                        if (isPike) hipAngle.roundToInt() else effectiveAlign.roundToInt(),
-                        if (isPike || effectiveAlign in 156f..204f) FormQuality.GOOD else FormQuality.FAULT,
-                        parentIndex = shIdx,
-                        childIndex = alignEndIdx,
-                        targetRangeText = if (isPike) "V inversé" else "160–200°",
-                        targetDegHint = hipHint
+                if (canJudgeBodyAlign || isPike) {
+                    badges.add(
+                        JointAngleBadge(
+                            hpIdx, hpS.x, hpS.y,
+                            if (isPike) hipAngle.roundToInt() else effectiveAlign.roundToInt(),
+                            if (isPike || effectiveAlign in 155f..205f) FormQuality.GOOD else FormQuality.FAULT,
+                            parentIndex = shIdx,
+                            childIndex = alignEndIdx,
+                            targetRangeText = if (isPike) "V inversé" else "160–200°",
+                            targetDegHint = hipHint
+                        )
                     )
-                )
+                }
                 feedback = faultMsg ?: when (phase) {
                     MovementPhase.BOTTOM -> if (isPike) {
                         "Pompe piquée validée — repoussez fort !"
@@ -1209,7 +1392,11 @@ class BiomechanicsEngine(
                         PushupVariant.KNEE -> "Pompes genoux (${effectiveAlign.roundToInt()}°) — buste gainé."
                         PushupVariant.WIDE -> "Prise large — poitrine vers le sol, amplitude fluide."
                         PushupVariant.DIAMOND -> "Prise diamant — coudes près des côtes, triceps engagés."
-                        PushupVariant.STANDARD -> "Corps aligné (${effectiveAlign.roundToInt()}°), coudes contrôlés."
+                        PushupVariant.STANDARD -> if (canJudgeBodyAlign) {
+                            "Corps aligné (${effectiveAlign.roundToInt()}°), coudes contrôlés."
+                        } else {
+                            "Pompes détectées — contrôlez la descente et poussez fort."
+                        }
                     }
                 }
             }
@@ -1661,14 +1848,17 @@ class BiomechanicsEngine(
                 if (torsoTilt <= 48f && currentDipHeight > 0.08f) {
                     if (adaptiveDipTopHeight <= 0.01f || currentDipHeight > adaptiveDipTopHeight) {
                         adaptiveDipTopHeight = currentDipHeight
-                    } else if (phase == MovementPhase.READY) {
-                        adaptiveDipTopHeight = adaptiveDipTopHeight * 0.996f + currentDipHeight * 0.004f
+                    } else if (elbowAngle >= 146f || phase == MovementPhase.READY) {
+                        adaptiveDipTopHeight = adaptiveDipTopHeight * 0.78f + currentDipHeight * 0.22f
                     }
                 }
-                val dipDropProgress = if (adaptiveDipTopHeight > 0.16f && torsoTilt <= 48f) {
+                var dipDropProgress = if (adaptiveDipTopHeight > 0.16f && torsoTilt <= 48f) {
                     ((adaptiveDipTopHeight - currentDipHeight) / (adaptiveDipTopHeight * 0.32f)).coerceIn(0f, 1.2f)
                 } else {
                     0f
+                }
+                if (elbowAngle >= 156f && maxOf(lArmW, rArmW) >= 0.55f) {
+                    dipDropProgress = minOf(dipDropProgress, 0.16f)
                 }
 
                 val dipDepth = if (isStrict) dipElbowProgress else maxOf(dipElbowProgress, dipDropProgress * 0.94f)
@@ -1810,13 +2000,13 @@ class BiomechanicsEngine(
                 }
 
                 val isHorizontal = if (use3D) {
-                    fullBodyTilt >= (if (isStrict) 55f else 48f) || isSidePlank
+                    fullBodyTilt >= (if (isStrict) 55f else 42f) || isSidePlank || (!isStrict && frontFloorHorizontal)
                 } else {
                     val classicHoriz = abs(shS.y - anS.y) < abs(shS.x - anS.x) * 0.78f
                     val bodyLen2D = dist2D(shS, anS).coerceAtLeast(0.05f)
                     val frontViewPlank = !isStrict &&
-                        abs(shS.y - anS.y) < maxOf(bodyLen2D * 0.35f, 0.28f) &&
-                        abs(shS.y - hpS.y) < 0.16f
+                        (frontFloorHorizontal ||
+                            (abs(shS.y - anS.y) < maxOf(bodyLen2D * 0.35f, 0.28f) && abs(shS.y - hpS.y) < 0.16f))
                     classicHoriz || frontViewPlank || isSidePlank
                 }
 
@@ -1920,9 +2110,9 @@ class BiomechanicsEngine(
 
             ExerciseType.BURPEE -> {
                 val bodyHorizontal = if (use3D) {
-                    torsoTilt >= (if (isStrict) 55f else 48f)
+                    torsoTilt >= (if (isStrict) 55f else 44f) || (!isStrict && frontFloorHorizontal)
                 } else {
-                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.60f
+                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.60f || (!isStrict && frontFloorHorizontal)
                 }
                 val standAngleThresh = if (isStrict) 155f else 145f
                 val standingTall = hipAngle > standAngleThresh && kneeAngle > standAngleThresh && shS.y < hpS.y
@@ -2490,6 +2680,20 @@ class BiomechanicsEngine(
             }
         }
 
+        // Update Velocity-Based Training (VBT) telemetry (concentric m/s, 3-phase tempo, velocity loss %, RIR)
+        val vbtMetrics = vbtEngine.onFrame(
+            exercise = currentExercise,
+            phase = phase,
+            repCompletedNow = repCompletedNow,
+            screenPts = screenPts,
+            worldPts = worldPts,
+            use3D = use3D,
+            timestampMs = timestampMs
+        )
+        if (repCompletedNow && vbtMetrics.alertVoiceCueFr != null) {
+            voiceCue = "$repCount. ${vbtMetrics.alertVoiceCueFr}"
+        }
+
         // Order corrections: FAULT first, then largest angle delta
         val orderedCorrections = corrections.sortedWith(
             compareBy<AngleCorrection> {
@@ -2534,7 +2738,8 @@ class BiomechanicsEngine(
             completedRepRomPct = completedRepRom,
             completedRepDurationSec = completedRepDurSec,
             isometricDeltaSec = isometricDeltaSec,
-            detectedVariantFr = detectedVariantFr
+            detectedVariantFr = detectedVariantFr,
+            vbt = vbtMetrics
         )
     }
 
@@ -2544,11 +2749,7 @@ class BiomechanicsEngine(
         val durationSec: Float
     )
 
-    private fun minRepDurationMs(): Long = when {
-        emaAlpha >= 0.999f && !useOneEuroFilter -> 180L
-        currentExercise == ExerciseType.JUMPING_JACK -> 240L
-        else -> 360L
-    }
+    private fun minRepDurationMs(): Long = 180L
 
     private fun completeRepOrAbort(timestampMs: Long, checkBottomDwell: Boolean): CycleResult {
         val dwellOk = !checkBottomDwell ||

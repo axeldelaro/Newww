@@ -203,9 +203,19 @@ class AutoExerciseDetector(
             pendingCandidate = currentLocked
             pendingStreak = 0
         } else {
-            // Candidate differs from currently locked exercise: apply asymmetric sticky hysteresis
-            val reqConf = if (hasActiveSetReps) ACTIVE_SET_MIN_CONFIDENCE else confirmThreshold
-            val reqMargin = if (hasActiveSetReps) ACTIVE_SET_MIN_MARGIN else 0.06f
+            // Candidate differs from currently locked exercise: apply asymmetric sticky hysteresis.
+            // Special fast-path: starting dynamic push-ups out of a static plank unlocks immediately!
+            val isPlankToPushup = currentLocked == ExerciseType.PLANK && topEx == ExerciseType.PUSHUP
+            val reqConf = when {
+                isPlankToPushup -> 0.62f
+                hasActiveSetReps -> ACTIVE_SET_MIN_CONFIDENCE
+                else -> confirmThreshold
+            }
+            val reqMargin = when {
+                isPlankToPushup -> 0.05f
+                hasActiveSetReps -> ACTIVE_SET_MIN_MARGIN
+                else -> 0.06f
+            }
 
             if (topConf >= reqConf && margin >= reqMargin) {
                 if (pendingCandidate == topEx) {
@@ -216,14 +226,17 @@ class AutoExerciseDetector(
                 }
 
                 val sameFamily = postureFamily(currentLocked) == postureFamily(topEx)
-                val requiredStreak = if (hasActiveSetReps) {
-                    if (sameFamily) ACTIVE_SET_SAME_FAMILY_STREAK else ACTIVE_SET_CROSS_POSTURE_STREAK
-                } else {
-                    val isCrossPostureSwitch = !sameFamily && topConf >= 0.72f
-                    if (isCrossPostureSwitch) fastPostureSwitchFrames else confirmConsecutiveFrames
+                val requiredStreak = when {
+                    isPlankToPushup -> 5
+                    hasActiveSetReps -> if (sameFamily) ACTIVE_SET_SAME_FAMILY_STREAK else ACTIVE_SET_CROSS_POSTURE_STREAK
+                    else -> {
+                        val isCrossPostureSwitch = !sameFamily && topConf >= 0.72f
+                        if (isCrossPostureSwitch) fastPostureSwitchFrames else confirmConsecutiveFrames
+                    }
                 }
 
-                val cooldownOk = !hasActiveSetReps ||
+                val cooldownOk = isPlankToPushup ||
+                    !hasActiveSetReps ||
                     lastSwitchTsMs == Long.MIN_VALUE ||
                     (timestampMs - lastSwitchTsMs) >= ACTIVE_SET_SWITCH_COOLDOWN_MS
 
@@ -232,7 +245,8 @@ class AutoExerciseDetector(
                 } else {
                     0L
                 }
-                val pushupToPlankOk = !(hasActiveSetReps && currentLocked == ExerciseType.PUSHUP && topEx == ExerciseType.PLANK) ||
+                // Always protect PUSHUP -> PLANK with 3.2s continuous static hold (even before rep 1!)
+                val pushupToPlankOk = !(currentLocked == ExerciseType.PUSHUP && topEx == ExerciseType.PLANK) ||
                     continuousPlankHoldMs >= PUSHUP_TO_PLANK_MIN_HOLD_MS
 
                 if (pendingStreak >= requiredStreak && cooldownOk && pushupToPlankOk) {
@@ -368,7 +382,16 @@ class AutoExerciseDetector(
         val ankleToShoulderRatio = dist(lAnkle, rAnkle) / shWidth
 
         val screenMidShY = (screenPts[BiomechanicsEngine.LEFT_SHOULDER].y + screenPts[BiomechanicsEngine.RIGHT_SHOULDER].y) * 0.5f
+        val screenMidHipY = (screenPts[BiomechanicsEngine.LEFT_HIP].y + screenPts[BiomechanicsEngine.RIGHT_HIP].y) * 0.5f
         val screenMidWristY = (screenPts[BiomechanicsEngine.LEFT_WRIST].y + screenPts[BiomechanicsEngine.RIGHT_WRIST].y) * 0.5f
+        val screenShWidth = BiomechanicsEngine.dist2D(
+            screenPts[BiomechanicsEngine.LEFT_SHOULDER],
+            screenPts[BiomechanicsEngine.RIGHT_SHOULDER]
+        ).coerceAtLeast(0.06f)
+        val frontFloorProne = (abs(screenMidHipY - screenMidShY) / screenShWidth) < 0.85f &&
+            screenMidWristY >= screenMidShY - 0.10f &&
+            screenMidShY >= 0.25f &&
+            hipAboveAnklesTl <= 0.90f
 
         val posture = classifyPosture(
             bodyTiltDeg = bodyTiltDeg,
@@ -379,7 +402,8 @@ class AutoExerciseDetector(
             ankleAboveHipTl = ankleAboveHipTl,
             hipAboveAnklesTl = hipAboveAnklesTl,
             shAboveAnklesTl = shAboveAnklesTl,
-            kneeDeg = kneeDeg
+            kneeDeg = kneeDeg,
+            frontFloorProne = frontFloorProne
         )
 
         return FrameSample(
@@ -417,7 +441,8 @@ class AutoExerciseDetector(
         ankleAboveHipTl: Float,
         hipAboveAnklesTl: Float,
         shAboveAnklesTl: Float,
-        kneeDeg: Float
+        kneeDeg: Float,
+        frontFloorProne: Boolean = false
     ): BodyPosture {
         // Supine floor: shoulders down on floor, knees raised above shoulders (glute bridge) OR torso flat & legs rising (leg raise)
         val looksSupineBridge = torsoTiltDeg >= 45f && kneeAboveShTl >= 0.10f && kneeDeg <= 135f && abs(shAboveAnklesTl) < 0.70f
@@ -426,9 +451,9 @@ class AutoExerciseDetector(
             return BodyPosture.SUPINE_FLOOR
         }
 
-        // Prone floor: horizontal or inclined/pike/knee push-up posture with hands supporting below shoulders toward floor level
-        val looksProne = (bodyTiltDeg >= 48f || torsoTiltDeg >= 52f) &&
-            wristAboveShTl <= -0.10f &&
+        // Prone floor: horizontal, knee, pike, or tilted front-floor push-up posture (including chest-to-floor bottom where wristAboveShTl ≈ 0!)
+        val looksProne = (bodyTiltDeg >= 36f || torsoTiltDeg >= 40f || frontFloorProne) &&
+            wristAboveShTl <= 0.14f &&
             hipAboveAnklesTl <= 1.05f &&
             shAboveAnklesTl <= 1.35f
         if (looksProne) {
@@ -581,31 +606,39 @@ class AutoExerciseDetector(
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
-        // 5. PUSHUP: Prone/pike/knee + dynamic elbow flexion OR vertical shoulder-to-wrist drop (wide/diamond/archer!)
+        // 5. PUSHUP: Prone/pike/knee/front-floor + dynamic elbow flexion OR vertical shoulder-to-wrist drop (wide/diamond/archer/front!)
+        val screenChestDropSignal = rampUp(scrShS.range, 0.06f, 0.15f) * rampUp(scrShMotionRatio, 0.52f, 0.72f)
         val pushupDynamicMotion = maxOf(
-            rampUp(maxOf(elbowS.range, minElbowS.range), 18f, 44f),
-            rampUp(shWrS.range, 0.14f, 0.34f)
+            rampUp(maxOf(elbowS.range, minElbowS.range), 16f, 40f),
+            rampUp(shWrS.range, 0.14f, 0.34f),
+            screenChestDropSignal
         )
         val pushupDepthFactor = maxOf(
             rampDown(minElbowS.min, 122f, 146f),
-            rampUp(shWrS.range, 0.16f, 0.36f)
+            rampUp(shWrS.range, 0.16f, 0.36f),
+            screenChestDropSignal
+        )
+        val proneAttitudeScore = maxOf(
+            rampUp(maxOf(bodyTiltS.mean, torsoS.mean), 34f, 56f),
+            rampUp(proneRatio, 0.75f, 0.92f)
         )
         scores[ExerciseType.PUSHUP] = product(
-            rampUp(proneRatio, 0.55f, 0.85f),
-            rampUp(maxOf(bodyTiltS.mean, torsoS.mean), 46f, 66f),
+            rampUp(proneRatio, 0.50f, 0.82f),
+            proneAttitudeScore,
             pushupDynamicMotion,
             pushupDepthFactor,
-            rampDown(wrShS.mean, -0.08f, 0.15f),
-            rampDown(standingRatio, 0.12f, 0.30f)
+            rampDown(wrShS.mean, 0.06f, 0.24f),
+            rampDown(standingRatio, 0.15f, 0.35f)
         )
 
-        // 6. PLANK: Prone horizontal + strict isometric stability (low elbow AND shoulder-to-wrist excursion)
+        // 6. PLANK: Prone horizontal + strict isometric stability (low elbow, shoulder-to-wrist, AND screen chest bobbing)
         scores[ExerciseType.PLANK] = product(
             rampUp(proneRatio, 0.65f, 0.90f),
-            rampUp(bodyTiltS.mean, 52f, 70f),
+            rampUp(bodyTiltS.mean, 44f, 66f),
             band(alignS.mean, 130f, 155f, 200f, 225f),
             rampDown(maxOf(elbowS.range, minElbowS.range), 12f, 24f),
             rampDown(shWrS.range, 0.08f, 0.20f),
+            rampDown(scrShS.range, 0.05f, 0.11f),
             rampDown(hipS.range, 12f, 24f),
             rampDown(kneeS.range, 12f, 24f),
             rampDown(bodyTiltS.range, 10f, 22f),

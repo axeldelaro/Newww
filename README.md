@@ -4,14 +4,15 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 1. KINETIX Coach (`kinetix-coach/` — v2.0.0)
-**Vision Biomécanique 3D Anti-Glitch 60 FPS + 7 Défis & Musique + 42 Vidéos + Coach IA Local**
+## 1. KINETIX Coach (`kinetix-coach/` — v2.1.0)
+**Vision Biomécanique 3D + VBT (m/s, Tempo, RIR) + 7 Défis & Musique + 42 Vidéos + Coach IA Local**
 
 - **Package** : `com.kinetix.coach` (Android 10+ / `arm64-v8a`, 100 % hors-ligne, zéro requête réseau)
-- **Détection Pro Anti-Glitch & Haute Fluidité** (`PoseSanityFilter`, `CameraViewpointTracker`, `AutoExerciseDetector`, `BiomechanicsEngine`) :
-  - Rejet physique des téléportations MediaPipe, maintien sur micro-occlusions (`< 180 ms`), garde de déplacement (*« Stabilisation… »*), hystérésis `±6°` sur l’angle caméra, garde physique de posture, durée minimale de répétition, verrouillage asymétrique anti-faux-switch (*Pompes ↔ Planche*, faux *Burpees* éliminés) + **cadenas 1-tap**.
-  - `ImageAnalysis` `640×480`, `PreviewView` matériel `PERFORMANCE`, tampon Bitmap **zéro GC**, backpressure `isInferring`, miroir caméra frontale anatomiquement exact, `pipelineLock` thread-safe, overlay squelette isolé haute fréquence, `FLAG_KEEP_SCREEN_ON` en Vision.
-- **Pompes multi-signaux (6 variantes) & Audit Complet des 16 Exercices** (`Adaptatif` / `Strict`) : Classiques, Larges, Diamant, Genoux, Piquées et Archer + 15 autres exercices calibrés terrain.
+- **VBT — Velocity-Based Training (`VbtEngine`)** : vitesse concentrique temps réel (`m/s`), tempo exact 3 phases (`Ecc-Pause-Conc`), perte de vitesse intra-série (`VL %`), estimation automatique **RIR (`4+` → `0`)**, alertes zones Hypertrophie (`≥ 20 %`) & Proche Échec (`≥ 35 %`), bandeau HUD dédié, bilan et débriefing Coach IA enrichi VBT.
+- **Scan Corporel & Détection Pompes Haute Fiabilité** (`PoseLandmarkerHelper`, `PoseSanityFilter`, `CameraViewpointTracker`, `AutoExerciseDetector`, `BiomechanicsEngine`) :
+  - FOV `4:3` verrouillé identiquement sur `Preview` + `ImageAnalysis` (alignement squelette pixel-perfect), double-buffering Bitmap + décodage `rowStride` matériel zéro GC, seuils MediaPipe optimisés sol/couché + watchdog anti-blocage.
+  - Moteur Pompes 3 signaux anti-verrouillage (coudes 3D/2D croisés + compression brachiale 3D invariante à l'inclinaison du téléphone + chute poitrine/tête fenêtre glissante `4,2 s`), compatible téléphone posé/incliné au sol face/3/4/profil, pompes explosives (`≥ 180 ms`) et tension continue, transition instantanée **Planche → Pompes** + **cadenas 1-tap**.
+- **Pompes 6 variantes & 16 Exercices** (`Adaptatif` / `Strict`) : Classiques, Larges, Diamant, Genoux, Piquées et Archer + 15 autres exercices calibrés terrain.
 - **7 Défis Caméra & Moteur Audio/Musique Hors-Ligne** : *Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM* + Records SQLite v3 + 4 musiques PCM 44,1 kHz + **import MP3/M4A/WAV/OGG local**.
 - **Calories personnalisées**, corrections visuelles/vocales au degré près (ligne fantôme, flèches, rapporteurs), **42 Vidéos MP4 H.264** (911/911 exos), **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5**.
 

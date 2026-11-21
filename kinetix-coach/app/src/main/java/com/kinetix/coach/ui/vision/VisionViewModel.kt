@@ -23,6 +23,7 @@ import com.kinetix.coach.vision.DetectionStrictness
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseOverlayState
 import com.kinetix.coach.vision.PosePoint
+import com.kinetix.coach.vision.VbtMetrics
 import com.kinetix.coach.vision.ViewpointInfo
 import com.kinetix.coach.vision.VoiceCoach
 import com.kinetix.coach.vision.WorkoutAudioEngine
@@ -73,6 +74,7 @@ data class VisionUiState(
     val restFinishedEvent: Int = 0,
     val completedSummary: WorkoutSession? = null,
     val completedBreakdown: List<ExerciseBreakdownItem> = emptyList(),
+    val completedVbt: VbtMetrics = VbtMetrics(),
     // Challenges & Music state
     val activeChallenge: ChallengeSnapshot? = null,
     val completedChallengeResult: ChallengeResult? = null,
@@ -143,6 +145,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private var setSamplesWeight = 0L
     private val sessionFaults = linkedSetOf<String>()
     private val exerciseBreakdownMap = linkedMapOf<ExerciseType, ExerciseBreakdownItem>()
+    private var lastRecordedVbt: VbtMetrics = VbtMetrics()
 
     fun setDetectionStrictness(mode: DetectionStrictness) {
         synchronized(pipelineLock) {
@@ -753,8 +756,12 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
 
             val inChallenge = challengeController.isActive
 
-            // 1. Run 3D multi-angle biomechanics analysis + physics sanity gate first
+            // 1. Run 3D multi-angle biomechanics analysis + physics sanity gate + VBT
+            engine.setAthleteHeightCm(profile.heightCm)
             val rawFrame = engine.processFrame(screenPoints, worldPoints, timestampMs)
+            if (rawFrame.vbt.hasData) {
+                lastRecordedVbt = rawFrame.vbt.copy(alertVoiceCueFr = null)
+            }
             var effectiveFrame = rawFrame
             activeExercise = engine.currentExercise
 
@@ -817,7 +824,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                         completedRepRomPct = 0,
                         completedRepDurationSec = 0f,
                         isometricDeltaSec = 0f,
-                        detectedVariantFr = null
+                        detectedVariantFr = null,
+                        vbt = VbtMetrics()
                     )
                 }
             }
@@ -863,6 +871,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 effectiveFrame.formQuality != prevFrame.formQuality ||
                 effectiveFrame.feedbackFr != prevFrame.feedbackFr ||
                 effectiveFrame.detectedVariantFr != prevFrame.detectedVariantFr ||
+                effectiveFrame.vbt != prevFrame.vbt ||
                 effectiveFrame.viewpointInfo.viewpoint != state.viewpointInfo.viewpoint ||
                 effectiveFrame.viewpointInfo.is3DActive != state.viewpointInfo.is3DActive ||
                 effectiveFrame.viewpointInfo.framingWarningFr != state.viewpointInfo.framingWarningFr ||
@@ -951,6 +960,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 restRemainingSec = 0,
                 completedSummary = null,
                 completedBreakdown = emptyList(),
+                completedVbt = VbtMetrics(),
                 activeChallenge = null,
                 completedChallengeResult = null
             )
@@ -967,12 +977,14 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
 
         val session: WorkoutSession
         val completedBreakdownList: List<ExerciseBreakdownItem>
+        val finalVbt: VbtMetrics
 
         synchronized(pipelineLock) {
             val state = _uiState.value
             val frame = state.frame
             val activeEx = engine.currentExercise
             val liveSetKcal = activeSetCaloriesKcal
+            finalVbt = if (frame.vbt.hasData) frame.vbt.copy(alertVoiceCueFr = null) else lastRecordedVbt
 
             val breakdownSnapshot = LinkedHashMap(exerciseBreakdownMap)
             val curReps = if (activeEx.isIsometric) 0 else frame.repCount
@@ -1034,6 +1046,18 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 } else if (totalSetsDone > 1) {
                     append("$totalSetsDone séries")
                 }
+                if (finalVbt.hasData && !primaryExercise.isIsometric) {
+                    if (isNotEmpty()) append(" · ")
+                    append(
+                        String.format(
+                            Locale.US,
+                            "VBT %.2f m/s · VL -%d%% · RIR %s",
+                            finalVbt.meanSetVelocityMs,
+                            finalVbt.velocityLossPct,
+                            finalVbt.rirLabel
+                        )
+                    )
+                }
             }
 
             session = WorkoutSession(
@@ -1062,7 +1086,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 isResting = false,
                 restRemainingSec = 0,
                 completedSummary = session,
-                completedBreakdown = completedBreakdownList
+                completedBreakdown = completedBreakdownList,
+                completedVbt = finalVbt
             )
         }
     }
@@ -1090,6 +1115,21 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         } else {
             "Caméra ${vp.viewpoint.shortLabelFr}"
         }
+        val vbt = _uiState.value.completedVbt
+        val vbtSuffix = if (vbt.hasData && !session.exerciseType.isIsometric) {
+            String.format(
+                Locale.US,
+                " Données VBT : vitesse concentrique moyenne %.2f m/s (pic %.2f m/s), perte de vitesse %d%%, RIR estimé %s (%s), tempo %s.",
+                vbt.meanSetVelocityMs,
+                vbt.bestSetVelocityMs,
+                vbt.velocityLossPct,
+                vbt.rirLabel,
+                vbt.zoneLabelFr,
+                vbt.tempoLabel
+            )
+        } else {
+            ""
+        }
         val activeCorrections = _uiState.value.frame.corrections
             .take(2)
             .joinToString("; ") { "${it.shortBadgeFr} : ${it.instructionFr}" }
@@ -1098,9 +1138,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         return "Analyse ma séance Vision KINETIX 3D de ${session.exerciseType.labelFr} : " +
             "$metricStr, dépense estimée $kcalStr (calibrée sur mon profil), " +
             "score postural moyen ${session.avgFormScore}/100, " +
-            "amplitude moyenne (ROM) ${session.avgRomPct}%, $angleStr. " +
+            "amplitude moyenne (ROM) ${session.avgRomPct}%, $angleStr.$vbtSuffix " +
             "Défauts relevés : $faultsText.$corrSuffix " +
-            "Donne-moi un débriefing biomécanique précis en 3 axes : points forts, corrections angulaires concrètes et recommandation pour la prochaine série."
+            "Donne-moi un débriefing biomécanique précis en 3 axes : points forts, corrections angulaires concrètes et recommandation VBT/intensité pour la prochaine série."
     }
 
     private fun bankActiveExerciseWorkLocked(
@@ -1134,6 +1174,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         setSamplesWeight = 0L
         sessionFaults.clear()
         exerciseBreakdownMap.clear()
+        lastRecordedVbt = VbtMetrics()
     }
 
     override fun onCleared() {

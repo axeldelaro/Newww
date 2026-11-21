@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -108,6 +109,7 @@ import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseLandmarkerHelper
 import com.kinetix.coach.vision.SkeletonOverlay
+import com.kinetix.coach.vision.VbtMetrics
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
@@ -650,6 +652,12 @@ fun VisionScreen(
                         }
                     }
 
+                    // Live VBT Telemetry Strip (appears cleanly after Rep 1 on dynamic exercises)
+                    if (!uiState.selectedExercise.isIsometric && uiState.frame.vbt.hasData) {
+                        Spacer(Modifier.height(8.dp))
+                        VbtTelemetryStrip(vbt = uiState.frame.vbt)
+                    }
+
                     Spacer(Modifier.height(10.dp))
 
                     Row(
@@ -978,6 +986,7 @@ fun VisionScreen(
         SessionSummarySheet(
             session = summary,
             breakdown = uiState.completedBreakdown,
+            vbt = uiState.completedVbt,
             onDismiss = { viewModel.dismissSummaryAndRestart() },
             onAnalyzeWithCoach = {
                 val prompt = viewModel.buildCoachDebriefPrompt(summary)
@@ -998,6 +1007,79 @@ private fun LiveSkeletonOverlayLayer(
         overlayState = overlayState,
         modifier = modifier
     )
+}
+
+@Composable
+private fun VbtTelemetryStrip(vbt: VbtMetrics) {
+    val zoneColor = when {
+        vbt.velocityLossPct >= 40 -> FormFault
+        vbt.velocityLossPct >= 30 -> SignalOrange
+        vbt.velocityLossPct >= 20 -> FormCaution
+        else -> FormGood
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = ElevatedSurface,
+        border = BorderStroke(1.dp, zoneColor.copy(alpha = 0.45f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 9.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Concentric Velocity (m/s)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "VBT",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SteelGray,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.width(5.dp))
+                Text(
+                    text = String.format(Locale.US, "%.2f m/s", vbt.lastConcentricVelocityMs),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = CrispWhite,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            // Velocity Loss %
+            Text(
+                text = if (vbt.velocityLossPct > 0) "VL -${vbt.velocityLossPct}%" else "PIC",
+                style = MaterialTheme.typography.labelSmall,
+                color = zoneColor,
+                fontWeight = FontWeight.Bold
+            )
+
+            // Estimated RIR Pill
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = zoneColor.copy(alpha = 0.18f),
+                border = BorderStroke(1.dp, zoneColor.copy(alpha = 0.7f))
+            ) {
+                Text(
+                    text = "RIR ${vbt.rirLabel}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = zoneColor,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                )
+            }
+
+            // 3-Phase Tempo (Ecc-Pause-Conc)
+            Text(
+                text = vbt.tempoLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = SteelGray,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+        }
+    }
 }
 
 @Composable
@@ -1314,11 +1396,19 @@ private fun CameraPoseViewport(
         providerFuture.addListener({
             val cameraProvider = providerFuture.get()
             boundProvider = cameraProvider
-            val preview = Preview.Builder().build().also {
-                it.surfaceProvider = previewView.surfaceProvider
-            }
+            val previewResolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .build()
 
-            val resolutionSelector = ResolutionSelector.Builder()
+            val preview = Preview.Builder()
+                .setResolutionSelector(previewResolutionSelector)
+                .build()
+                .also {
+                    it.surfaceProvider = previewView.surfaceProvider
+                }
+
+            val analysisResolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
                     ResolutionStrategy(
                         Size(640, 480),
@@ -1328,7 +1418,7 @@ private fun CameraPoseViewport(
                 .build()
 
             val analyzer = ImageAnalysis.Builder()
-                .setResolutionSelector(resolutionSelector)
+                .setResolutionSelector(analysisResolutionSelector)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
@@ -1364,6 +1454,7 @@ private fun CameraPoseViewport(
 private fun SessionSummarySheet(
     session: WorkoutSession,
     breakdown: List<ExerciseBreakdownItem>,
+    vbt: VbtMetrics,
     onDismiss: () -> Unit,
     onAnalyzeWithCoach: () -> Unit
 ) {
@@ -1421,6 +1512,54 @@ private fun SessionSummarySheet(
                         unit = "%",
                         modifier = Modifier.weight(1f)
                     )
+                }
+            }
+
+            if (vbt.hasData && !session.exerciseType.isIsometric) {
+                Spacer(Modifier.height(10.dp))
+                IndustrialCard(containerColor = ObsidianBg) {
+                    SectionLabel(
+                        text = "VBT · VITESSE & FATIGUE",
+                        trailing = "${vbt.zoneLabelFr} · ${vbt.tempoLabel}"
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    val vlColor = when {
+                        vbt.velocityLossPct >= 40 -> FormFault
+                        vbt.velocityLossPct >= 30 -> SignalOrange
+                        vbt.velocityLossPct >= 20 -> FormCaution
+                        else -> FormGood
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        MetricCell(
+                            label = "Vitesse moy.",
+                            value = String.format(Locale.US, "%.2f", vbt.meanSetVelocityMs),
+                            unit = "m/s",
+                            modifier = Modifier.weight(1f)
+                        )
+                        MetricCell(
+                            label = "Pic",
+                            value = String.format(Locale.US, "%.2f", vbt.bestSetVelocityMs),
+                            unit = "m/s",
+                            modifier = Modifier.weight(1f)
+                        )
+                        MetricCell(
+                            label = "Perte VL",
+                            value = "-${vbt.velocityLossPct}",
+                            unit = "%",
+                            valueColor = vlColor,
+                            modifier = Modifier.weight(1f)
+                        )
+                        MetricCell(
+                            label = "RIR estimé",
+                            value = vbt.rirLabel,
+                            unit = "",
+                            valueColor = vlColor,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
 
