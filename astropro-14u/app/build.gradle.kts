@@ -32,10 +32,11 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("/home/antigravity/model-cache/release.keystore")
-            storePassword = "astrocoach2026"
-            keyAlias = "release"
-            keyPassword = "astrocoach2026"
+            val ksPath = System.getenv("RELEASE_KEYSTORE_PATH") ?: "/home/antigravity/model-cache/release.keystore"
+            storeFile = file(ksPath)
+            storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "astrocoach2026"
+            keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "release"
+            keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "astrocoach2026"
         }
     }
 

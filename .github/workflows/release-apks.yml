@@ -1,0 +1,167 @@
+name: Build & Publish Release APKs
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-astropro:
+    name: Build AstroPro 14U APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+
+      - name: Run Native C++20 Astro Engine Unit Tests
+        run: |
+          g++ -O2 -std=c++20 -Wall -Wextra \
+            astropro-14u/app/src/main/cpp/raw_demosaic.cpp \
+            astropro-14u/app/src/main/cpp/star_engine.cpp \
+            astropro-14u/app/src/main/cpp/stacker_engine.cpp \
+            astropro-14u/app/src/main/cpp/astro_lab.cpp \
+            astropro-14u/app/src/main/cpp/astro_io.cpp \
+            astropro-14u/app/src/main/cpp/tests/test_astro_engine.cpp \
+            -Iastropro-14u/app/src/main/cpp -o /tmp/test_astro && /tmp/test_astro
+
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass astrocoach2026 -keypass astrocoach2026 \
+            -dname "CN=Newww Mobile, OU=Engineering, O=Newww, L=Paris, ST=IDF, C=FR"
+
+      - name: Test & Assemble AstroPro 14U Release APK
+        working-directory: astropro-14u
+        env:
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          gradle testDebugUnitTest assembleRelease --no-daemon --console=plain
+          cp app/build/outputs/apk/release/app-release.apk /tmp/AstroPro-14U-v1.0.0-arm64.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose /tmp/AstroPro-14U-v1.0.0-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: astropro-14u-apk
+          path: /tmp/AstroPro-14U-v1.0.0-arm64.apk
+
+  build-kinetix:
+    name: Build KINETIX Coach APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+
+      - name: Fetch llama.cpp & Embedded Offline AI Models
+        run: |
+          mkdir -p /tmp/model-cache kinetix-coach/app/src/main/assets/models
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/model-cache/llama.cpp
+          curl -fSL -o kinetix-coach/app/src/main/assets/models/pose_landmarker_full.task \
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+          curl -fSL -o kinetix-coach/app/src/main/assets/models/gemma-3-1b-it-Q4_K_M.gguf \
+            "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"
+          ls -lh kinetix-coach/app/src/main/assets/models/
+
+      - name: Verify Knowledge Base & Generate Release Keystore
+        run: |
+          python3 kinetix-coach/scripts/verify_knowledge_base.py
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass astrocoach2026 -keypass astrocoach2026 \
+            -dname "CN=Newww Mobile, OU=Engineering, O=Newww, L=Paris, ST=IDF, C=FR"
+
+      - name: Test & Assemble KINETIX Coach Release APK
+        working-directory: kinetix-coach
+        env:
+          LLAMA_CPP_DIR: /tmp/model-cache/llama.cpp
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          gradle :app:testDebugUnitTest -x externalNativeBuildDebug -x mergeDebugAssets --no-daemon --console=plain
+          gradle assembleRelease --no-daemon --console=plain
+          cp app/build/outputs/apk/release/app-release.apk /tmp/Kinetix-Coach-v1.0.0-arm64.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose /tmp/Kinetix-Coach-v1.0.0-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kinetix-coach-apk
+          path: /tmp/Kinetix-Coach-v1.0.0-arm64.apk
+
+  publish-release:
+    name: Publish GitHub Release with Direct APK Links
+    needs: [build-astropro, build-kinetix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: astropro-14u-apk
+          path: /tmp/release-apks
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kinetix-coach-apk
+          path: /tmp/release-apks
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-v1.0.0}"
+          ls -lh /tmp/release-apks/
+          SHA_K=$(sha256sum /tmp/release-apks/Kinetix-Coach-v1.0.0-arm64.apk | awk '{print $1}')
+          SHA_A=$(sha256sum /tmp/release-apks/AstroPro-14U-v1.0.0-arm64.apk | awk '{print $1}')
+          cat > /tmp/release-notes.md <<EOF
+          ## 2 Applications Android 100 % Hors-Ligne Prêtes à Installer (ARM64 / Android 10+)
+
+          ### 1. KINETIX Coach (\`Kinetix-Coach-v1.0.0-arm64.apk\`)
+          - **LLM local intégré prêt à l'emploi** : \`Gemma-3 1B Instruct Q4_K_M\` via \`llama.cpp\` ARM64 (\`armv8.2-a+dotprod+fp16\`), streaming fluide, zéro serveur.
+          - **Base de connaissances colossale hors-ligne** : **2 683 fiches uniques en français** indexées SQLite FTS5 (\`~2,6 ms\` / requête) + 156 synonymes (1 103 nutrition, 911 exercices, 288 biomécanique/physiologie, 217 blessures/réathlétisation, 164 programmes).
+          - **Vision IA & Biomécanique** : MediaPipe Pose Landmarker (33 points) + 16 exercices analysés en direct (comptage reps, ROM %, score de forme, détection de fautes, coach vocal TTS FR).
+          - **SHA-256** : \`$SHA_K\`
+
+          ### 2. AstroPro 14U (\`AstroPro-14U-v1.0.0-arm64.apk\`)
+          - **Dédié Xiaomi 14 Ultra** : détection multi-objectifs 3 niveaux (12mm UGA 0.5x, 23mm LYT-900 1" ouverture variable f/1.63–f/4.0, 75mm 3.2x, 120mm 5x + sonde HAL 0..64 + diagnostic JSON).
+          - **Interface fidèle Xiaomi HyperOS Camera Pro** : noir OLED pur, molettes crantées haptiques (\`WB / F / S / ISO / f/ / EV\`), règle NPF auto, histogramme RGB live, niveau 2 axes, loupe 10× FWHM/HFD temps réel, déclenchement sans vibration et **Mode Vision Nocturne OLED Rouge** 1-tap.
+          - **Moteur C++20 16-bit natif** : Astro Pro RAW DNG, Ciel Profond (Live Stacking + alignement par astérismes + Kappa-Sigma Clipping), Lune & Planètes (Lucky Imaging + ondelettes À Trous), Star Trails (+ Comète), Timelapse MP4 matériel, Calibration Dark/Flat/Bias, Labo 16-bit (Auto-STF, Arcsinh, retrait gradient 2D, SCNR, exports TIFF 16-bit / FITS 32-bit / DNG / JPEG HD) et Éphémérides hors-ligne (Jean Meeus + boussole Voie Lactée).
+          - **SHA-256** : \`$SHA_A\`
+          EOF
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
+          gh release create "$TAG" \
+            /tmp/release-apks/Kinetix-Coach-v1.0.0-arm64.apk \
+            /tmp/release-apks/AstroPro-14U-v1.0.0-arm64.apk \
+            --repo "${{ github.repository }}" \
+            --title "V1.0.0 — KINETIX Coach & AstroPro 14U (APK Release Signés)" \
+            --notes-file /tmp/release-notes.md
