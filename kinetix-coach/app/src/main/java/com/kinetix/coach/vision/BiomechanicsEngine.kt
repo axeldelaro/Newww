@@ -137,6 +137,7 @@ class BiomechanicsEngine(
         private const val MIN_BOTTOM_DWELL_MS = 55L
         private const val FAST_TOUCH_BOTTOM_DWELL_MS = 25L
         private const val POSTURE_ABORT_GRACE_FRAMES = 4
+        private const val SETUP_POSTURE_SETTLE_MS = 450L
         private const val PUSHUP_WINDOW_MS = 4200L
         private const val DEPTH_STALL_MIN_MS = 480L
         private const val EARLY_REVERSAL_HINT_MS = 1800L
@@ -311,14 +312,21 @@ class BiomechanicsEngine(
     private data class PushupHeightSample(
         val timestampMs: Long,
         val normHeight: Float,
+        val wristX: Float,
         val wristY: Float,
         val elbowDeg: Float
     )
+
+    private val isDeterministicMode: Boolean
+        get() = emaAlpha >= 0.999f && !useOneEuroFilter
 
     private var repCount: Int = 0
     private var phase: MovementPhase = MovementPhase.READY
     private var reachedBottom: Boolean = false
     private var enteredBottomFromRamp: Boolean = false
+    private var requiresNeutralStart: Boolean = true
+    private var hadPriorOutOfPostureOrUnstable: Boolean = false
+    private var postureSettleStartTsMs: Long = Long.MIN_VALUE
     private var bottomEnteredTsMs: Long = 0L
     private var concentricLeftBottomTsMs: Long = 0L
     private var burpeeStage: Int = 0 // 0=stand, 1=down/plank
@@ -406,6 +414,101 @@ class BiomechanicsEngine(
     }
 
     /**
+     * Clears any residual setup/rest movement buffers while keeping temporal smoothers warm
+     * so Rep 1 starts cleanly from a neutral posture the moment setup or rest ends.
+     */
+    fun armAfterSetup() {
+        abortIncompleteRepCycle()
+        burpeeStage = 0
+        burpeeBottomEnteredTsMs = 0L
+        postureGateRejectStreak = 0
+        requiresNeutralStart = true
+        hadPriorOutOfPostureOrUnstable = false
+        postureSettleStartTsMs = Long.MIN_VALUE
+        prevPrimaryPosMeters = Float.NaN
+        pushupHeightWindow.clear()
+        adaptivePushupTopHeight = 0f
+        pushupStraightArmStreak = 0
+        adaptiveDipTopHeight = 0f
+        postureCoach.reset()
+    }
+
+    /**
+     * Smooths and renders live landmarks for camera framing during Setup Countdown or Rest Timer
+     * WITHOUT counting reps, accumulating isometric hold time, calibrating push-up baselines,
+     * or firing posture corrections.
+     */
+    fun previewPoseOnly(
+        rawScreenLandmarks: List<PosePoint>,
+        rawWorldLandmarks: List<PosePoint>,
+        timestampMs: Long,
+        statusFr: String
+    ): BiomechanicsFrame {
+        if (rawScreenLandmarks.size < 29) {
+            lastFrameTsMs = timestampMs
+            return emptyFrame().copy(feedbackFr = statusFr)
+        }
+
+        val preScreen: List<PosePoint>
+        val preWorld: List<PosePoint>
+        if (useOneEuroFilter) {
+            val sanity = sanityFilter.filter(rawScreenLandmarks, rawWorldLandmarks, timestampMs)
+            preScreen = sanity.screenPoints
+            preWorld = sanity.worldPoints
+            lastMotionGuard = sanity.motionGuard
+        } else {
+            preScreen = rawScreenLandmarks
+            preWorld = rawWorldLandmarks
+            lastMotionGuard = MotionGuardState()
+        }
+
+        val screenPts = smoothLandmarks(preScreen, timestampMs, isWorld = false)
+        val worldPts = if (preWorld.size >= 29) smoothLandmarks(preWorld, timestampMs, isWorld = true) else emptyList()
+        lastFrameTsMs = timestampMs
+        val viewpointInfo = if (isDeterministicMode) {
+            CameraViewpointDetector.detect(screenPts, worldPts)
+        } else {
+            viewpointTracker.update(screenPts, worldPts)
+        }
+
+        // Keep counters disarmed so transitioning out of setup/rest never leaks a phantom rep
+        abortIncompleteRepCycle()
+        burpeeStage = 0
+        burpeeBottomEnteredTsMs = 0L
+        requiresNeutralStart = true
+        hadPriorOutOfPostureOrUnstable = false
+        postureSettleStartTsMs = Long.MIN_VALUE
+        prevPrimaryPosMeters = Float.NaN
+        pushupHeightWindow.clear()
+        adaptivePushupTopHeight = 0f
+        pushupStraightArmStreak = 0
+        adaptiveDipTopHeight = 0f
+
+        return BiomechanicsFrame(
+            exercise = currentExercise,
+            landmarks = screenPts,
+            repCount = repCount,
+            isometricHoldSec = plankHoldMs / 1000f,
+            phase = MovementPhase.READY,
+            romPct = 0,
+            formScore = 100,
+            formQuality = FormQuality.GOOD,
+            feedbackFr = statusFr,
+            voiceCueFr = null,
+            angleBadges = emptyList(),
+            avgFormScore = computeAvgForm(),
+            avgRomPct = computeAvgRom(),
+            topFaults = computeTopFaults(),
+            poseDetected = true,
+            worldLandmarks = worldPts,
+            viewpointInfo = viewpointInfo,
+            corrections = emptyList(),
+            isStabilizing = false,
+            velocityTelemetry = velocityEstimator.currentTelemetry()
+        )
+    }
+
+    /**
      * Resets temporal landmark smoothers, sanity gate, and viewpoint tracker without discarding
      * current set rep counts (used when flipping Front <-> Back camera).
      */
@@ -420,6 +523,8 @@ class BiomechanicsEngine(
         prevPrimaryPosMeters = Float.NaN
         lastMotionGuard = MotionGuardState()
         postureGateRejectStreak = 0
+        requiresNeutralStart = true
+        postureSettleStartTsMs = Long.MIN_VALUE
     }
 
     fun resetSession() {
@@ -433,6 +538,9 @@ class BiomechanicsEngine(
         phase = MovementPhase.READY
         reachedBottom = false
         enteredBottomFromRamp = false
+        requiresNeutralStart = true
+        hadPriorOutOfPostureOrUnstable = false
+        postureSettleStartTsMs = Long.MIN_VALUE
         bottomEnteredTsMs = 0L
         concentricLeftBottomTsMs = 0L
         burpeeStage = 0
@@ -524,10 +632,13 @@ class BiomechanicsEngine(
     ): BiomechanicsFrame {
         if (rawScreenLandmarks.size < 29) {
             lastFrameTsMs = timestampMs
+            hadPriorOutOfPostureOrUnstable = true
+            requiresNeutralStart = true
+            postureSettleStartTsMs = Long.MIN_VALUE
             return emptyFrame()
         }
 
-        val isDeterministicPassThrough = emaAlpha >= 0.999f && !useOneEuroFilter
+        val isDeterministicPassThrough = isDeterministicMode
         val preScreen: List<PosePoint>
         val preWorld: List<PosePoint>
         val motionGuard: MotionGuardState
@@ -562,7 +673,14 @@ class BiomechanicsEngine(
             abortIncompleteRepCycle()
             burpeeStage = 0
             burpeeBottomEnteredTsMs = 0L
+            hadPriorOutOfPostureOrUnstable = true
+            requiresNeutralStart = true
+            postureSettleStartTsMs = Long.MIN_VALUE
             prevPrimaryPosMeters = Float.NaN
+            pushupHeightWindow.clear()
+            adaptivePushupTopHeight = 0f
+            pushupStraightArmStreak = 0
+            adaptiveDipTopHeight = 0f
             return BiomechanicsFrame(
                 exercise = currentExercise,
                 landmarks = screenPts,
@@ -673,6 +791,13 @@ class BiomechanicsEngine(
         val midShSAll = midpoint(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER])
         val midHpSAll = midpoint(screenPts[LEFT_HIP], screenPts[RIGHT_HIP])
         val bothArmsVisGlobal = lArmW >= 0.40f && rArmW >= 0.40f
+        val activeWrSX = if (bothArmsVisGlobal) {
+            (screenPts[LEFT_WRIST].x + screenPts[RIGHT_WRIST].x) * 0.5f
+        } else if (lArmW >= rArmW) {
+            screenPts[LEFT_WRIST].x
+        } else {
+            screenPts[RIGHT_WRIST].x
+        }
         val activeWrSY = if (bothArmsVisGlobal) {
             (screenPts[LEFT_WRIST].y + screenPts[RIGHT_WRIST].y) * 0.5f
         } else if (lArmW >= rArmW) {
@@ -733,6 +858,13 @@ class BiomechanicsEngine(
             val shouldRejectNow = !isMidRep || postureGateRejectStreak >= POSTURE_ABORT_GRACE_FRAMES
             if (shouldRejectNow) {
                 abortIncompleteRepCycle()
+                hadPriorOutOfPostureOrUnstable = true
+                requiresNeutralStart = true
+                postureSettleStartTsMs = Long.MIN_VALUE
+                pushupHeightWindow.clear()
+                adaptivePushupTopHeight = 0f
+                pushupStraightArmStreak = 0
+                adaptiveDipTopHeight = 0f
                 return BiomechanicsFrame(
                     exercise = currentExercise,
                     landmarks = screenPts,
@@ -758,6 +890,46 @@ class BiomechanicsEngine(
             }
         } else {
             postureGateRejectStreak = 0
+            // Automatic 450 ms setup settle after getting into position from out-of-frame / walk / standing:
+            // Prevents kneeling, placing hands, or extending feet into plank from counting a phantom Rep 1!
+            if (!isDeterministicPassThrough && hadPriorOutOfPostureOrUnstable) {
+                if (postureSettleStartTsMs == Long.MIN_VALUE) {
+                    postureSettleStartTsMs = timestampMs
+                }
+                if ((timestampMs - postureSettleStartTsMs) < SETUP_POSTURE_SETTLE_MS) {
+                    abortIncompleteRepCycle()
+                    requiresNeutralStart = true
+                    pushupHeightWindow.clear()
+                    adaptivePushupTopHeight = 0f
+                    pushupStraightArmStreak = 0
+                    adaptiveDipTopHeight = 0f
+                    return BiomechanicsFrame(
+                        exercise = currentExercise,
+                        landmarks = screenPts,
+                        repCount = repCount,
+                        isometricHoldSec = plankHoldMs / 1000f,
+                        phase = MovementPhase.READY,
+                        romPct = 0,
+                        formScore = 100,
+                        formQuality = FormQuality.GOOD,
+                        feedbackFr = "Position détectée — stabilisation…",
+                        voiceCueFr = null,
+                        angleBadges = emptyList(),
+                        avgFormScore = computeAvgForm(),
+                        avgRomPct = computeAvgRom(),
+                        topFaults = computeTopFaults(),
+                        poseDetected = true,
+                        worldLandmarks = worldPts,
+                        viewpointInfo = viewpointInfo,
+                        corrections = emptyList(),
+                        isStabilizing = false,
+                        velocityTelemetry = velocityEstimator.currentTelemetry()
+                    )
+                } else {
+                    hadPriorOutOfPostureOrUnstable = false
+                    postureSettleStartTsMs = Long.MIN_VALUE
+                }
+            }
         }
 
         // Detect exercise variant across ALL 16 exercises (temporally stabilized in live mode)
@@ -1327,6 +1499,7 @@ class BiomechanicsEngine(
                         PushupHeightSample(
                             timestampMs = timestampMs,
                             normHeight = currentScreenHeight,
+                            wristX = activeWrSX,
                             wristY = activeWrSY,
                             elbowDeg = activeElbow
                         )
@@ -1371,16 +1544,20 @@ class BiomechanicsEngine(
                     }
                 }
 
-                // Verify wrists stayed planted on floor (prevents waving hands from faking chest drop)
+                // Verify wrists stayed planted on floor in BOTH X and Y (prevents adjusting hand spacing or waving hands from faking chest drop)
+                var minWrX = activeWrSX
+                var maxWrX = activeWrSX
                 var minWrY = activeWrSY
                 var maxWrY = activeWrSY
                 for (s in pushupHeightWindow) {
                     if ((timestampMs - s.timestampMs) <= 1500L) {
+                        if (s.wristX < minWrX) minWrX = s.wristX
+                        if (s.wristX > maxWrX) maxWrX = s.wristX
                         if (s.wristY < minWrY) minWrY = s.wristY
                         if (s.wristY > maxWrY) maxWrY = s.wristY
                     }
                 }
-                val handsPlanted = (maxWrY - minWrY) <= 0.14f
+                val handsPlanted = (maxWrY - minWrY) <= 0.13f && (maxWrX - minWrX) <= 0.13f
 
                 var chestDropProgress = if (inPushupAttitude && handsPlanted && adaptivePushupTopHeight > 0.14f) {
                     val dropDenom = maxOf(adaptivePushupTopHeight * 0.34f, 0.16f)
@@ -2325,25 +2502,33 @@ class BiomechanicsEngine(
                 val standingTall = hipAngle > standAngleThresh && kneeAngle > standAngleThresh && shS.y < hpS.y
                 when (burpeeStage) {
                     0 -> {
-                        phase = if (kneeAngle < 130f) MovementPhase.ECCENTRIC else MovementPhase.READY
-                        romPct = if (bodyHorizontal) 75 else mapRange(kneeAngle, 165f, 90f) / 2
-                        if (kneeAngle < 130f && repStartTsMs == 0L) {
-                            repStartTsMs = timestampMs
-                            phase1StartPosMeters = primaryPosMeters
-                            phase1PeakVelMps = 0f
-                        }
-                        if (phase == MovementPhase.ECCENTRIC && instantSpeedMps > phase1PeakVelMps) {
-                            phase1PeakVelMps = instantSpeedMps
-                        }
-                        if (bodyHorizontal) {
-                            burpeeStage = 1
-                            burpeeBottomEnteredTsMs = timestampMs
-                            concentricLeftBottomTsMs = 0L
-                            phase1EndPosMeters = primaryPosMeters
-                            phase2StartPosMeters = primaryPosMeters
-                            phase2PeakVelMps = 0f
-                            phase = MovementPhase.BOTTOM
-                            if (repStartTsMs == 0L) repStartTsMs = timestampMs
+                        if (!isDeterministicPassThrough && requiresNeutralStart) {
+                            phase = MovementPhase.READY
+                            romPct = 0
+                            if (standingTall) {
+                                requiresNeutralStart = false
+                            }
+                        } else {
+                            phase = if (kneeAngle < 130f) MovementPhase.ECCENTRIC else MovementPhase.READY
+                            romPct = if (bodyHorizontal) 75 else mapRange(kneeAngle, 165f, 90f) / 2
+                            if (kneeAngle < 130f && repStartTsMs == 0L) {
+                                repStartTsMs = timestampMs
+                                phase1StartPosMeters = primaryPosMeters
+                                phase1PeakVelMps = 0f
+                            }
+                            if (phase == MovementPhase.ECCENTRIC && instantSpeedMps > phase1PeakVelMps) {
+                                phase1PeakVelMps = instantSpeedMps
+                            }
+                            if (bodyHorizontal) {
+                                burpeeStage = 1
+                                burpeeBottomEnteredTsMs = timestampMs
+                                concentricLeftBottomTsMs = 0L
+                                phase1EndPosMeters = primaryPosMeters
+                                phase2StartPosMeters = primaryPosMeters
+                                phase2PeakVelMps = 0f
+                                phase = MovementPhase.BOTTOM
+                                if (repStartTsMs == 0L) repStartTsMs = timestampMs
+                            }
                         }
                     }
                     1 -> {
@@ -3273,6 +3458,12 @@ class BiomechanicsEngine(
 
         when (phase) {
             MovementPhase.READY -> {
+                if (!isDeterministicMode && requiresNeutralStart) {
+                    if (progress <= finishThreshold) {
+                        requiresNeutralStart = false
+                    }
+                    return CycleResult(false, 0, 0f)
+                }
                 if (progress >= startThreshold) {
                     val hitPeak = progress >= peakThreshold
                     phase = if (hitPeak) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
@@ -3356,6 +3547,12 @@ class BiomechanicsEngine(
 
         when (phase) {
             MovementPhase.READY -> {
+                if (!isDeterministicMode && requiresNeutralStart) {
+                    if (metric >= finishThreshold) {
+                        requiresNeutralStart = false
+                    }
+                    return CycleResult(false, 0, 0f)
+                }
                 if (metric < startThreshold) {
                     val hitBottom = metric <= bottomThreshold
                     phase = if (hitBottom) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
@@ -3436,6 +3633,12 @@ class BiomechanicsEngine(
 
         when (phase) {
             MovementPhase.READY -> {
+                if (!isDeterministicMode && requiresNeutralStart) {
+                    if (metric <= finishThreshold) {
+                        requiresNeutralStart = false
+                    }
+                    return CycleResult(false, 0, 0f)
+                }
                 if (metric > startThreshold) {
                     val hitTop = metric >= topThreshold && extraTopCondition
                     phase = if (hitTop) MovementPhase.BOTTOM else MovementPhase.CONCENTRIC

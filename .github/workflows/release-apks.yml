@@ -148,7 +148,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
-          TAG="${TAG:-v2.4.0}"
+          TAG="${TAG:-v2.5.0}"
           APK_K="/tmp/release-apks/Kinetix-Coach-${TAG}-arm64.apk"
           APK_A="/tmp/release-apks/AstroPro-14U-${TAG}-arm64.apk"
           ls -lh /tmp/release-apks/
@@ -157,13 +157,15 @@ jobs:
           cat > /tmp/release-notes.md <<EOF
           ## 2 Applications Android 100 % Hors-Ligne Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
-          ### 1. KINETIX Coach v2.2.0 Pro (\`Kinetix-Coach-${TAG}-arm64.apk\`)
-          - **Pompes Entièrement Refondues & Audit Complet des 16 Exercices (60/60 tests)** :
-            - Correction complète des pompes sous **tous les angles réels** (téléphone posé au sol incliné vers le haut, face 2D/3D, 3/4, profil pur avec côté éloigné occlus, dos), suppression définitive du verrouillage \`adaptivePushupTopHeight\` / \`adaptiveDipTopHeight\`, fusion multi-signaux 3 voies (coudes cross-check 2D+3D, compression de corde 3D sans calibration, fenêtre glissante poitrine+tête 4,2 s), support touch-and-go explosif & soft-lockout, double-buffer zéro-GC Snapdragon + alignement CameraX 4:3, réveil instantané \`Planche → Pompes\` et **9 variantes pompes** (*Classique, Large, Serrée, Diamant, Genoux, Piquée, Archer, Inclinée, Déclinée*).
-            - Corrections terrain sur les 15 autres exercices : Squat Sumo séparé des Fentes via axe pelvien 3D, Bulgare verrouillé sur la jambe avant au sol, Développé militaire & Élévations latérales unilatéraux/alternés, Pont fessier 1 jambe, Relevé de jambes suspendu à la barre, Rowing Pendlay/Yates, Soulevé de terre Sumo/RDL/Unilatéral.
-          - **Détection Automatique de Chaque Variante sur les 16 Exercices (\`ExerciseVariantDetector\`)** avec hystérésis anti-clignotement et adaptation des seuils/exemptions biomécaniques.
-          - **Coaching Postural Zéro Spam (\`PostureFeedbackCoach\` + \`VoiceCoach\`)** : persistance temporelle (\`≥ 360 ms\` faute / \`≥ 560 ms\` vigilance), maintien stable \`950 ms\`, fin des alertes *« Descendez encore »* pendant une descente normale, focus visuel unique, cooldowns vocaux stricts (\`≥ 9,5 s\` global, \`≥ 20 s\` + \`≥ 2 reps\` même défaut, max \`3/min\`).
-          - **Système VBT — Vitesse d'Exécution Progressive & Estimation Rep Max (\`VelocityEstimator\`)** : vitesse concentrique (\`m/s\`) par rep (immunisée aux pauses entre reps), perte de vitesse (\`VL%\`), fraîcheur inter-séries, **RIR / RPE**, **Rep Max estimé (\`MAX ~X\`)**, graphique sparkline live dans le HUD, bilan post-séance multi-séries, persistance SQLite v4 dans l'Historique et débriefing Coach IA enrichi.
+          ### 1. KINETIX Coach v2.2.1 Pro (\`Kinetix-Coach-${TAG}-arm64.apk\`)
+          - **Zéro Fausse Rep pendant l'Installation & le Repos (61/61 tests)** :
+            - **Chrono d'installation mains-libres (\`0s / 5s / 8s / 10s\`, défaut \`5s\`)** avec aperçu squelette 60 FPS en mode cadrage pur (\`previewPoseOnly\`), boutons \`+5s\` / \`Prêt !\` et décompte vocal *« 3, 2, 1, c'est parti ! »* — comptage totalement verrouillé pendant la mise en place du téléphone et pendant les temps de repos.
+            - **Protection automatique même chrono à \`0s\`** : verrou de départ neutre (\`requiresNeutralStart\`) sur tous les cycles + stabilisation \`450 ms\` après entrée en position + contrôle de stabilité des poignets en 2D \`X + Y\` pour les pompes + détection de recul face caméra (\`PoseSanityFilter\`).
+          - **Pompes Entièrement Refondues & Audit Complet des 16 Exercices** :
+            - Pompes fiables sous **tous les angles réels** (téléphone au sol incliné, face 2D/3D, 3/4, profil pur avec côté éloigné occlus, dos), fusion multi-signaux 3 voies sans verrouillage, support touch-and-go explosif & soft-lockout, alignement CameraX 4:3, réveil instantané \`Planche → Pompes\` et **9 variantes pompes** (*Classique, Large, Serrée, Diamant, Genoux, Piquée, Archer, Inclinée, Déclinée*).
+            - **Détection automatique de chaque variante sur les 16 exercices (\`ExerciseVariantDetector\`)** avec adaptation biomécanique réelle.
+          - **Coaching Postural Zéro Spam (\`PostureFeedbackCoach\` + \`VoiceCoach\`)** : persistance temporelle (\`≥ 360 ms\` / \`≥ 560 ms\`), maintien stable \`950 ms\`, fin du spam en cours de descente, cooldowns vocaux stricts.
+          - **Système VBT — Vitesse d'Exécution Progressive & Estimation Rep Max (\`VelocityEstimator\`)** : vitesse concentrique (\`m/s\`) lissée avec calibrage 3 reps, zones claires (\`CALIB. / EXPLOSIF / OPTIMAL / FATIGUE / LIMITE\`), perte de vitesse (\`VL%\`), fraîcheur inter-séries, **RIR / RPE**, **Rep Max estimé (\`MAX ~X\`)**, sparkline live, persistance SQLite v4 et débriefing Coach IA.
           - **SHA-256** : \`$SHA_K\`
 
           ### 2. AstroPro 14U v2.0.0 (\`AstroPro-14U-${TAG}-arm64.apk\`)
@@ -175,5 +177,5 @@ jobs:
             "$APK_K" \
             "$APK_A" \
             --repo "${{ github.repository }}" \
-            --title "${TAG} — KINETIX Coach v2.2 Pro (Pompes 9 Variantes, 16 Exos, Anti-Spam, VBT Rep Max) & AstroPro 14U v2.0" \
+            --title "${TAG} — KINETIX Coach v2.2.1 Pro (Zéro Fausse Rep Installation, Pompes 9 Variantes, VBT Rep Max) & AstroPro 14U v2.0" \
             --notes-file /tmp/release-notes.md

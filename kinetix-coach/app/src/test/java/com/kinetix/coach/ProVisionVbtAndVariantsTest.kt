@@ -785,4 +785,125 @@ class ProVisionVbtAndVariantsTest {
         )
         assertTrue("Negative deceleration slope expected, got ${vbt.speedTrendSlopeMpsPerRep}", vbt.speedTrendSlopeMpsPerRep < -0.01f)
     }
+
+    // -------------------------------------------------------------------------
+    // 7. REAL-WORLD SETUP / INSTALLATION TIME FALSE-REP PROTECTION
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun setupInstallationGuard_blocksFalseRepsDuringPhonePlacementGettingDownAndRestPreview() {
+        // 7A. Placing phone on floor & standing back up in SQUAT mode (enters frame crouched 82° -> stands 172°) -> 0 fake squats!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.SQUAT)
+            var ts = 1000L
+            // Athlete already crouched placing phone on floor (15 frames) then stands up (15 frames)
+            for (i in 0 until 30) {
+                ts += 33L
+                val deg = if (i < 15) 82f else 82f + 90f * ((i - 15) / 14f)
+                val (s, w) = rotateAndProject(buildSquat3D(deg, torsoLeanDeg = 22f), yawDeg = 35f)
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Standing up after placing phone on floor must count 0 fake squats", 0, engine.emptyFrame().repCount)
+
+            // Now perform 3 genuine squats from standing -> MUST count all 3 cleanly!
+            repeat(3) {
+                for (i in 0 until 36) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildSquat3D(172f - p * 86f, torsoLeanDeg = 12f + p * 16f), yawDeg = 35f)
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("After setup stand-up, 3 real squats must count cleanly", 3, engine.emptyFrame().repCount)
+        }
+
+        // 7B. Getting down from standing -> bent elbows (108°) adjusting hands on floor -> extending into top plank (166°) -> 0 fake push-ups!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.PUSHUP)
+            var ts = 1000L
+            // 10 frames standing upright (out of posture)
+            repeat(10) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildSquat3D(172f, torsoLeanDeg = 6f), yawDeg = 35f)
+                engine.processFrame(s, w, ts)
+            }
+            // 18 frames kneeling/getting down with bent elbows (108°) while shifting hand width on floor, then locking out to 166°
+            for (i in 0 until 26) {
+                ts += 33L
+                val deg = if (i < 12) 108f else 108f + 58f * ((i - 12) / 13f).coerceIn(0f, 1f)
+                val depth = ((166f - deg) / 76f).coerceIn(0f, 1f)
+                val handSpread = if (i < 12) 0.75f + (i / 12f) * 0.75f else 1.15f
+                val (s, w) = rotateAndProject(
+                    buildPushup3D(deg, depthFrac = depth, wristSpreadRatio = handSpread),
+                    yawDeg = 35f
+                )
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Getting down + adjusting hands with bent elbows must count 0 fake push-ups", 0, engine.emptyFrame().repCount)
+
+            // Hold brief top plank (5 frames) then perform 4 clean push-ups -> MUST count all 4!
+            repeat(5) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildPushup3D(166f, depthFrac = 0f), yawDeg = 35f)
+                engine.processFrame(s, w, ts)
+            }
+            repeat(4) {
+                for (i in 0 until 36) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildPushup3D(166f - p * 78f, depthFrac = p), yawDeg = 35f)
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("After setup settle, all 4 real push-ups must count cleanly", 4, engine.emptyFrame().repCount)
+        }
+
+        // 7C. previewPoseOnly during Setup Countdown / Rest Timer renders live skeleton with ZERO reps or faults!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.PUSHUP)
+            var ts = 1000L
+            // Simulate doing full movement during 5s setup countdown or rest timer
+            repeat(3) {
+                for (i in 0 until 32) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 31.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildPushup3D(166f - p * 80f, depthFrac = p), yawDeg = 35f)
+                    val frame = engine.previewPoseOnly(s, w, ts, "Installation (3s)")
+                    assertTrue("Preview mode must still detect & smooth skeleton for framing", frame.poseDetected)
+                    assertEquals("Preview mode must emit 0 posture fault corrections", 0, frame.corrections.size)
+                }
+            }
+            assertEquals("Setup/Rest preview mode must count 0 reps", 0, engine.emptyFrame().repCount)
+
+            // Arm after countdown ends -> real set starts at 0 and counts 3 real push-ups cleanly
+            engine.armAfterSetup()
+            repeat(3) {
+                for (i in 0 until 36) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildPushup3D(166f - p * 78f, depthFrac = p), yawDeg = 35f)
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("Real push-ups immediately after armAfterSetup must count all 3 reps", 3, engine.emptyFrame().repCount)
+        }
+
+        // 7D. Getting up from floor after placing phone in BURPEE mode -> 0 fake burpees!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.BURPEE)
+            var ts = 1000L
+            // Start horizontal/prone on floor (12 frames) then stand up (15 frames)
+            repeat(12) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildPushup3D(165f, depthFrac = 0f), yawDeg = 45f)
+                engine.processFrame(s, w, ts)
+            }
+            repeat(15) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildSquat3D(172f, torsoLeanDeg = 6f), yawDeg = 45f)
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Standing up from floor in BURPEE mode must count 0 fake burpees", 0, engine.emptyFrame().repCount)
+        }
+    }
 }

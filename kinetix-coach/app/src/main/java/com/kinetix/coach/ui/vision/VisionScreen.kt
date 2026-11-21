@@ -516,6 +516,49 @@ fun VisionScreen(
                                 }
                             }
                         }
+
+                        // 1-Tap Setup Countdown Delay Pill (0s / 5s / 8s / 10s — prevents false reps while placing phone!)
+                        val setupEnabled = uiState.setupDelaySec > 0
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (uiState.isSettingUp) FormCaution.copy(alpha = 0.22f) else ObsidianBg.copy(alpha = 0.90f),
+                            border = BorderStroke(
+                                1.dp,
+                                when {
+                                    uiState.isSettingUp -> FormCaution
+                                    setupEnabled -> FormGood.copy(alpha = 0.65f)
+                                    else -> BorderHairline
+                                }
+                            ),
+                            modifier = Modifier.clickable { viewModel.cycleSetupDelay() }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Timer,
+                                    contentDescription = "Délai d'installation",
+                                    tint = when {
+                                        uiState.isSettingUp -> FormCaution
+                                        setupEnabled -> FormGood
+                                        else -> SteelGray
+                                    },
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(Modifier.width(3.dp))
+                                Text(
+                                    text = if (setupEnabled) "${uiState.setupDelaySec}s" else "0s",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = when {
+                                        uiState.isSettingUp -> FormCaution
+                                        setupEnabled -> CrispWhite
+                                        else -> SteelGray
+                                    },
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
 
                     // Framing Alert Chip (only appears if body parts are clipped out of frame)
@@ -563,6 +606,17 @@ fun VisionScreen(
                         onCycleTrack = { viewModel.cycleQuickMusicTrack() },
                         onPickCustomAudio = { customAudioLauncher.launch(arrayOf("audio/*")) },
                         onStopChallenge = { viewModel.stopActiveChallenge() }
+                    )
+                }
+
+                // Active Hands-Free Installation Countdown Pill (Zero false reps while setting phone down!)
+                if (uiState.isSettingUp && !uiState.isResting && uiState.activeChallenge == null) {
+                    Spacer(Modifier.height(8.dp))
+                    SetupCountdownOverlayPill(
+                        remainingSec = uiState.setupRemainingSec,
+                        totalSec = maxOf(uiState.setupDelaySec, uiState.setupRemainingSec),
+                        onAdd5s = { viewModel.addSetupSeconds(5) },
+                        onStartNow = { viewModel.skipSetupCountdown() }
                     )
                 }
 
@@ -1147,6 +1201,111 @@ private fun PrecisionCorrectionBanner(
                     modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun SetupCountdownOverlayPill(
+    remainingSec: Int,
+    totalSec: Int,
+    onAdd5s: () -> Unit,
+    onStartNow: () -> Unit
+) {
+    val progress = if (totalSec > 0) (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f) else 0f
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = ObsidianBg.copy(alpha = 0.94f),
+        border = BorderStroke(1.dp, FormCaution),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Timer,
+                        contentDescription = null,
+                        tint = FormCaution,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = "INSTALLATION · COMPTAGE EN PAUSE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = FormCaution,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Row(
+                            verticalAlignment = Alignment.Bottom,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "${remainingSec}s",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Posez le téléphone et placez-vous",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SteelGray,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(bottom = 3.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.width(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = ElevatedSurface,
+                        border = BorderStroke(1.dp, BorderHairline),
+                        modifier = Modifier.clickable(onClick = onAdd5s)
+                    ) {
+                        Text(
+                            text = "+5s",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CrispWhite,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = FormGood,
+                        modifier = Modifier.clickable(onClick = onStartNow)
+                    ) {
+                        Text(
+                            text = "Prêt !",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = ObsidianBg,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp)),
+                color = FormCaution,
+                trackColor = ElevatedSurface
+            )
         }
     }
 }
