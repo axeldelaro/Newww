@@ -14,6 +14,14 @@ data class NativeFocusMetrics(
     val starFound: Boolean = false
 )
 
+data class BestFocusStarTarget(
+    val found: Boolean = false,
+    val isStar: Boolean = false,
+    val normX: Float = 0.5f,
+    val normY: Float = 0.5f,
+    val snr: Float = 0f
+)
+
 data class NativeStackReport(
     val accepted: Boolean = false,
     val totalReceived: Int = 0,
@@ -40,7 +48,9 @@ data class LabParameters(
     val denoiseStrength: Float = 0.0f,
     val saturation: Float = 1.0f,
     val temperature: Float = 0.0f,
-    val tint: Float = 0.0f
+    val tint: Float = 0.0f,
+    val deconvolution: Float = 0.0f,
+    val chromaticAberrationFix: Float = 0.65f
 ) {
     fun toFloatArray(): FloatArray = floatArrayOf(
         if (autoStf) 1f else 0f,
@@ -57,7 +67,9 @@ data class LabParameters(
         denoiseStrength,
         saturation,
         temperature,
-        tint
+        tint,
+        deconvolution,
+        chromaticAberrationFix
     )
 }
 
@@ -66,7 +78,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
         label = "Auto-STF",
         params = LabParameters(
             autoStf = true,
-            bgNeutralize = true
+            bgNeutralize = true,
+            deconvolution = 0.25f,
+            chromaticAberrationFix = 0.65f
         )
     ),
     MILKY_WAY(
@@ -81,7 +95,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
             denoiseStrength = 0.20f,
             saturation = 1.25f,
             temperature = 0.08f,
-            tint = 0.0f
+            tint = 0.0f,
+            deconvolution = 0.25f,
+            chromaticAberrationFix = 0.70f
         )
     ),
     NEBULA(
@@ -96,7 +112,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
             denoiseStrength = 0.30f,
             saturation = 1.35f,
             temperature = 0.0f,
-            tint = 0.05f
+            tint = 0.05f,
+            deconvolution = 0.30f,
+            chromaticAberrationFix = 0.70f
         )
     ),
     CRISP_MOON(
@@ -116,7 +134,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
             denoiseStrength = 0.08f,
             saturation = 1.05f,
             temperature = 0f,
-            tint = 0f
+            tint = 0f,
+            deconvolution = 0.55f,
+            chromaticAberrationFix = 0.75f
         )
     ),
     URBAN_SKY(
@@ -131,7 +151,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
             denoiseStrength = 0.28f,
             saturation = 1.15f,
             temperature = -0.05f,
-            tint = 0f
+            tint = 0f,
+            deconvolution = 0.20f,
+            chromaticAberrationFix = 0.65f
         )
     ),
     RESET(
@@ -151,7 +173,9 @@ enum class LabPreset(val label: String, val params: LabParameters) {
             denoiseStrength = 0f,
             saturation = 1.0f,
             temperature = 0f,
-            tint = 0f
+            tint = 0f,
+            deconvolution = 0f,
+            chromaticAberrationFix = 0f
         )
     )
 }
@@ -164,6 +188,10 @@ class AstroNativeEngine : AutoCloseable {
         const val STACK_MODE_STAR_TRAILS_STANDARD = 2
         const val STACK_MODE_STAR_TRAILS_COMET = 3
         const val STACK_MODE_SINGLE_PRO = 4
+        const val STACK_MODE_HDR_ASTRO = 5
+
+        const val FLAG_LANDSCAPE_AUTO = 1 shl 0
+        const val FLAG_DRIZZLE_2X = 1 shl 1
 
         const val CAL_TYPE_DARK = 0
         const val CAL_TYPE_FLAT = 1
@@ -231,8 +259,37 @@ class AstroNativeEngine : AutoCloseable {
         )
     }
 
-    fun startStackSession(mode: Int, param1: Float = 2.5f, param2: Float = 3.0f, param3: Float = 0.0f) {
-        nativeStartStackSession(checkHandle(), mode, param1, param2, param3)
+    fun findBestFocusStar(
+        yBuf: ByteBuffer, yRowStride: Int, yPixelStride: Int,
+        width: Int, height: Int
+    ): BestFocusStarTarget {
+        val h = handle
+        if (h == 0L) return BestFocusStarTarget()
+        val out = FloatArray(5)
+        val ok = nativeFindBestFocusStar(h, yBuf, yRowStride, yPixelStride, width, height, out)
+        return BestFocusStarTarget(
+            found = ok && out[0] > 0.5f,
+            isStar = out[1] > 0.5f,
+            normX = out[2],
+            normY = out[3],
+            snr = out[4]
+        )
+    }
+
+    fun startStackSession(
+        mode: Int,
+        param1: Float = 2.5f,
+        param2: Float = 3.0f,
+        param3: Float = 0.0f,
+        flags: Int = 0
+    ) {
+        nativeStartStackSession(checkHandle(), mode, param1, param2, param3, flags)
+    }
+
+    fun hasDetectedForeground(): Boolean {
+        val h = handle
+        if (h == 0L) return false
+        return nativeHasDetectedForeground(h)
     }
 
     fun addRawFrame(
@@ -243,12 +300,13 @@ class AstroNativeEngine : AutoCloseable {
         whiteLevel: Float,
         wbGains3: FloatArray,
         bin2x2: Boolean,
-        livePreviewBitmap: Bitmap?
+        livePreviewBitmap: Bitmap?,
+        evMultiplier: Float = 1.0f
     ): NativeStackReport {
         val outStats = FloatArray(8)
         nativeAddRawFrame(
             checkHandle(), rawBuf, width, height, rowStrideBytes,
-            cfaPattern, blackLevel4, whiteLevel, wbGains3, bin2x2,
+            cfaPattern, blackLevel4, whiteLevel, wbGains3, bin2x2, evMultiplier,
             livePreviewBitmap, outStats
         )
         return parseStackReport(outStats)
@@ -259,7 +317,8 @@ class AstroNativeEngine : AutoCloseable {
         uBuf: ByteBuffer, uRowStride: Int, uPixelStride: Int,
         vBuf: ByteBuffer, vRowStride: Int, vPixelStride: Int,
         width: Int, height: Int, downsampleStep: Int,
-        livePreviewBitmap: Bitmap?
+        livePreviewBitmap: Bitmap?,
+        evMultiplier: Float = 1.0f
     ): NativeStackReport {
         val outStats = FloatArray(8)
         nativeAddYuvFrame(
@@ -267,7 +326,7 @@ class AstroNativeEngine : AutoCloseable {
             yBuf, yRowStride, yPixelStride,
             uBuf, uRowStride, uPixelStride,
             vBuf, vRowStride, vPixelStride,
-            width, height, downsampleStep,
+            width, height, downsampleStep, evMultiplier,
             livePreviewBitmap, outStats
         )
         return parseStackReport(outStats)
@@ -405,13 +464,21 @@ class AstroNativeEngine : AutoCloseable {
         outPointsXY: FloatArray
     ): Int
 
-    private external fun nativeStartStackSession(handle: Long, mode: Int, p1: Float, p2: Float, p3: Float)
+    private external fun nativeFindBestFocusStar(
+        handle: Long,
+        yBuf: ByteBuffer, yRowStride: Int, yPixelStride: Int,
+        width: Int, height: Int,
+        outResult5: FloatArray
+    ): Boolean
+
+    private external fun nativeStartStackSession(handle: Long, mode: Int, p1: Float, p2: Float, p3: Float, flags: Int)
+    private external fun nativeHasDetectedForeground(handle: Long): Boolean
 
     private external fun nativeAddRawFrame(
         handle: Long,
         rawBuf: ByteBuffer, width: Int, height: Int, rowStrideBytes: Int,
         cfa: Int, blackLevel4: FloatArray, whiteLevel: Float,
-        wbGains3: FloatArray, bin2x2: Boolean,
+        wbGains3: FloatArray, bin2x2: Boolean, evMultiplier: Float,
         livePreviewBitmap: Bitmap?, outStats: FloatArray
     )
 
@@ -420,7 +487,7 @@ class AstroNativeEngine : AutoCloseable {
         yBuf: ByteBuffer, yRowStride: Int, yPixelStride: Int,
         uBuf: ByteBuffer, uRowStride: Int, uPixelStride: Int,
         vBuf: ByteBuffer, vRowStride: Int, vPixelStride: Int,
-        width: Int, height: Int, downsampleStep: Int,
+        width: Int, height: Int, downsampleStep: Int, evMultiplier: Float,
         livePreviewBitmap: Bitmap?, outStats: FloatArray
     )
 

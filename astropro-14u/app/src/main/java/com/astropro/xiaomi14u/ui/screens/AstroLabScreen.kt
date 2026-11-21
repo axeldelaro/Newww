@@ -530,6 +530,18 @@ fun AstroLabScreen(
 
                     else -> {
                         LabSliderRow(
+                            label = "Déconvolution R-L (Netteté Étoiles & Lune)",
+                            value = params.deconvolution,
+                            range = 0f..1f,
+                            fmt = { "${(it * 100).toInt()}%" }
+                        ) { v -> onUpdateParams { it.copy(deconvolution = v) } }
+                        LabSliderRow(
+                            label = "Anti-Aberration Chrom.",
+                            value = params.chromaticAberrationFix,
+                            range = 0f..1f,
+                            fmt = { "${(it * 100).toInt()}%" }
+                        ) { v -> onUpdateParams { it.copy(chromaticAberrationFix = v) } }
+                        LabSliderRow(
                             label = "Ondelettes À Trous · Fin",
                             value = params.waveletFine,
                             range = -0.5f..2.5f,

@@ -14,9 +14,9 @@ import org.junit.Test
 class ModeGuideTest {
 
     @Test
-    fun allSixModes_haveUniqueGuidesAndDistinctSampleDrawables() {
+    fun allSevenModes_haveUniqueGuidesAndDistinctSampleDrawables() {
         val allModes = CaptureMode.entries
-        assertEquals(6, allModes.size)
+        assertEquals(7, allModes.size)
         assertEquals(allModes.toSet(), ModeGuideData.ORDERED_MODES.toSet())
         assertEquals(allModes.toSet(), ModeGuideData.ENTRIES.map { it.mode }.toSet())
 
@@ -31,11 +31,11 @@ class ModeGuideTest {
             assertNotEquals("Invalid drawable ID for $mode", 0, guide.drawableRes)
             assertTrue("Duplicate drawable ID for $mode", drawables.add(guide.drawableRes))
         }
-        assertEquals(6, drawables.size)
+        assertEquals(7, drawables.size)
     }
 
     @Test
-    fun allSixModes_haveFourBriefScannableBulletPoints() {
+    fun allSevenModes_haveFourBriefScannableBulletPoints() {
         for (mode in CaptureMode.entries) {
             val guide = ModeGuideData.guideFor(mode)
             assertEquals("Expected exactly 4 brief points for $mode", 4, guide.briefPoints.size)
@@ -51,7 +51,7 @@ class ModeGuideTest {
     }
 
     @Test
-    fun allSixModes_haveSensibleXiaomi14UltraPresets() {
+    fun allSevenModes_haveSensibleXiaomi14UltraPresets() {
         val validBadges = setOf("0.5", "1", "3.2", "5")
         val validEqMm = setOf(12, 23, 75, 120)
 
@@ -76,31 +76,44 @@ class ModeGuideTest {
         assertTrue(deepSky.useNpfShutter)
         val dsOpts = deepSky.applyToModeOptions(ModeOptions())
         assertEquals(60, dsOpts.deepSkyFrames)
+        assertTrue("Paysage Auto should be enabled by default", dsOpts.deepSkyLandscapeAuto)
+        assertFalse("Drizzle 2x should be OFF by default for speed", dsOpts.deepSkyDrizzle2x)
 
         val trails = ModeGuideData.guideFor(CaptureMode.STAR_TRAILS).recommendedPreset
         assertEquals("0.5", trails.recommendedZoomBadge)
         val trOpts = trails.applyToModeOptions(ModeOptions())
         assertEquals(StarTrailStyle.COMET, trOpts.starTrailStyle)
+
+        val hdr = ModeGuideData.guideFor(CaptureMode.HDR_ASTRO).recommendedPreset
+        assertEquals("5", hdr.recommendedZoomBadge)
+        assertEquals(3, hdr.hdrBrackets)
+        val hdrOpts = hdr.applyToModeOptions(ModeOptions(hdrBrackets = 5))
+        assertEquals(3, hdrOpts.hdrBrackets)
     }
 
     @Test
-    fun labPresets_coverAllSixProfilesWithValidParameters() {
+    fun labPresets_coverAllSixProfilesWithValid17FloatParameters() {
         assertEquals(6, LabPreset.entries.size)
         for (preset in LabPreset.entries) {
             assertTrue(preset.label.isNotBlank())
             val arr = preset.params.toFloatArray()
-            assertEquals(15, arr.size)
+            assertEquals(17, arr.size)
             assertTrue(preset.params.saturation in 0f..2.0f)
             assertTrue(preset.params.denoiseStrength in 0f..1.0f)
             assertTrue(preset.params.bgRemovalStrength in 0f..1.0f)
             assertTrue(preset.params.scnrStrength in 0f..1.0f)
+            assertTrue(preset.params.deconvolution in 0f..1.0f)
+            assertTrue(preset.params.chromaticAberrationFix in 0f..1.0f)
         }
 
         assertTrue(LabPreset.MILKY_WAY.params.asinhBeta >= 60f)
         assertTrue(LabPreset.NEBULA.params.asinhBeta >= 100f)
         assertTrue(LabPreset.NEBULA.params.scnrStrength >= 0.7f)
         assertTrue(LabPreset.CRISP_MOON.params.waveletFine >= 0.6f)
+        assertTrue(LabPreset.CRISP_MOON.params.deconvolution >= 0.4f)
         assertTrue(LabPreset.URBAN_SKY.params.bgRemovalStrength >= 0.85f)
         assertFalse(LabPreset.RESET.params.autoStf)
+        assertEquals(0f, LabPreset.RESET.params.deconvolution, 1e-4f)
+        assertEquals(0f, LabPreset.RESET.params.chromaticAberrationFix, 1e-4f)
     }
 }

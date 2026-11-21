@@ -52,7 +52,7 @@ import com.astropro.xiaomi14u.ui.theme.tabularStyle
 /**
  * Authentic Xiaomi HyperOS Leica Camera Pro Mode Guide Sheet.
  *
- * Displays all 6 astrophotography modes with full-bleed 4:3 reference photos,
+ * Displays all 7 astrophotography modes (including HDR Astro) with full-bleed 4:3 reference photos,
  * Leica-style bottom monospace EXIF caption, 4 scannable field bullets,
  * recommended Xiaomi 14 Ultra preset chips, and a 1-tap "Appliquer ces réglages" button.
  * 100% compatible with Vision Nocturne OLED Red mode.

@@ -568,10 +568,524 @@ void testFocusPeakingPoints() {
     assert(elapsedMs < 1.5);
 }
 
+// =========================================================================
+// Test 9: Auto-Horizon Sky/Ground Separation (Zero-Effort Dual-Stacker)
+// =========================================================================
+void testAutoHorizonSkyGroundSeparation() {
+    const int w = 256, h = 256;
+    auto ridgeYAt = [&](int x) -> float {
+        // Synthetic mountain silhouette spanning bottom ~32% of frame
+        const float peak1 = 22.0f * std::exp(-std::pow((x - 84.0f) / 28.0f, 2.0f));
+        const float peak2 = 28.0f * std::exp(-std::pow((x - 182.0f) / 34.0f, 2.0f));
+        return 178.0f - peak1 - peak2;
+    };
+
+    // 1. Verify Auto-No-Op Protection on pure starry sky (no foreground)
+    {
+        FloatImageRGB pureSky;
+        pureSky.resize(w, h);
+        std::mt19937 rngPure(101);
+        std::normal_distribution<float> skyNoise(0.06f, 0.002f);
+        for (size_t i = 0; i < pureSky.pixelCount(); ++i) {
+            pureSky.r[i] = pureSky.g[i] = pureSky.b[i] = std::max(0.0f, skyNoise(rngPure));
+        }
+        const float pts[12][2] = {
+            {35, 30}, {110, 42}, {210, 38}, {60, 115}, {148, 128}, {225, 118},
+            {44, 195}, {132, 205}, {205, 198}, {52, 236}, {140, 240}, {218, 234}
+        };
+        for (const auto& p : pts) drawGaussianStar(pureSky, p[0], p[1], 0.65f, 1.5f);
+        std::vector<float> dummyH;
+        const bool detectedOnZenith = autoDetectHorizon(pureSky, dummyH);
+        assert(!detectedOnZenith);
+    }
+
+    // 2. Verify Sky + Mountain Dual-Stacking across 5 sky-drifting frames
+    struct S { float x, y, pk; };
+    std::vector<S> skyStars = {
+        {32, 32, 0.72f}, {84, 24, 0.60f}, {138, 38, 0.78f}, {198, 28, 0.64f}, {232, 46, 0.56f},
+        {48, 76, 0.68f}, {108, 64, 0.80f}, {162, 80, 0.62f}, {216, 72, 0.74f},
+        {36, 118, 0.65f}, {92, 108, 0.70f}, {146, 116, 0.76f}, {204, 106, 0.58f},
+        {64, 136, 0.54f}, {126, 138, 0.66f}
+    };
+
+    DeepSkyStacker landscapeStacker;
+    landscapeStacker.reset(2.5f, 3.0f, /*landscapeMode=*/true, /*drizzle2x=*/false);
+
+    DeepSkyStacker skyOnlyStacker;
+    skyOnlyStacker.reset(2.5f, 3.0f, /*landscapeMode=*/false, /*drizzle2x=*/false);
+
+    std::mt19937 rng(909);
+    std::normal_distribution<float> noise(0.0f, 0.002f);
+
+    // Build 5 frames: stars drift 2.5px/frame (+10px total!) while mountain silhouette stays FIXED
+    for (int f = 0; f < 5; ++f) {
+        FloatImageRGB frame;
+        frame.resize(w, h);
+        const float driftX = f * 2.5f;
+        const float driftY = f * 0.6f;
+
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t idx = static_cast<size_t>(y) * w + x;
+                const float nVal = noise(rng);
+                const float rY = ridgeYAt(x);
+                if (static_cast<float>(y) < rY) {
+                    const float skyVal = std::max(0.0f, 0.065f + nVal);
+                    frame.r[idx] = skyVal;
+                    frame.g[idx] = skyVal;
+                    frame.b[idx] = skyVal;
+                } else {
+                    // Dark mountain silhouette with crisp fixed vertical rock cliff stripe at x=128..131, y=210..235
+                    float fgVal = 0.014f + nVal;
+                    if (y >= 205 && y <= 238 && x >= 126 && x <= 130) {
+                        fgVal = 0.048f + nVal; // crisp fixed foreground lit ridge detail!
+                    }
+                    fgVal = std::max(0.0f, fgVal);
+                    frame.r[idx] = fgVal;
+                    frame.g[idx] = fgVal;
+                    frame.b[idx] = fgVal;
+                }
+            }
+        }
+        // Paint drifting stars in the sky zone
+        for (const auto& s : skyStars) {
+            const float sx = s.x - driftX;
+            const float sy = s.y - driftY;
+            if (sx > 8 && sx < w - 8 && sy > 8 && sy < ridgeYAt(static_cast<int>(sx)) - 8) {
+                drawGaussianStar(frame, sx, sy, s.pk, 1.45f);
+            }
+        }
+
+        assert(landscapeStacker.addFrame(frame).accepted);
+        assert(skyOnlyStacker.addFrame(frame).accepted);
+    }
+
+    assert(landscapeStacker.hasDetectedForeground());
+
+    FloatImageRGB landOut, skyOnlyOut;
+    landscapeStacker.getCurrentImage(landOut);
+    skyOnlyStacker.getCurrentImage(skyOnlyOut);
+
+    // Check sky star at (108, 64) stayed razor-sharp in landscape stack
+    const float skyStarPeak = landOut.g[64 * w + 108];
+
+    // Measure horizontal edge contrast of the fixed rock detail at x=126..130, y=220
+    // In landscape mode (ground-locked), edge stays crisp; in sky-only stack (shifted 0..10px), it smears!
+    auto measureFgDetailContrast = [&](const FloatImageRGB& im) -> float {
+        float peakVal = 0.0f;
+        float bgVal = 0.0f;
+        for (int x = 127; x <= 129; ++x) peakVal += im.g[220 * w + x];
+        for (int x = 115; x <= 120; ++x) bgVal += im.g[220 * w + x];
+        return (peakVal / 3.0f) - (bgVal / 6.0f);
+    };
+    const float fgContrastLand = measureFgDetailContrast(landOut);
+    const float fgContrastSkyOnly = measureFgDetailContrast(skyOnlyOut);
+
+    std::printf("[Test 9] Auto-Horizon Dual-Stack: fgDetected=1 starPeak=%.3f fgContrast=%.4f (vs unseparated=%.4f)\n",
+                skyStarPeak, fgContrastLand, fgContrastSkyOnly);
+
+    assert(skyStarPeak > 0.65f);
+    assert(fgContrastLand > 0.030f);                  // Razor-sharp fixed foreground!
+    assert(fgContrastLand > fgContrastSkyOnly * 1.8f); // Zero motion blur vs naive sky-only stack!
+}
+
+// =========================================================================
+// Test 10: HDR Astro 3-Bracket Linear Radiance Fusion
+// =========================================================================
+void testHdrAstroFusion() {
+    const int w = 160, h = 160;
+    const float cx = 80.0f, cy = 80.0f;
+
+    // True physical linear radiance scene (Orion Nebula M42):
+    // - Sky background: 0.004
+    // - Faint outer nebula ring (r=38..54): 0.022
+    // - Blazing Trapezium core (r<10): peak 2.40 (exceeds 1.0!)
+    auto trueRadiance = [&](float x, float y) -> float {
+        const float r = std::hypot(x - cx, y - cy);
+        const float core = 2.40f * std::exp(-(r * r) / (2.0f * 6.5f * 6.5f));
+        const float outer = 0.022f * std::exp(-std::pow((r - 42.0f) / 10.0f, 2.0f));
+        return 0.004f + core + outer;
+    };
+
+    const float evMuls[3] = {0.25f, 1.0f, 4.0f}; // -2 EV, 0 EV, +2 EV
+    const float shifts[3][2] = {{-1.5f, 1.0f}, {0.0f, 0.0f}, {1.2f, -0.8f}};
+
+    std::mt19937 rng(1010);
+    std::normal_distribution<float> readNoise(0.0f, 0.0045f);
+
+    HdrAstroStacker hdr;
+    hdr.reset(3);
+
+    FloatImageRGB shortFrame;
+    for (int b = 0; b < 3; ++b) {
+        FloatImageRGB frame;
+        frame.resize(w, h);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const float rad = trueRadiance(x - shifts[b][0], y - shifts[b][1]);
+                // Sensor clips linearly at 1.0 with fixed read noise per frame
+                const float sig = std::clamp(rad * evMuls[b] + readNoise(rng), 0.0f, 1.0f);
+                const size_t i = static_cast<size_t>(y) * w + x;
+                frame.r[i] = sig;
+                frame.g[i] = sig;
+                frame.b[i] = sig;
+            }
+        }
+        if (b == 0) shortFrame = frame;
+        assert(hdr.addBracket(frame, evMuls[b]).accepted);
+    }
+
+    FloatImageRGB fused;
+    assert(hdr.finalize(fused));
+    assert(fused.width == w && fused.height == h);
+
+    // Core must preserve unclipped linear radiance > 1.5 (near true 2.40!)
+    const float coreVal = fused.g[80 * w + 80];
+
+    // Faint outer nebula around radius 42 (y=80, x=122) must recover ~0.026 (bg 0.004 + nebula 0.022) cleanly!
+    double outerSum = 0.0;
+    double outerSq = 0.0;
+    int outerCnt = 0;
+    double shortOuterSq = 0.0;
+    for (int y = 76; y <= 84; ++y) {
+        for (int x = 119; x <= 125; ++x) {
+            const float expected = trueRadiance(static_cast<float>(x), static_cast<float>(y));
+            const float got = fused.g[static_cast<size_t>(y) * w + x];
+            outerSum += got;
+            const double err = got - expected;
+            outerSq += err * err;
+
+            const float shortEst = shortFrame.g[static_cast<size_t>(y) * w + x] / evMuls[0];
+            const double sErr = shortEst - expected;
+            shortOuterSq += sErr * sErr;
+            outerCnt++;
+        }
+    }
+    const float outerMean = static_cast<float>(outerSum / outerCnt);
+    const float outerRms = static_cast<float>(std::sqrt(outerSq / outerCnt));
+    const float shortOuterRms = static_cast<float>(std::sqrt(shortOuterSq / outerCnt));
+
+    // Also verify Lab HDR tone compression maps >1.0 master cleanly into [0..1] without blowing core flat
+    FloatImageRGB developed;
+    LabParams lp{};
+    lp.autoStf = true;
+    lp.bgNeutralize = false;
+    processAstroLab(fused, lp, developed);
+    const float devCore = developed.g[80 * w + 80];
+    const float devRing = developed.g[80 * w + 88];
+
+    std::printf("[Test 10] HDR Astro 3-EV Fusion: core=%.3f (true=2.40) outer=%.4f rms=%.5f (vs short=%.5f) devCore=%.3f>ring=%.3f\n",
+                coreVal, outerMean, outerRms, shortOuterRms, devCore, devRing);
+
+    assert(coreVal > 1.85f && coreVal < 2.75f); // Unclipped bright core > 1.0 preserved!
+    assert(outerMean > 0.018f && outerMean < 0.034f); // Faint outer nebula recovered!
+    assert(outerRms < shortOuterRms * 0.45f);         // Huge SNR improvement over short bracket!
+    assert(devCore > devRing && devCore <= 1.0f);     // HDR tone map preserves core gradient!
+}
+
+// =========================================================================
+// Test 11: Super-Resolution Drizzle 2x Sub-Pixel Reconstruction
+// =========================================================================
+void testDrizzle2xSuperResolution() {
+    const int w = 96, h = 96;
+    const float trueStarX = 48.25f;
+    const float trueStarY = 47.75f;
+    const float starSigma = 0.85f; // Undersampled pinpoint star
+
+    // 4 sub-pixel dithered frames
+    const float dithers[4][2] = {{0.0f, 0.0f}, {0.5f, 0.0f}, {0.0f, 0.5f}, {0.5f, 0.5f}};
+
+    Drizzle2xAccumulator drizzle;
+    drizzle.reset(w, h, 0.72f);
+
+    FloatImageRGB firstFrame;
+    for (int f = 0; f < 4; ++f) {
+        FloatImageRGB frame;
+        frame.resize(w, h);
+        for (size_t i = 0; i < frame.pixelCount(); ++i) {
+            frame.r[i] = frame.g[i] = frame.b[i] = 0.03f;
+        }
+        // Star shifted by (-dx, -dy) in source frame; alignment matrix maps src -> ref by (+dx, +dy)
+        drawGaussianStar(frame, trueStarX - dithers[f][0], trueStarY - dithers[f][1], 0.85f, starSigma);
+        if (f == 0) firstFrame = frame;
+
+        const float M[6] = {1.0f, 0.0f, dithers[f][0], 0.0f, 1.0f, dithers[f][1]};
+        drizzle.addFrame(frame, M, nullptr);
+    }
+
+    FloatImageRGB out2x;
+    drizzle.finalize(out2x);
+
+    assert(out2x.valid());
+    assert(out2x.width == w * 2 && out2x.height == h * 2);
+
+    // Check zero NaN / zero hole artifacts and valid background normalization
+    for (size_t i = 0; i < out2x.pixelCount(); ++i) {
+        assert(std::isfinite(out2x.g[i]));
+        assert(out2x.g[i] >= 0.02f);
+    }
+
+    // Measure star FWHM on 2x drizzled crop (centered near 2*trueStarX, 2*trueStarY)
+    const int cropW = 48;
+    std::vector<float> crop(cropW * cropW);
+    const int cx = static_cast<int>(std::round(2.0f * trueStarX));
+    const int cy = static_cast<int>(std::round(2.0f * trueStarY));
+    for (int dy = 0; dy < cropW; ++dy) {
+        for (int dx = 0; dx < cropW; ++dx) {
+            crop[dy * cropW + dx] = out2x.g[static_cast<size_t>(cy - cropW / 2 + dy) * out2x.width + (cx - cropW / 2 + dx)];
+        }
+    }
+    const FocusMetrics fm2x = measureFocusCrop(crop.data(), cropW, cropW);
+
+    // Compare against naive 2x bilinear upsampling of single frame
+    FloatImageRGB bilinear2x;
+    bilinear2x.resize(w * 2, h * 2);
+    for (int y = 0; y < h * 2; ++y) {
+        for (int x = 0; x < w * 2; ++x) {
+            const float sx = std::clamp((x - 0.5f) * 0.5f, 0.0f, static_cast<float>(w - 1));
+            const float sy = std::clamp((y - 0.5f) * 0.5f, 0.0f, static_cast<float>(h - 1));
+            const int x0 = static_cast<int>(sx), y0 = static_cast<int>(sy);
+            const int x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+            const float fx = sx - x0, fy = sy - y0;
+            const float v = (1 - fx) * (1 - fy) * firstFrame.g[y0 * w + x0] +
+                            fx * (1 - fy) * firstFrame.g[y0 * w + x1] +
+                            (1 - fx) * fy * firstFrame.g[y1 * w + x0] +
+                            fx * fy * firstFrame.g[y1 * w + x1];
+            bilinear2x.r[y * w * 2 + x] = bilinear2x.g[y * w * 2 + x] = bilinear2x.b[y * w * 2 + x] = v;
+        }
+    }
+    std::vector<float> cropBilin(cropW * cropW);
+    for (int dy = 0; dy < cropW; ++dy) {
+        for (int dx = 0; dx < cropW; ++dx) {
+            cropBilin[dy * cropW + dx] = bilinear2x.g[static_cast<size_t>(cy - cropW / 2 + dy) * bilinear2x.width + (cx - cropW / 2 + dx)];
+        }
+    }
+    const FocusMetrics fmBilin = measureFocusCrop(cropBilin.data(), cropW, cropW);
+
+    std::printf("[Test 11] Drizzle 2x: %dx%d -> %dx%d peak=%.3f FWHM=%.2fpx (vs bilinear2x=%.2fpx)\n",
+                w, h, out2x.width, out2x.height, fm2x.peakValue, fm2x.fwhm, fmBilin.fwhm);
+
+    assert(fm2x.starFound == 1);
+    assert(fm2x.peakValue > 0.72f);
+    assert(fm2x.fwhm < fmBilin.fwhm); // Genuine super-resolution sharper than bilinear upsample!
+}
+
+// =========================================================================
+// Test 12: Richardson-Lucy Deconvolution & Chromatic Aberration Fix
+// =========================================================================
+void testRichardsonLucyAndChromaticAberration() {
+    // Part A: Regularized Richardson-Lucy Deconvolution (sharpens star without amplifying sky noise!)
+    {
+        const int w = 128, h = 128;
+        FloatImageRGB img;
+        img.resize(w, h);
+        std::mt19937 rng(1212);
+        std::normal_distribution<float> bgNoise(0.05f, 0.0025f);
+        for (size_t i = 0; i < img.pixelCount(); ++i) {
+            const float v = std::max(0.0f, bgNoise(rng));
+            img.r[i] = img.g[i] = img.b[i] = v;
+        }
+        drawGaussianStar(img, 64.0f, 64.0f, 0.65f, 2.35f);
+
+        auto measureCornerStd = [&](const FloatImageRGB& im) -> float {
+            double mean = 0.0, sq = 0.0;
+            int cnt = 0;
+            for (int y = 4; y < 32; ++y) {
+                for (int x = 4; x < 32; ++x) {
+                    const float v = im.g[static_cast<size_t>(y) * w + x];
+                    mean += v;
+                    cnt++;
+                }
+            }
+            mean /= cnt;
+            for (int y = 4; y < 32; ++y) {
+                for (int x = 4; x < 32; ++x) {
+                    const double d = im.g[static_cast<size_t>(y) * w + x] - mean;
+                    sq += d * d;
+                }
+            }
+            return static_cast<float>(std::sqrt(sq / cnt));
+        };
+
+        const FocusMetrics beforeFm = measureFocusCrop(img.g.data(), w, h);
+        const float bgStdBefore = measureCornerStd(img);
+
+        applyRichardsonLucyDeconv(img, 0.90f, 1.35f);
+
+        const FocusMetrics afterFm = measureFocusCrop(img.g.data(), w, h);
+        const float bgStdAfter = measureCornerStd(img);
+
+        std::printf("[Test 12A] R-L Deconv: FWHM %.3f -> %.3f px | skyNoiseStd %.5f -> %.5f\n",
+                    beforeFm.fwhm, afterFm.fwhm, bgStdBefore, bgStdAfter);
+
+        assert(afterFm.starFound == 1);
+        assert(afterFm.fwhm < beforeFm.fwhm * 0.87f); // Noticeably tighter PSF!
+        assert(bgStdAfter <= bgStdBefore * 1.12f);    // Sky noise protected by damping mask!
+    }
+
+    // Part B: Lateral Radial Chromatic Aberration + Purple Edge Fringe Removal
+    {
+        const int w = 220, h = 220;
+        const float cx = 0.5f * (w - 1), cy = 0.5f * (h - 1);
+        FloatImageRGB img;
+        img.resize(w, h);
+        for (size_t i = 0; i < img.pixelCount(); ++i) {
+            img.r[i] = img.g[i] = img.b[i] = 0.03f;
+        }
+
+        // 8 bright peripheral stars with +0.8% outward Red lateral CA and -0.8% inward Blue lateral CA
+        for (int k = 0; k < 8; ++k) {
+            const float ang = k * (2.0f * kPi / 8.0f) + 0.25f;
+            const float rad = 82.0f;
+            const float gx = cx + rad * std::cos(ang);
+            const float gy = cy + rad * std::sin(ang);
+            const float rx = cx + (rad * 1.008f) * std::cos(ang);
+            const float ry = cy + (rad * 1.008f) * std::sin(ang);
+            const float bx = cx + (rad * 0.992f) * std::cos(ang);
+            const float by = cy + (rad * 0.992f) * std::sin(ang);
+            drawGaussianStar(img, rx, ry, 0.72f, 1.8f, 1.0f, 0.0f, 0.0f);
+            drawGaussianStar(img, gx, gy, 0.72f, 1.8f, 0.0f, 1.0f, 0.0f);
+            drawGaussianStar(img, bx, by, 0.72f, 1.8f, 0.0f, 0.0f, 1.0f);
+        }
+
+        // Also add a bright central lunar disc with an axial purple fringe around its limb
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const float r = std::hypot(x - cx, y - cy);
+                const size_t i = static_cast<size_t>(y) * w + x;
+                if (r < 26.0f) {
+                    img.r[i] = img.g[i] = img.b[i] = 0.78f;
+                } else if (r < 28.0f) {
+                    // Axial purple CA halo on lunar limb
+                    img.r[i] = 0.42f;
+                    img.g[i] = 0.14f;
+                    img.b[i] = 0.44f;
+                }
+            }
+        }
+
+        auto measureRadialColorErr = [&](const FloatImageRGB& im) -> float {
+            double err = 0.0;
+            int cnt = 0;
+            for (int y = 10; y < h - 10; ++y) {
+                for (int x = 10; x < w - 10; ++x) {
+                    const float r = std::hypot(x - cx, y - cy);
+                    if (r < 55.0f) continue;
+                    const size_t i = static_cast<size_t>(y) * w + x;
+                    err += std::abs(im.r[i] - im.g[i]) + std::abs(im.b[i] - im.g[i]);
+                    cnt++;
+                }
+            }
+            return static_cast<float>(err / std::max(1, cnt));
+        };
+
+        auto measureLimbPurple = [&](const FloatImageRGB& im) -> float {
+            double sum = 0.0;
+            int cnt = 0;
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const float r = std::hypot(x - cx, y - cy);
+                    if (r >= 26.0f && r < 28.0f) {
+                        const size_t i = static_cast<size_t>(y) * w + x;
+                        sum += std::max(0.0f, std::min(im.r[i], im.b[i]) - im.g[i]);
+                        cnt++;
+                    }
+                }
+            }
+            return static_cast<float>(sum / std::max(1, cnt));
+        };
+
+        const float colorErrBefore = measureRadialColorErr(img);
+        const float purpleBefore = measureLimbPurple(img);
+
+        applyChromaticAberrationFix(img, 1.0f);
+
+        const float colorErrAfter = measureRadialColorErr(img);
+        const float purpleAfter = measureLimbPurple(img);
+
+        std::printf("[Test 12B] Chromatic Aberration Fix: radialErr %.5f -> %.5f | purpleLimb %.4f -> %.4f\n",
+                    colorErrBefore, colorErrAfter, purpleBefore, purpleAfter);
+
+        assert(colorErrAfter < colorErrBefore * 0.35f); // Radial R/B shift cleanly corrected!
+        assert(purpleAfter < purpleBefore * 0.35f);     // Purple lunar limb fringe suppressed!
+    }
+}
+
+// =========================================================================
+// Test 13: Auto Best Focus Star Finder (Rejects Hot Border & Saturated Pixels)
+// =========================================================================
+void testAutoBestFocusStarFinder() {
+    const int w = 640, h = 480;
+    std::vector<uint8_t> yPlane(static_cast<size_t>(w) * h, 14);
+
+    // Inject deceptive blazing hot pixels on borders (outside central 70%)
+    yPlane[12 * w + 15] = 255;
+    yPlane[12 * w + 16] = 255;
+    yPlane[13 * w + 15] = 255;
+    yPlane[465 * w + 622] = 255;
+    yPlane[465 * w + 623] = 255;
+    // Inject isolated single-pixel hot pixel right near center
+    yPlane[240 * w + 320] = 255;
+
+    // Inject a clipped/saturated star at (210, 180) (flat 255 core)
+    for (int dy = -5; dy <= 5; ++dy) {
+        for (int dx = -5; dx <= 5; ++dx) {
+            const float g = 340.0f * std::exp(-(dx * dx + dy * dy) / (2.0f * 2.1f * 2.1f));
+            yPlane[static_cast<size_t>(180 + dy) * w + (210 + dx)] =
+                static_cast<uint8_t>(std::clamp(14.0f + g, 0.0f, 255.0f));
+        }
+    }
+
+    // Inject the ideal bright UNSATURATED focus star at (388, 266) (peak ~212)
+    const float targetX = 388.4f, targetY = 266.2f;
+    for (int dy = -8; dy <= 8; ++dy) {
+        for (int dx = -8; dx <= 8; ++dx) {
+            const float ddx = (388 + dx) - targetX;
+            const float ddy = (266 + dy) - targetY;
+            const float g = 198.0f * std::exp(-(ddx * ddx + ddy * ddy) / (2.0f * 1.9f * 1.9f));
+            yPlane[static_cast<size_t>(266 + dy) * w + (388 + dx)] =
+                static_cast<uint8_t>(std::clamp(14.0f + g, 0.0f, 255.0f));
+        }
+    }
+
+    const BestFocusStarResult r = findBestFocusStar(yPlane.data(), w, 1, w, h);
+    const float foundX = r.normX * w;
+    const float foundY = r.normY * h;
+
+    std::printf("[Test 13A] Auto Focus Star Finder: found=%d isStar=%d pos=(%.1f, %.1f) target=(%.1f, %.1f) snr=%.1f\n",
+                r.found ? 1 : 0, r.isStar ? 1 : 0, foundX, foundY, targetX, targetY, r.snr);
+
+    assert(r.found);
+    assert(r.isStar);
+    assert(std::abs(foundX - targetX) < 1.5f);
+    assert(std::abs(foundY - targetY) < 1.5f);
+
+    // Part B: Lunar high-contrast crater fallback when zero stars are present
+    std::vector<uint8_t> moonY(static_cast<size_t>(w) * h, 10);
+    for (int y = 160; y < 320; ++y) {
+        for (int x = 220; x < 420; ++x) {
+            const float rDist = std::hypot(x - 320.0f, y - 240.0f);
+            if (rDist < 75.0f) {
+                float v = 175.0f;
+                if (std::abs(rDist - 35.0f) < 3.0f) v = 240.0f;
+                else if (rDist < 32.0f) v = 60.0f;
+                moonY[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(v);
+            }
+        }
+    }
+    const BestFocusStarResult rMoon = findBestFocusStar(moonY.data(), w, 1, w, h);
+    std::printf("[Test 13B] Lunar Fallback Focus Finder: found=%d isStar=%d pos=(%.2f, %.2f)\n",
+                rMoon.found ? 1 : 0, rMoon.isStar ? 1 : 0, rMoon.normX, rMoon.normY);
+    assert(rMoon.found);
+    assert(!rMoon.isStar);
+    assert(rMoon.normX > 0.25f && rMoon.normX < 0.75f);
+    assert(rMoon.normY > 0.25f && rMoon.normY < 0.75f);
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== AstroPro 14U C++20 Engine Verification Suite ===\n");
+    std::printf("=== AstroPro 14U C++20 Engine Verification Suite (v2.0.0) ===\n");
     testFocusFwhmHfd();
     testTriangleAlignment();
     testKappaSigmaSatelliteRejection();
@@ -580,6 +1094,11 @@ int main() {
     testWaveletSharpening();
     testTiff16AndFits32Export();
     testFocusPeakingPoints();
-    std::printf("=== ALL 8 C++20 ASTRO ENGINE TESTS PASSED ===\n");
+    testAutoHorizonSkyGroundSeparation();
+    testHdrAstroFusion();
+    testDrizzle2xSuperResolution();
+    testRichardsonLucyAndChromaticAberration();
+    testAutoBestFocusStarFinder();
+    std::printf("=== ALL 13 C++20 ASTRO ENGINE TESTS PASSED ===\n");
     return 0;
 }

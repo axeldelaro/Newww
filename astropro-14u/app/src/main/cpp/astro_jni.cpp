@@ -26,6 +26,7 @@ struct AstroEngineContext {
     StackMode activeMode = StackMode::SINGLE_PRO;
     DeepSkyStacker deepSky;
     LuckyImagingStacker lucky;
+    HdrAstroStacker hdr;
     StarTrailsStacker starTrails;
     CalibrationBuilder calBuilder;
 
@@ -85,23 +86,26 @@ LabParams unpackLabParams(JNIEnv* env, jfloatArray arr) {
     if (!arr) return p;
     const jsize len = env->GetArrayLength(arr);
     if (len < 15) return p;
-    jfloat buf[15];
-    env->GetFloatArrayRegion(arr, 0, 15, buf);
-    p.autoStf           = buf[0] > 0.5f;
-    p.blackPoint        = buf[1];
-    p.midtones          = buf[2];
-    p.whitePoint        = buf[3];
-    p.asinhBeta         = buf[4];
-    p.bgRemovalStrength = buf[5];
-    p.bgNeutralize      = buf[6] > 0.5f;
-    p.scnrStrength      = buf[7];
-    p.waveletFine       = buf[8];
-    p.waveletMedium     = buf[9];
-    p.waveletCoarse     = buf[10];
-    p.denoiseStrength   = buf[11];
-    p.saturation        = buf[12];
-    p.temperature       = buf[13];
-    p.tint              = buf[14];
+    jfloat buf[17] = {};
+    const jsize count = std::min<jsize>(len, 17);
+    env->GetFloatArrayRegion(arr, 0, count, buf);
+    p.autoStf                = buf[0] > 0.5f;
+    p.blackPoint             = buf[1];
+    p.midtones               = buf[2];
+    p.whitePoint             = buf[3];
+    p.asinhBeta              = buf[4];
+    p.bgRemovalStrength      = buf[5];
+    p.bgNeutralize           = buf[6] > 0.5f;
+    p.scnrStrength           = buf[7];
+    p.waveletFine            = buf[8];
+    p.waveletMedium          = buf[9];
+    p.waveletCoarse          = buf[10];
+    p.denoiseStrength        = buf[11];
+    p.saturation             = buf[12];
+    p.temperature            = buf[13];
+    p.tint                   = buf[14];
+    if (count >= 16) p.deconvolution          = buf[15];
+    if (count >= 17) p.chromaticAberrationFix = buf[16];
     return p;
 }
 
@@ -312,23 +316,59 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeComputeFocusPea
     return count;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeFindBestFocusStar(
+    JNIEnv* env, jobject, jlong /*handle*/,
+    jobject yBuf, jint yRowStride, jint yPixelStride,
+    jint width, jint height,
+    jfloatArray outResult5
+) {
+    if (!yBuf || !outResult5 || env->GetArrayLength(outResult5) < 5) return JNI_FALSE;
+    auto* yPtr = static_cast<const uint8_t*>(env->GetDirectBufferAddress(yBuf));
+    if (!yPtr) return JNI_FALSE;
+
+    const BestFocusStarResult r = findBestFocusStar(yPtr, yRowStride, yPixelStride, width, height);
+    jfloat out[5] = {
+        r.found ? 1.0f : 0.0f,
+        r.isStar ? 1.0f : 0.0f,
+        r.normX,
+        r.normY,
+        r.snr
+    };
+    env->SetFloatArrayRegion(outResult5, 0, 5, out);
+    return r.found ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeStartStackSession(
     JNIEnv*, jobject, jlong handle,
-    jint modeInt, jfloat param1, jfloat param2, jfloat param3
+    jint modeInt, jfloat param1, jfloat param2, jfloat param3, jint flags
 ) {
     auto* ctx = reinterpret_cast<AstroEngineContext*>(handle);
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->mtx);
-    ctx->activeMode = static_cast<StackMode>(std::clamp(modeInt, 0, 4));
+    ctx->activeMode = static_cast<StackMode>(std::clamp(modeInt, 0, 5));
+    const bool landscapeMode = (flags & 1) != 0;
+    const bool drizzle2x = (flags & 2) != 0;
     switch (ctx->activeMode) {
         case StackMode::DEEP_SKY:
-            ctx->deepSky.reset(param1 > 0.5f ? param1 : 2.5f, param2 > 0.5f ? param2 : 3.0f);
+            ctx->deepSky.reset(
+                param1 > 0.5f ? param1 : 2.5f,
+                param2 > 0.5f ? param2 : 3.0f,
+                landscapeMode,
+                drizzle2x
+            );
             break;
         case StackMode::LUCKY_PLANETARY:
-            ctx->lucky.reset(static_cast<int>(std::max(5.0f, param1)),
-                             param2 > 0.01f ? param2 : 0.25f,
-                             param3);
+            ctx->lucky.reset(
+                static_cast<int>(std::max(5.0f, param1)),
+                param2 > 0.01f ? param2 : 0.25f,
+                param3,
+                drizzle2x
+            );
+            break;
+        case StackMode::HDR_ASTRO:
+            ctx->hdr.reset(static_cast<int>(std::clamp(param1, 2.0f, 7.0f)));
             break;
         case StackMode::STAR_TRAILS_STANDARD:
             ctx->starTrails.reset(false, 1.0f);
@@ -341,12 +381,22 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeStartStackSessi
     }
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeHasDetectedForeground(
+    JNIEnv*, jobject, jlong handle
+) {
+    auto* ctx = reinterpret_cast<AstroEngineContext*>(handle);
+    if (!ctx) return JNI_FALSE;
+    std::lock_guard<std::mutex> lock(ctx->mtx);
+    return ctx->deepSky.hasDetectedForeground() ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeAddRawFrame(
     JNIEnv* env, jobject, jlong handle,
     jobject rawBuf, jint width, jint height, jint rowStrideBytes,
     jint cfaInt, jfloatArray blackLevel4, jfloat whiteLevel,
-    jfloatArray wbGains3, jboolean bin2x2,
+    jfloatArray wbGains3, jboolean bin2x2, jfloat evMultiplier,
     jobject livePreviewBitmap, jfloatArray outStats
 ) {
     auto* ctx = reinterpret_cast<AstroEngineContext*>(handle);
@@ -395,6 +445,11 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeAddRawFrame(
         if (livePreviewBitmap != nullptr && rgb.valid()) {
             renderImageToAndroidBitmap(env, rgb, livePreviewBitmap, true);
         }
+    } else if (ctx->activeMode == StackMode::HDR_ASTRO) {
+        rep = ctx->hdr.addBracket(rgb, evMultiplier > 1e-4f ? evMultiplier : 1.0f);
+        if (livePreviewBitmap != nullptr && rgb.valid()) {
+            renderImageToAndroidBitmap(env, rgb, livePreviewBitmap, true);
+        }
     } else if (ctx->activeMode == StackMode::STAR_TRAILS_STANDARD ||
                ctx->activeMode == StackMode::STAR_TRAILS_COMET) {
         rep = ctx->starTrails.addFrame(rgb);
@@ -425,7 +480,7 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeAddYuvFrame(
     jobject yBuf, jint yRowStride, jint yPixelStride,
     jobject uBuf, jint uRowStride, jint uPixelStride,
     jobject vBuf, jint vRowStride, jint vPixelStride,
-    jint width, jint height, jint downsampleStep,
+    jint width, jint height, jint downsampleStep, jfloat evMultiplier,
     jobject livePreviewBitmap, jfloatArray outStats
 ) {
     auto* ctx = reinterpret_cast<AstroEngineContext*>(handle);
@@ -461,6 +516,11 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeAddYuvFrame(
         }
     } else if (ctx->activeMode == StackMode::LUCKY_PLANETARY) {
         rep = ctx->lucky.addFrame(rgb);
+        if (livePreviewBitmap != nullptr && rgb.valid()) {
+            renderImageToAndroidBitmap(env, rgb, livePreviewBitmap, true);
+        }
+    } else if (ctx->activeMode == StackMode::HDR_ASTRO) {
+        rep = ctx->hdr.addBracket(rgb, evMultiplier > 1e-4f ? evMultiplier : 1.0f);
         if (livePreviewBitmap != nullptr && rgb.valid()) {
             renderImageToAndroidBitmap(env, rgb, livePreviewBitmap, true);
         }
@@ -507,6 +567,9 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeFinishStackSess
     } else if (ctx->activeMode == StackMode::LUCKY_PLANETARY) {
         ctx->lucky.finalize(result);
         stackCnt = std::max(1, ctx->lucky.receivedCount());
+    } else if (ctx->activeMode == StackMode::HDR_ASTRO) {
+        stackCnt = std::max(1, ctx->hdr.bracketCount());
+        ctx->hdr.finalize(result);
     } else if (ctx->activeMode == StackMode::STAR_TRAILS_STANDARD ||
                ctx->activeMode == StackMode::STAR_TRAILS_COMET) {
         result = ctx->starTrails.currentImage();
@@ -539,8 +602,11 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeFinishStackSess
     if (outPreviewBitmap != nullptr && ctx->labProxy.valid()) {
         FloatImageRGB stretched;
         LabParams lp{};
-        lp.autoStf = (ctx->activeMode == StackMode::DEEP_SKY || ctx->activeMode == StackMode::SINGLE_PRO);
-        lp.bgNeutralize = (ctx->activeMode == StackMode::DEEP_SKY);
+        lp.autoStf = (ctx->activeMode == StackMode::DEEP_SKY ||
+                      ctx->activeMode == StackMode::SINGLE_PRO ||
+                      ctx->activeMode == StackMode::HDR_ASTRO);
+        lp.bgNeutralize = (ctx->activeMode == StackMode::DEEP_SKY || ctx->activeMode == StackMode::HDR_ASTRO);
+        lp.chromaticAberrationFix = 0.65f;
         processAstroLab(ctx->labProxy, lp, stretched);
         renderImageToAndroidBitmap(env, stretched, outPreviewBitmap, !lp.autoStf);
     }

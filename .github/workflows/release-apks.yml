@@ -148,7 +148,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
-          TAG="${TAG:-v1.2.0}"
+          TAG="${TAG:-v2.0.0}"
           APK_K="/tmp/release-apks/Kinetix-Coach-${TAG}-arm64.apk"
           APK_A="/tmp/release-apks/AstroPro-14U-${TAG}-arm64.apk"
           ls -lh /tmp/release-apks/
@@ -157,24 +157,26 @@ jobs:
           cat > /tmp/release-notes.md <<EOF
           ## 2 Applications Android 100 % Hors-Ligne Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
-          ### 1. KINETIX Coach v1.2.0 (\`Kinetix-Coach-${TAG}-arm64.apk\`)
-          - **Vision Biomécanique 3D Multi-Angles (\`worldLandmarks\` + Filtre One-Euro)** : mesure les vrais angles articulaires en 3D métrique indépendamment de l'angle de la caméra (**Face 0°, 3/4 45°, Profil 90°, Dos 180°**) avec détection en direct de l'angle caméra, symétrie gauche/droite, valgus 3D et alertes de cadrage.
-          - **Détection Automatique de l'Exercice en Direct (\`AUTO\` / \`FIXE\`)** : identifie automatiquement l'exercice pratiqué parmi les 16 mouvements selon la cinématique temps réel (avec hystérésis anti-clignotement et cumul multi-exercices dans la séance).
-          - **Calories Dépensées en Direct selon la Série & le Profil** : calcul MET corrigé (Mifflin-St Jeor sur poids/taille/âge/sexe du profil) + travail mécanique ajusté par la ROM % et le tempo, affiché en live dans le HUD, enregistré dans l'historique (SQLite v2) et transmis au Coach IA.
-          - **Corrections Visuelles & Vocales Précises au Degré Près** : arcs rapporteurs colorés, ligne fantôme pointillée de la posture idéale, flèches directionnelles sur le squelette et consigne chiffrée (\`114° → ≤95°\`).
-          - **42 vidéos explicatives biomécaniques MP4 H.264** (100 % des 16 exos Vision + 911/911 exos Encyclopédie, ralenti \`0.5× / 1.0× / 1.5×\`), minuteur de repos intelligent, **LLM local \`Gemma-3 1B Q4_K_M\` intégré** + **2 683 fiches SQLite FTS5**.
-          - **SHA-256** : \`$SHA_K\`
-
-          ### 2. AstroPro 14U v1.1.0 (\`AstroPro-14U-${TAG}-arm64.apk\`)
-          - **Guide & Exemples photo par mode (style Xiaomi HyperOS)** : **6 exemples photo astrophotographiques réalistes** (1 par mode), **4 points explicatifs brefs** et bouton 1-tap **« Appliquer ces réglages »** (100 % Vision Nocturne OLED rouge).
-          - **Focus Peaking C++ temps réel** (\`~0,3 ms\`), anneau compte à rebours pose longue + ETA empilement, **Presets 1-tap Labo 16-bit**, persistance des préférences.
-          - **Moteur C++20 16-bit & Xiaomi 14 Ultra** : détection multi-objectifs (12mm / 23mm f/1.63–f/4.0 / 75mm / 120mm, sonde HAL 0..64), RAW DNG, Live Stacking Kappa-Sigma, Lucky Imaging + ondelettes, Star Trails, Timelapse MP4, exports TIFF 16-bit / FITS 32-bit, Éphémérides Jean Meeus.
+          ### 1. AstroPro 14U v2.0.0 (\`AstroPro-14U-${TAG}-arm64.apk\`)
+          - **#1 Auto-Focus Étoiles (Courbe en V) + Infini mémorisé par objectif** : repère automatiquement l'étoile optimale non saturée, balaie 12 pas fins autour de l'infini, verrouille le minimum FWHM/HFD et sauvegarde l'infini calibré par objectif (\`12 / 23 / 75 / 120 mm\`).
+          - **#2 AR Sky Overlay sur le viseur (toggle 1-tap \`AR\`)** : projette l'arche de la Voie Lactée, Polaris et les 12 cibles majeures (M31, M42, M45, Lune, planètes) selon le champ réel (\`FOV\`) de l'objectif actif + flèche de guidage vers la cible (100 % Vision Nocturne OLED rouge).
+          - **#3 Paysage + Ciel Séparé 100 % Automatique** : détecte automatiquement l'horizon en C++20 ; aligne le ciel sur les étoiles tout en gardant le sol/montagne parfaitement fixe et net sans flou de bougé (zéro tracé manuel).
+          - **#4 Mode HDR Astro Automatique (\`3 EV / 5 EV\`)** : bracket automatique + fusion HDR 32-bit float linéaire préservant le cœur des nébuleuses (M42 Orion) et la Lune sans surexposition (+ exemple photo & guide 4 points).
+          - **#6 Super-Résolution Drizzle 2×** : reconstruction sub-pixel Fruchter & Hook activable en 1 tap dans *Ciel Profond* et *Lune / Planètes*.
+          - **#9 Déconvolution Richardson-Lucy + Anti-Aberration Chromatique automatiques** : appliquées automatiquement en fin de capture + réglables dans le Labo 16-bit.
+          - **#11 Garde Anti-Vibration / Coup de Vent Automatique** : surveillance gyroscope + accéléromètre haute fréquence qui stabilise avant la prise, rejette et refait automatiquement toute pose secouée par le vent.
+          - **Pipeline Post-Capture Zéro Effort** : développement Auto-STF + retrait gradient + Anti-CA + netteté appliqués automatiquement, JPEG HD prêt à partager dans \`DCIM/AstroPro14U\` + master 32-bit \`.astro32\` conservé.
           - **SHA-256** : \`$SHA_A\`
+
+          ### 2. KINETIX Coach v1.2.0 (\`Kinetix-Coach-${TAG}-arm64.apk\`)
+          - **Vision Biomécanique 3D Multi-Angles (\`worldLandmarks\` + Filtre One-Euro)** : vrais angles articulaires 3D sous tous les angles de caméra (Face 0°, 3/4 45°, Profil 90°, Dos 180°), détection automatique des 16 exercices (\`AUTO\`/\`FIXE\`), calories dépensées selon la série et le profil, corrections visuelles/vocales au degré près (ligne fantôme + flèches + rapporteurs).
+          - **42 vidéos biomécaniques MP4 H.264** (100 % des 16 exos Vision + 911/911 exos Encyclopédie, ralenti \`0.5× / 1.0× / 1.5×\`), **LLM local \`Gemma-3 1B Q4_K_M\` intégré** + **2 683 fiches SQLite FTS5**.
+          - **SHA-256** : \`$SHA_K\`
           EOF
           gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
           gh release create "$TAG" \
-            "$APK_K" \
             "$APK_A" \
+            "$APK_K" \
             --repo "${{ github.repository }}" \
-            --title "${TAG} — KINETIX Coach 3D Multi-Angles (Auto-Exo, Calories, Corrections) & AstroPro 14U" \
+            --title "${TAG} — AstroPro 14U v2.0 (AF Courbe V, AR Ciel, Paysage+Ciel Auto, HDR, Drizzle 2x, Anti-Vent) & KINETIX Coach v1.2" \
             --notes-file /tmp/release-notes.md

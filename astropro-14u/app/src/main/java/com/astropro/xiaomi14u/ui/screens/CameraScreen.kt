@@ -62,6 +62,9 @@ import com.astropro.xiaomi14u.camera.ModeOptions
 import com.astropro.xiaomi14u.camera.NpfCalculator
 import com.astropro.xiaomi14u.camera.ProDialType
 import com.astropro.xiaomi14u.camera.StarTrailStyle
+import com.astropro.xiaomi14u.ephemeris.ArSkyProjector
+import com.astropro.xiaomi14u.ui.components.ArSkyOverlay
+import com.astropro.xiaomi14u.ui.components.AutoFocusVCurvePill
 import com.astropro.xiaomi14u.ui.components.FocusPeakingOverlay
 import com.astropro.xiaomi14u.ui.components.GridAndBubbleLevelOverlay
 import com.astropro.xiaomi14u.ui.components.LiveCaptureHudOverlay
@@ -79,8 +82,8 @@ import kotlin.math.abs
 
 /**
  * Main Camera Viewfinder faithfully modeled after Xiaomi HyperOS Leica Camera Pro:
- *   1. 48dp Pure OLED Black Top Icon Bar
- *   2. 4:3 Viewfinder (telemetry, live RGB histogram, 2-axis bubble level, focus peaking, 10x FWHM focus loupe, floating lens pill)
+ *   1. 48dp Pure OLED Black Top Icon Bar (Vision Nocturne · AR · Format · Timer · NPF · Grille · Menu)
+ *   2. 4:3 Viewfinder (telemetry, live RGB histogram, AR Sky Overlay, 2-axis bubble level, focus peaking, 10x FWHM loupe, V-Curve AF pill, floating lens pill)
  *   3. Mode-specific compact options strip + 1-tap Mode Guide button
  *   4. Slide-up Xiaomi Horizontal Precision Tick-Wheel Dial
  *   5. 6 Pro Manual Tiles (WB · F · S · ISO · f/ · EV)
@@ -93,12 +96,17 @@ fun CameraScreen(
     onAttachTextureView: (TextureView) -> Unit,
     onRequestPermission: () -> Unit,
     onToggleNightVision: () -> Unit,
+    onToggleArSky: () -> Unit,
     onCycleFormat: () -> Unit,
     onCycleTimer: () -> Unit,
     onSnapNpf: () -> Unit,
     onToggleGridLevel: () -> Unit,
     onToggleHistogram: () -> Unit,
     onToggleFocusPeaking: () -> Unit,
+    onToggleVibrationGuard: () -> Unit,
+    onStartStarAutoFocus: () -> Unit,
+    onCancelStarAutoFocus: () -> Unit,
+    onSnapCalibratedInfinity: () -> Unit,
     onToggleTopMenu: () -> Unit,
     onOpenModeGuide: () -> Unit,
     onDismissModeGuide: () -> Unit,
@@ -137,7 +145,7 @@ fun CameraScreen(
                     .fillMaxWidth()
                     .height(48.dp)
                     .background(colors.background)
-                    .padding(horizontal = 10.dp),
+                    .padding(horizontal = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -150,9 +158,16 @@ fun CameraScreen(
                         imageVector = Icons.Outlined.RemoveRedEye,
                         contentDescription = "Vision Nocturne",
                         tint = if (state.nightVision) colors.accent else colors.textPrimary,
-                        modifier = Modifier.size(21.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
+
+                // 1-Tap Augmented Reality Sky Overlay (OFF by default)
+                TopBarToggleBadge(
+                    text = "AR",
+                    active = state.arSkyOverlayEnabled,
+                    onClick = onToggleArSky
+                )
 
                 // Output Format (DNG 16b / RAW+JPG)
                 TopBarTextBadge(
@@ -298,6 +313,40 @@ fun CameraScreen(
                         GridAndBubbleLevelOverlay(orientation = orientation)
                     }
 
+                    // Augmented Reality Astronomical Sky Overlay (Milky Way Plane + 12 Targets + Smart Guidance)
+                    if (state.arSkyOverlayEnabled && !state.captureProgress.active && !state.usingFront && lens != null) {
+                        val arFov = remember(lens.id, lens.focalLengthMm, lens.sensorWidthMm, lens.sensorHeightMm) {
+                            ArSkyProjector.computePortraitFov(
+                                focalLengthMm = lens.focalLengthMm,
+                                sensorWidthMm = lens.sensorWidthMm,
+                                sensorHeightMm = lens.sensorHeightMm
+                            )
+                        }
+                        val arFrame = remember(
+                            orientation.cameraAzimuthDeg,
+                            orientation.cameraAltitudeDeg,
+                            orientation.cameraRollDeg,
+                            arFov,
+                            state.targets,
+                            state.captureMode,
+                            state.compassTargetId,
+                            state.location
+                        ) {
+                            ArSkyProjector.projectOverlay(
+                                epochMillis = System.currentTimeMillis(),
+                                location = state.location,
+                                camAzDeg = orientation.cameraAzimuthDeg.toDouble(),
+                                camAltDeg = orientation.cameraAltitudeDeg.toDouble(),
+                                camRollDeg = orientation.cameraRollDeg.toDouble(),
+                                fov = arFov,
+                                targets = state.targets,
+                                captureMode = state.captureMode,
+                                selectedTargetId = state.compassTargetId
+                            )
+                        }
+                        ArSkyOverlay(frame = arFrame)
+                    }
+
                     // Real-Time Focus Peaking Overlay (Lunar craters, horizon, pinpoint stars)
                     if (state.focusPeakingEnabled && !state.captureProgress.active && state.focusPeaking.pointCount > 0) {
                         FocusPeakingOverlay(
@@ -345,14 +394,27 @@ fun CameraScreen(
                         )
                     }
 
-                    // Interactive 10x Star Focus Loupe (with real-time C++20 FWHM & HFD!)
+                    // Interactive 10x Star Focus Loupe (with real-time C++20 FWHM, HFD & 1-tap AF ★!)
                     if (state.focusLoupe.enabled && !state.captureProgress.active) {
                         StarFocusLoupeOverlay(
                             loupe = state.focusLoupe,
+                            isAutoFocusing = state.autoFocus.running,
+                            onAutoFocus = onStartStarAutoFocus,
                             onClose = { onToggleFocusLoupe(null, null) },
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .padding(start = 8.dp, top = 36.dp)
+                        )
+                    }
+
+                    // Compact Translucent V-Curve Star Autofocus Sweep Pill (auto-dismisses once locked)
+                    if (state.autoFocus.running && !state.captureProgress.active) {
+                        AutoFocusVCurvePill(
+                            autoFocus = state.autoFocus,
+                            onCancel = onCancelStarAutoFocus,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(end = 8.dp, top = if (state.showHistogram) 82.dp else 36.dp)
                         )
                     }
 
@@ -443,13 +505,18 @@ fun CameraScreen(
             // 4. SLIDE-UP XIAOMI PRO PRECISION TICK-WHEEL DIAL (when tile active)
             // =================================================================
             val openDial = state.activeDial
+            val calibratedInf = lens?.let { state.calibratedInfinityByLens[it.id] } ?: 0.0f
             if (openDial != null && lens != null) {
                 ActiveProDialSection(
                     dialType = openDial,
                     lens = lens,
                     manual = manual,
+                    calibratedInfinity = calibratedInf,
+                    isAutoFocusing = state.autoFocus.running,
                     focusPeakingEnabled = state.focusPeakingEnabled,
                     onToggleFocusPeaking = onToggleFocusPeaking,
+                    onStartStarAutoFocus = onStartStarAutoFocus,
+                    onSnapCalibratedInfinity = onSnapCalibratedInfinity,
                     onUpdateManual = onUpdateManual,
                     onSnapNpf = onSnapNpf,
                     onDismiss = onDismissDial
@@ -478,7 +545,7 @@ fun CameraScreen(
                     label = "F",
                     value = when {
                         manual.focusAuto -> "AUTO"
-                        manual.focusDistance <= 0.02f -> "∞"
+                        manual.focusDistance <= 0.02f || abs(manual.focusDistance - calibratedInf) <= 0.015f -> "∞"
                         else -> String.format(Locale.US, "%.2f", manual.focusDistance)
                     },
                     isManualActive = !manual.focusAuto,
@@ -643,6 +710,7 @@ fun CameraScreen(
         // SLIDE-DOWN HYPEROS PRO TOP MENU DRAWER
         // =================================================================
         if (state.showTopMenu) {
+            val calInfForActiveLens = lens?.let { state.calibratedInfinityByLens[it.id] }
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -684,13 +752,57 @@ fun CameraScreen(
                                 style = tabularStyle(size = 11.5.sp, weight = FontWeight.SemiBold, color = colors.textPrimary)
                             )
                             Text(
-                                text = "6 modes · Photos de référence & réglages 1-tap Xiaomi 14U",
+                                text = "7 modes · Photos de référence & réglages 1-tap Xiaomi 14U",
                                 style = tabularStyle(size = 9.5.sp, color = colors.textSecondary)
                             )
                         }
                     }
                     Text(
                         text = "OUVRIR",
+                        style = tabularStyle(size = 10.sp, weight = FontWeight.Bold, color = colors.accent)
+                    )
+                }
+
+                // 1-Tap Star V-Curve Autofocus + Per-Lens Infinity Memory
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(colors.surface)
+                        .border(
+                            0.75.dp,
+                            if (state.autoFocus.running) colors.accent else colors.borderSubtle,
+                            RoundedCornerShape(5.dp)
+                        )
+                        .clickable {
+                            onToggleTopMenu()
+                            onStartStarAutoFocus()
+                        }
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Auto-Focus Étoiles (Courbe en V)",
+                            style = tabularStyle(size = 11.5.sp, weight = FontWeight.SemiBold, color = colors.textPrimary)
+                        )
+                        Text(
+                            text = if (calInfForActiveLens != null) {
+                                String.format(
+                                    Locale.US,
+                                    "∞ calibré sur %s : %.2f D · Recalibrer",
+                                    lens.displayName,
+                                    calInfForActiveLens
+                                )
+                            } else {
+                                "Détection auto étoile + mémoire infini par objectif"
+                            },
+                            style = tabularStyle(size = 9.5.sp, color = colors.textSecondary)
+                        )
+                    }
+                    Text(
+                        text = if (state.autoFocus.running) "EN COURS" else "AF ★",
                         style = tabularStyle(size = 10.sp, weight = FontWeight.Bold, color = colors.accent)
                     )
                 }
@@ -726,17 +838,29 @@ fun CameraScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     MenuToggleChip(
+                        label = "Anti-Vent",
+                        active = state.vibrationGuardEnabled,
+                        onClick = onToggleVibrationGuard,
+                        modifier = Modifier.weight(1f)
+                    )
+                    MenuToggleChip(
                         label = "PEAK",
                         active = state.focusPeakingEnabled,
                         onClick = onToggleFocusPeaking,
-                        modifier = Modifier.weight(0.75f)
+                        modifier = Modifier.weight(0.8f)
                     )
                     MenuToggleChip(
                         label = "Histogramme",
                         active = state.showHistogram,
                         onClick = onToggleHistogram,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1.1f)
                     )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     MenuToggleChip(
                         label = "Écran tamisé",
                         active = state.dimScreenDuringStack,
@@ -744,13 +868,13 @@ fun CameraScreen(
                         modifier = Modifier.weight(1f)
                     )
                     MenuToggleChip(
-                        label = if (state.usingFront) "Arrière" else "Frontal",
+                        label = if (state.usingFront) "Objectif Arrière" else "Objectif Frontal",
                         active = state.usingFront,
                         onClick = {
                             onToggleFrontRear()
                             onToggleTopMenu()
                         },
-                        modifier = Modifier.weight(0.75f)
+                        modifier = Modifier.weight(1f)
                     )
                 }
             }
@@ -794,8 +918,12 @@ private fun ActiveProDialSection(
     dialType: ProDialType,
     lens: LensInfo,
     manual: ManualSettings,
+    calibratedInfinity: Float,
+    isAutoFocusing: Boolean,
     focusPeakingEnabled: Boolean,
     onToggleFocusPeaking: () -> Unit,
+    onStartStarAutoFocus: () -> Unit,
+    onSnapCalibratedInfinity: () -> Unit,
     onUpdateManual: ((ManualSettings) -> ManualSettings) -> Unit,
     onSnapNpf: () -> Unit,
     onDismiss: () -> Unit
@@ -829,8 +957,15 @@ private fun ActiveProDialSection(
                     t * t * maxD
                 }
             }
-            val labels = remember(steps) {
-                steps.mapIndexed { idx, d -> if (idx == 0) "∞ (0.00)" else String.format(Locale.US, "%.2f", d) }
+            val labels = remember(steps, calibratedInfinity) {
+                steps.mapIndexed { idx, d ->
+                    when {
+                        idx == 0 && calibratedInfinity <= 0.01f -> "∞ (0.00)"
+                        calibratedInfinity > 0.01f && abs(d - calibratedInfinity) < 0.012f ->
+                            String.format(Locale.US, "∞ (%.2f)", calibratedInfinity)
+                        else -> String.format(Locale.US, "%.2f", d)
+                    }
+                }
             }
             val idx = steps.indices.minByOrNull { abs(steps[it] - manual.focusDistance) } ?: 0
             XiaomiProTickDial(
@@ -842,10 +977,13 @@ private fun ActiveProDialSection(
                 quickActionActive = manual.focusAuto,
                 onQuickAction = { onUpdateManual { it.copy(focusAuto = !it.focusAuto) } },
                 secondaryActionLabel = "∞",
-                onSecondaryAction = { onUpdateManual { it.copy(focusAuto = false, focusDistance = 0.0f) } },
-                tertiaryActionLabel = "PEAK",
-                tertiaryActionActive = focusPeakingEnabled,
-                onTertiaryAction = onToggleFocusPeaking,
+                onSecondaryAction = onSnapCalibratedInfinity,
+                tertiaryActionLabel = "AF ★",
+                tertiaryActionActive = isAutoFocusing,
+                onTertiaryAction = onStartStarAutoFocus,
+                quaternaryActionLabel = "PEAK",
+                quaternaryActionActive = focusPeakingEnabled,
+                onQuaternaryAction = onToggleFocusPeaking,
                 onDismiss = onDismiss
             )
         }
@@ -963,7 +1101,7 @@ private fun ModeOptionsBar(
                         onClick = onToggleFocusPeaking
                     )
                     Text(
-                        text = "Pose unique RAW 16-bit linéaire · DNG + .astro32",
+                        text = "Pose unique RAW 16-bit · Dév. Auto Galerie + .astro32",
                         style = tabularStyle(size = 10.sp, color = colors.textSecondary),
                         maxLines = 1
                     )
@@ -975,6 +1113,14 @@ private fun ModeOptionsBar(
                     ModeOptionChip("Poses: ${options.deepSkyFrames}", true) {
                         onUpdate { it.copy(deepSkyFrames = nextCount) }
                     }
+                    ModeOptionChip(
+                        label = "Paysage Auto",
+                        highlighted = options.deepSkyLandscapeAuto
+                    ) { onUpdate { it.copy(deepSkyLandscapeAuto = !it.deepSkyLandscapeAuto) } }
+                    ModeOptionChip(
+                        label = "Drizzle 2×",
+                        highlighted = options.deepSkyDrizzle2x
+                    ) { onUpdate { it.copy(deepSkyDrizzle2x = !it.deepSkyDrizzle2x) } }
                     ModeOptionChip(
                         "Dark ${if (hasDark && options.useAutoDark) "✓" else "OFF"}",
                         hasDark && options.useAutoDark
@@ -1003,6 +1149,10 @@ private fun ModeOptionsBar(
                         onUpdate { it.copy(planetaryKeepPercent = nextPct) }
                     }
                     ModeOptionChip(
+                        label = "Drizzle 2×",
+                        highlighted = options.planetaryDrizzle2x
+                    ) { onUpdate { it.copy(planetaryDrizzle2x = !it.planetaryDrizzle2x) } }
+                    ModeOptionChip(
                         "Ondelettes Auto: ${if (options.planetaryAutoWavelets) "ON" else "OFF"}",
                         options.planetaryAutoWavelets
                     ) { onUpdate { it.copy(planetaryAutoWavelets = !it.planetaryAutoWavelets) } }
@@ -1020,6 +1170,21 @@ private fun ModeOptionsBar(
                             onUpdate { it.copy(cometTailLength = nextLen) }
                         }
                     }
+                }
+
+                CaptureMode.HDR_ASTRO -> {
+                    val isFive = options.hdrBrackets == 5
+                    ModeOptionChip(
+                        label = if (isFive) "5 EV (-3..+3)" else "3 EV (-2/0/+2)",
+                        highlighted = true
+                    ) {
+                        onUpdate { it.copy(hdrBrackets = if (it.hdrBrackets == 3) 5 else 3) }
+                    }
+                    Text(
+                        text = "Fusion 32-bit linéaire · Cœur préservé · Auto-STF",
+                        style = tabularStyle(size = 10.sp, color = colors.textSecondary),
+                        maxLines = 1
+                    )
                 }
 
                 CaptureMode.TIMELAPSE -> {
@@ -1165,6 +1330,32 @@ private fun TopBarIconItem(active: Boolean, onClick: () -> Unit, content: @Compo
         contentAlignment = Alignment.Center
     ) {
         content()
+    }
+}
+
+@Composable
+private fun TopBarToggleBadge(text: String, active: Boolean, onClick: () -> Unit) {
+    val colors = LocalAstroColors.current
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(if (active) colors.accent.copy(alpha = 0.16f) else Color.Transparent)
+            .border(
+                0.75.dp,
+                if (active) colors.accent else colors.borderSubtle,
+                RoundedCornerShape(4.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 7.dp, vertical = 3.dp)
+    ) {
+        Text(
+            text = text,
+            style = tabularStyle(
+                size = 10.5.sp,
+                weight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                color = if (active) colors.accent else colors.textSecondary
+            )
+        )
     }
 }
 

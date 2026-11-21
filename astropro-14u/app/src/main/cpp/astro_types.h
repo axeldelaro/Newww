@@ -21,7 +21,8 @@ enum class StackMode : int {
     LUCKY_PLANETARY = 1,
     STAR_TRAILS_STANDARD = 2,
     STAR_TRAILS_COMET = 3,
-    SINGLE_PRO = 4
+    SINGLE_PRO = 4,
+    HDR_ASTRO = 5
 };
 
 enum class CalibrationType : int {
@@ -124,6 +125,15 @@ struct FocusMetrics {
     int starFound = 0;
 };
 
+struct BestFocusStarResult {
+    bool found = false;
+    bool isStar = false; // true = unsaturated star, false = sharp lunar/horizon peak fallback
+    float normX = 0.5f;  // [0..1] in YUV frame
+    float normY = 0.5f;  // [0..1] in YUV frame
+    float peak = 0.0f;
+    float snr = 0.0f;
+};
+
 struct AlignResult {
     bool success = false;
     float dx = 0.0f;
@@ -153,20 +163,22 @@ struct FrameStackReport {
 
 struct LabParams {
     bool autoStf = true;
-    float blackPoint = 0.0f;      // [0.0 .. 0.5]
-    float midtones = 0.5f;        // [0.01 .. 0.99] MTF parameter (0.5 = identity)
-    float whitePoint = 1.0f;      // [0.5 .. 1.0]
-    float asinhBeta = 0.0f;       // [0 .. 100] Lupton arcsinh stretch strength
-    float bgRemovalStrength = 0.0f; // [0 .. 1] 2D quadratic polynomial background extraction
-    bool bgNeutralize = true;     // Align sky RGB medians
-    float scnrStrength = 0.0f;    // [0 .. 1] Green cast removal (SCNR Average Neutral)
-    float waveletFine = 0.0f;     // [-1 .. 3] À Trous scale 1
-    float waveletMedium = 0.0f;   // [-1 .. 3] À Trous scale 2
-    float waveletCoarse = 0.0f;   // [-1 .. 3] À Trous scale 3
-    float denoiseStrength = 0.0f; // [0 .. 1] Edge/star-preserving bilateral denoise
-    float saturation = 1.0f;      // [0 .. 2.0]
-    float temperature = 0.0f;     // [-1 .. 1]
-    float tint = 0.0f;            // [-1 .. 1]
+    float blackPoint = 0.0f;            // [0.0 .. 0.5]
+    float midtones = 0.5f;              // [0.01 .. 0.99] MTF parameter (0.5 = identity)
+    float whitePoint = 1.0f;            // [0.5 .. 1.0]
+    float asinhBeta = 0.0f;             // [0 .. 100] Lupton arcsinh stretch strength
+    float bgRemovalStrength = 0.0f;     // [0 .. 1] 2D quadratic polynomial background extraction
+    bool bgNeutralize = true;           // Align sky RGB medians
+    float scnrStrength = 0.0f;          // [0 .. 1] Green cast removal (SCNR Average Neutral)
+    float waveletFine = 0.0f;           // [-1 .. 3] À Trous scale 1
+    float waveletMedium = 0.0f;         // [-1 .. 3] À Trous scale 2
+    float waveletCoarse = 0.0f;         // [-1 .. 3] À Trous scale 3
+    float denoiseStrength = 0.0f;       // [0 .. 1] Edge/star-preserving bilateral denoise
+    float saturation = 1.0f;            // [0 .. 2.0]
+    float temperature = 0.0f;           // [-1 .. 1]
+    float tint = 0.0f;                  // [-1 .. 1]
+    float deconvolution = 0.0f;         // [0 .. 1] Regularized Richardson-Lucy deconvolution
+    float chromaticAberrationFix = 0.0f;// [0 .. 1] Radial lateral CA + purple/green fringe fix
 };
 
 struct AstroMetadata {
@@ -241,6 +253,11 @@ int computeFocusPeakingPoints(
     float* outNormXY
 );
 
+BestFocusStarResult findBestFocusStar(
+    const uint8_t* yPlane, int yRowStride, int yPixelStride,
+    int width, int height
+);
+
 // ---------------- star_engine.cpp ----------------
 FocusMetrics measureFocusCrop(const float* luma, int w, int h);
 
@@ -268,14 +285,37 @@ AlignResult alignPlanetaryTranslation(
 );
 
 // ---------------- stacker_engine.cpp ----------------
+bool autoDetectHorizon(const FloatImageRGB& refFrame, std::vector<float>& horizonY);
+
+class Drizzle2xAccumulator {
+public:
+    void reset(int baseW, int baseH, float pixfrac = 0.72f);
+    void addFrame(const FloatImageRGB& src, const float matrix[6], const std::vector<uint8_t>* rejectMask = nullptr);
+    void finalize(FloatImageRGB& out) const;
+    int outWidth() const { return outW_; }
+    int outHeight() const { return outH_; }
+    int frameCount() const { return frameCount_; }
+
+private:
+    int baseW_ = 0;
+    int baseH_ = 0;
+    int outW_ = 0;
+    int outH_ = 0;
+    float pixfrac_ = 0.72f;
+    int frameCount_ = 0;
+    std::vector<float> sumR_, sumG_, sumB_, weight_;
+};
+
 class DeepSkyStacker {
 public:
-    void reset(float kappa = 2.5f, float maxResidualPx = 3.0f);
+    void reset(float kappa = 2.5f, float maxResidualPx = 3.0f, bool landscapeMode = false, bool drizzle2x = false);
     FrameStackReport addFrame(const FloatImageRGB& frame);
     void getCurrentImage(FloatImageRGB& out) const;
     int acceptedCount() const { return accepted_; }
     int rejectedCount() const { return rejected_; }
     float avgResidual() const { return alignedCount_ > 0 ? static_cast<float>(sumResidual_ / alignedCount_) : 0.0f; }
+    bool hasDetectedForeground() const { return hasForeground_; }
+    const std::vector<float>& horizonContour() const { return horizonY_; }
 
 private:
     struct CompactFrame16 {
@@ -290,6 +330,9 @@ private:
 
     float kappa_ = 2.5f;
     float maxResidualPx_ = 3.0f;
+    bool landscapeMode_ = false;
+    bool drizzle2x_ = false;
+    bool hasForeground_ = false;
     int width_ = 0;
     int height_ = 0;
     int received_ = 0;
@@ -310,11 +353,19 @@ private:
     std::vector<float> meanR_, meanG_, meanB_;
     std::vector<float> m2R_, m2G_, m2B_;
     std::vector<uint16_t> count_;
+
+    // Automatic horizon sky/ground separation (Sequator-style ground-locked accumulator)
+    std::vector<float> horizonY_;
+    std::vector<float> fgSumR_, fgSumG_, fgSumB_;
+    int fgCount_ = 0;
+
+    // Optional Drizzle 2x sub-pixel reconstruction
+    Drizzle2xAccumulator drizzle_;
 };
 
 class LuckyImagingStacker {
 public:
-    void reset(int targetFrames, float keepPercent, float waveletStrength);
+    void reset(int targetFrames, float keepPercent, float waveletStrength, bool enableDrizzle2x = false);
     FrameStackReport addFrame(const FloatImageRGB& frame);
     bool finalize(FloatImageRGB& out);
     int acceptedCount() const { return static_cast<int>(pool_.size()); }
@@ -331,8 +382,26 @@ private:
 
     int maxKeep_ = 12;
     float waveletStrength_ = 1.0f;
+    bool drizzle2x_ = false;
     int received_ = 0;
     std::vector<ScoredFrame> pool_;
+};
+
+class HdrAstroStacker {
+public:
+    void reset(int expectedBrackets = 3);
+    FrameStackReport addBracket(const FloatImageRGB& frame, float evMultiplier);
+    bool finalize(FloatImageRGB& out);
+    int bracketCount() const { return static_cast<int>(brackets_.size()); }
+
+private:
+    struct BracketFrame {
+        FloatImageRGB img;
+        float evMultiplier = 1.0f;
+    };
+
+    int expectedBrackets_ = 3;
+    std::vector<BracketFrame> brackets_;
 };
 
 class StarTrailsStacker {
@@ -376,6 +445,8 @@ void applyBackgroundNeutralization(FloatImageRGB& img);
 void applyScnrGreen(FloatImageRGB& img, float strength);
 void applyATrousWavelets(FloatImageRGB& img, float fineGain, float medGain, float coarseGain, bool fiveScale = false);
 void applyBilateralDenoise(FloatImageRGB& img, float strength);
+void applyChromaticAberrationFix(FloatImageRGB& img, float strength);
+void applyRichardsonLucyDeconv(FloatImageRGB& img, float strength, float psfSigma = 1.15f);
 
 void processAstroLab(
     const FloatImageRGB& inputLinear,

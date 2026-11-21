@@ -13,6 +13,8 @@ import androidx.lifecycle.viewModelScope
 import com.astropro.xiaomi14u.camera.AppScreen
 import com.astropro.xiaomi14u.camera.AstroCameraController
 import com.astropro.xiaomi14u.camera.AstroSessionItem
+import com.astropro.xiaomi14u.camera.AutoFocusSample
+import com.astropro.xiaomi14u.camera.AutoFocusState
 import com.astropro.xiaomi14u.camera.CalibrationKind
 import com.astropro.xiaomi14u.camera.CalibrationMasterInfo
 import com.astropro.xiaomi14u.camera.CaptureMode
@@ -40,12 +42,15 @@ import com.astropro.xiaomi14u.ephemeris.TargetCategory
 import com.astropro.xiaomi14u.ephemeris.TargetVisibility
 import com.astropro.xiaomi14u.ephemeris.TwilightSummary
 import com.astropro.xiaomi14u.nativeengine.AstroNativeEngine
+import com.astropro.xiaomi14u.nativeengine.BestFocusStarTarget
 import com.astropro.xiaomi14u.nativeengine.LabParameters
 import com.astropro.xiaomi14u.nativeengine.LabPreset
+import com.astropro.xiaomi14u.nativeengine.NativeFocusMetrics
 import com.astropro.xiaomi14u.storage.AstroPreferences
 import com.astropro.xiaomi14u.storage.AstroSessionStore
 import com.astropro.xiaomi14u.timelapse.TimelapseEncoder
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -57,13 +62,17 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.roundToInt
 
 data class AstroAppUiState(
     val screen: AppScreen = AppScreen.CAMERA,
@@ -83,11 +92,15 @@ data class AstroAppUiState(
     val showHistogram: Boolean = true,
     val showGridLevel: Boolean = true,
     val focusPeakingEnabled: Boolean = false,
+    val arSkyOverlayEnabled: Boolean = false,
+    val vibrationGuardEnabled: Boolean = true,
     val showTopMenu: Boolean = false,
     val showModeGuide: Boolean = false,
     val dimScreenDuringStack: Boolean = false,
     val histogram: HistogramData = HistogramData(),
     val focusLoupe: FocusLoupeState = FocusLoupeState(),
+    val autoFocus: AutoFocusState = AutoFocusState(),
+    val calibratedInfinityByLens: Map<String, Float> = emptyMap(),
     val focusPeaking: FocusPeakingState = FocusPeakingState(),
     val captureProgress: CaptureProgressState = CaptureProgressState(),
     val sessions: List<AstroSessionItem> = emptyList(),
@@ -123,9 +136,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var probeResult: XiaomiLensProbe.ProbeResult? = null
     private var captureJob: Job? = null
+    private var autoFocusJob: Job? = null
     private var labRenderJob: Job? = null
     private var bannerJob: Job? = null
     private val requestFinishEarly = AtomicBoolean(false)
+
+    // Synchronized hooks for live preview V-Curve Autofocus sweeps
+    private val pendingBestStarSearch = AtomicReference<CompletableDeferred<BestFocusStarTarget>?>(null)
+    private val pendingFocusMeasurement = AtomicReference<CompletableDeferred<NativeFocusMetrics>?>(null)
+    @Volatile
+    private var afMeasureNormX: Float = 0.5f
+    @Volatile
+    private var afMeasureNormY: Float = 0.5f
 
     // Reusable analysis buffers (avoid GC churn on live preview)
     private val previewHistR = IntArray(64)
@@ -136,6 +158,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState: MutableStateFlow<AstroAppUiState> = run {
         val saved = preferences.load()
+        val calInfs = preferences.getAllCalibratedInfinities()
         val now = System.currentTimeMillis()
         MutableStateFlow(
             AstroAppUiState(
@@ -143,9 +166,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 showGridLevel = saved.showGridLevel,
                 showHistogram = saved.showHistogram,
                 focusPeakingEnabled = saved.focusPeakingEnabled,
+                arSkyOverlayEnabled = saved.arSkyOverlayEnabled,
+                vibrationGuardEnabled = saved.vibrationGuardEnabled,
                 outputFormat = saved.outputFormat,
                 timerOption = saved.timerOption,
                 dimScreenDuringStack = saved.dimScreenDuringStack,
+                calibratedInfinityByLens = calInfs,
                 location = saved.location,
                 twilight = AstroEphemeris.computeTwilightSummary(now, saved.location),
                 moon = AstroEphemeris.computeMoonSummary(now, saved.location),
@@ -195,11 +221,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     defaultLens.minExposureSec,
                     defaultLens.maxExposureSec
                 )
+                val savedInf = preferences.getCalibratedInfinity(defaultLens.id)
+                    .coerceIn(0.0f, max(0.0f, defaultLens.minFocusDistance))
                 ManualSettings(
                     wbAuto = false,
                     wbKelvin = 4200,
                     focusAuto = false,
-                    focusDistance = 0.0f,
+                    focusDistance = savedInf,
                     shutterAuto = false,
                     shutterSeconds = npf,
                     isoAuto = false,
@@ -334,6 +362,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun toggleArSkyOverlay() {
+        val next = !_uiState.value.arSkyOverlayEnabled
+        preferences.setArSkyOverlay(next)
+        _uiState.update { it.copy(arSkyOverlayEnabled = next) }
+        if (next) {
+            refreshEphemeris()
+        }
+    }
+
+    fun toggleVibrationGuard() {
+        val next = !_uiState.value.vibrationGuardEnabled
+        preferences.setVibrationGuard(next)
+        _uiState.update { it.copy(vibrationGuardEnabled = next) }
+        showBanner(if (next) "Anti-Vibration Vent Auto activé" else "Anti-Vibration Vent désactivé")
+    }
+
     fun toggleTopMenu(show: Boolean? = null) {
         _uiState.update {
             val nextShow = show ?: !it.showTopMenu
@@ -372,17 +416,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(outputFormat = next) }
     }
 
+    private fun calibratedInfinityFor(lens: LensInfo?): Float {
+        if (lens == null) return 0.0f
+        return preferences.getCalibratedInfinity(lens.id)
+            .coerceIn(0.0f, max(0.0f, lens.minFocusDistance))
+    }
+
+    fun snapFocusToCalibratedInfinity() {
+        val lens = _uiState.value.activeLens
+        val calD = calibratedInfinityFor(lens)
+        updateManualSettings { it.copy(focusAuto = false, focusDistance = calD) }
+        if (lens != null && preferences.hasCalibratedInfinity(lens.id)) {
+            showBanner(String.format(Locale.US, "∞ calibré %s · %.2f D", lens.displayName, calD))
+        }
+    }
+
     fun selectCaptureMode(mode: CaptureMode, showHint: Boolean = true) {
         if (_uiState.value.captureProgress.active) return
         _uiState.update { st ->
             val lens = st.activeLens
             var manual = st.manualSettings
+            val calInf = calibratedInfinityFor(lens)
             if (mode == CaptureMode.LUNAR_PLANETARY && lens != null) {
                 // Fast planetary shutter default so Moon isn't blown out!
-                manual = manual.copy(shutterAuto = false, shutterSeconds = 1.0 / 250.0, isoAuto = false, iso = 200.coerceIn(lens.minIso, lens.maxIso))
+                manual = manual.copy(
+                    shutterAuto = false,
+                    shutterSeconds = 1.0 / 250.0,
+                    isoAuto = false,
+                    iso = 200.coerceIn(lens.minIso, lens.maxIso),
+                    focusAuto = false,
+                    focusDistance = calInf
+                )
             } else if (mode == CaptureMode.DEEP_SKY && lens != null) {
                 val npf = NpfCalculator.snapToCameraShutter(lens.npfSeconds(manual.aperture), lens.minExposureSec, lens.maxExposureSec)
-                manual = manual.copy(shutterAuto = false, shutterSeconds = npf, focusAuto = false, focusDistance = 0.0f)
+                manual = manual.copy(shutterAuto = false, shutterSeconds = npf, focusAuto = false, focusDistance = calInf)
+            } else if (mode == CaptureMode.HDR_ASTRO && lens != null) {
+                val centerShutter = (lens.npfSeconds(manual.aperture) * 0.5)
+                    .coerceIn(lens.minExposureSec, lens.maxExposureSec)
+                val snapped = NpfCalculator.snapToCameraShutter(centerShutter, lens.minExposureSec, lens.maxExposureSec)
+                manual = manual.copy(
+                    shutterAuto = false,
+                    shutterSeconds = snapped,
+                    isoAuto = false,
+                    iso = 800.coerceIn(lens.minIso, lens.maxIso),
+                    focusAuto = false,
+                    focusDistance = calInf
+                )
             }
             cameraController.updateManualSettings(manual, mode)
             st.copy(captureMode = mode, manualSettings = manual, activeDial = null)
@@ -410,6 +489,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val updatedManual = if (targetLens != null) {
             val ap = targetLens.defaultAperture
+            val calInf = calibratedInfinityFor(targetLens)
             val shutter = if (preset.useNpfShutter) {
                 NpfCalculator.snapToCameraShutter(
                     targetLens.npfSeconds(ap),
@@ -423,7 +503,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 wbAuto = false,
                 wbKelvin = preset.wbKelvin,
                 focusAuto = !preset.focusInfinity,
-                focusDistance = if (preset.focusInfinity) 0.0f else st.manualSettings.focusDistance,
+                focusDistance = if (preset.focusInfinity) calInf else st.manualSettings.focusDistance,
                 shutterAuto = false,
                 shutterSeconds = shutter,
                 isoAuto = false,
@@ -475,14 +555,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectLens(lens: LensInfo) {
         if (_uiState.value.captureProgress.active) return
+        cancelStarAutoFocus()
         val st = _uiState.value
         val ap = lens.availableApertures.minByOrNull { abs(it - st.manualSettings.aperture) } ?: lens.defaultAperture
         val iso = st.manualSettings.iso.coerceIn(lens.minIso, lens.maxIso)
         val clampedShutter = st.manualSettings.shutterSeconds.coerceIn(lens.minExposureSec, lens.maxExposureSec)
+        val calInf = calibratedInfinityFor(lens)
         val updatedManual = st.manualSettings.copy(
             aperture = ap,
             iso = iso,
-            shutterSeconds = clampedShutter
+            shutterSeconds = clampedShutter,
+            focusAuto = false,
+            focusDistance = calInf
         )
         _uiState.update {
             it.copy(
@@ -551,21 +635,233 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // =========================================================================
+    // #1 — Automatic Star V-Curve Autofocus + Per-Lens Infinity Memory
+    // =========================================================================
+
+    fun cancelStarAutoFocus() {
+        autoFocusJob?.cancel()
+        autoFocusJob = null
+        pendingBestStarSearch.getAndSet(null)?.cancel()
+        pendingFocusMeasurement.getAndSet(null)?.cancel()
+        if (_uiState.value.autoFocus.running) {
+            _uiState.update { it.copy(autoFocus = AutoFocusState()) }
+        }
+    }
+
+    fun startStarAutoFocus() {
+        val st = _uiState.value
+        if (st.captureProgress.active) return
+        val lens = st.activeLens ?: run {
+            showBanner("Aucun capteur actif")
+            return
+        }
+        if (st.autoFocus.running) {
+            cancelStarAutoFocus()
+            return
+        }
+
+        autoFocusJob?.cancel()
+        autoFocusJob = viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val totalSteps = 12
+                val stepDiopter = 0.03f
+                val maxLensDiopter = lens.minFocusDistance.coerceAtLeast(0.35f)
+
+                _uiState.update {
+                    it.copy(
+                        showTopMenu = false,
+                        autoFocus = AutoFocusState(
+                            running = true,
+                            currentStep = 0,
+                            totalSteps = totalSteps,
+                            currentDiopter = 0.0f,
+                            statusText = "Recherche étoile guide..."
+                        )
+                    )
+                }
+
+                // Step 0: Automatically locate brightest unsaturated star (or sharpest lunar/horizon peak)
+                val starDef = CompletableDeferred<BestFocusStarTarget>()
+                pendingBestStarSearch.set(starDef)
+                val autoTarget = withTimeoutOrNull(750L) { starDef.await() }
+                pendingBestStarSearch.set(null)
+
+                val targetX = if (autoTarget != null && autoTarget.found) autoTarget.normX else st.focusLoupe.normX
+                val targetY = if (autoTarget != null && autoTarget.found) autoTarget.normY else st.focusLoupe.normY
+                afMeasureNormX = targetX.coerceIn(0.1f, 0.9f)
+                afMeasureNormY = targetY.coerceIn(0.1f, 0.9f)
+
+                // Lock loupe coordinates onto the auto-located target so user sees it immediately if loupe is open
+                _uiState.update { cur ->
+                    cur.copy(
+                        focusLoupe = cur.focusLoupe.copy(
+                            normX = afMeasureNormX,
+                            normY = afMeasureNormY
+                        )
+                    )
+                }
+
+                // Step 1..12: Fine V-Curve sweep from 0.00 D to 0.33 D (step 0.03 D, settling ~220ms/step)
+                val samples = mutableListOf<AutoFocusSample>()
+                for (stepIdx in 0 until totalSteps) {
+                    if (!coroutineContext.isActive) break
+                    val d = (stepIdx * stepDiopter).coerceAtMost(maxLensDiopter)
+
+                    // Apply focus distance to Camera2 preview stream
+                    val curManual = _uiState.value.manualSettings.copy(focusAuto = false, focusDistance = d)
+                    _uiState.update { cur ->
+                        cur.copy(
+                            manualSettings = curManual,
+                            autoFocus = cur.autoFocus.copy(
+                                running = true,
+                                currentStep = stepIdx + 1,
+                                totalSteps = totalSteps,
+                                currentDiopter = d,
+                                samples = samples.toList(),
+                                statusText = String.format(Locale.US, "Courbe V %d/%d · %.2f D", stepIdx + 1, totalSteps, d)
+                            )
+                        )
+                    }
+                    cameraController.updateManualSettings(curManual, _uiState.value.captureMode)
+
+                    // Wait ~220ms for VCM voice-coil motor & live preview frame to settle cleanly
+                    delay(220L)
+
+                    val measDef = CompletableDeferred<NativeFocusMetrics>()
+                    pendingFocusMeasurement.set(measDef)
+                    val metrics = withTimeoutOrNull(450L) { measDef.await() } ?: NativeFocusMetrics()
+                    pendingFocusMeasurement.set(null)
+
+                    val sharpScore = if (metrics.starFound && metrics.fwhm > 0.5f) {
+                        (10.0f / metrics.fwhm).coerceIn(0.1f, 20.0f)
+                    } else {
+                        metrics.tenengrad * 100.0f
+                    }
+                    samples.add(
+                        AutoFocusSample(
+                            diopter = d,
+                            fwhmPx = metrics.fwhm,
+                            hfdPx = metrics.hfd,
+                            sharpnessScore = sharpScore,
+                            starFound = metrics.starFound
+                        )
+                    )
+                    _uiState.update { cur ->
+                        cur.copy(autoFocus = cur.autoFocus.copy(samples = samples.toList()))
+                    }
+                }
+
+                if (samples.isEmpty()) {
+                    _uiState.update { it.copy(autoFocus = AutoFocusState()) }
+                    showBanner("Auto-Focus annulé (aperçu indisponible)")
+                    return@launch
+                }
+
+                // Parabolic V-Curve minimum refinement around the sharpest point
+                val starSamples = samples.count { it.starFound && it.fwhmPx > 0.5f }
+                val useStarFwhm = starSamples >= 3
+
+                val bestIdx = if (useStarFwhm) {
+                    samples.indices
+                        .filter { samples[it].starFound && samples[it].fwhmPx > 0.5f }
+                        .minByOrNull { samples[it].fwhmPx } ?: 0
+                } else {
+                    samples.indices.maxByOrNull { samples[it].sharpnessScore } ?: 0
+                }
+
+                var optimalDiopter = samples[bestIdx].diopter
+                if (bestIdx in 1 until samples.lastIndex) {
+                    val yPrev = if (useStarFwhm) {
+                        if (samples[bestIdx - 1].starFound && samples[bestIdx - 1].fwhmPx > 0.5f) samples[bestIdx - 1].fwhmPx
+                        else samples[bestIdx].fwhmPx + 1.5f
+                    } else {
+                        -samples[bestIdx - 1].sharpnessScore
+                    }
+                    val yCur = if (useStarFwhm) samples[bestIdx].fwhmPx else -samples[bestIdx].sharpnessScore
+                    val yNext = if (useStarFwhm) {
+                        if (samples[bestIdx + 1].starFound && samples[bestIdx + 1].fwhmPx > 0.5f) samples[bestIdx + 1].fwhmPx
+                        else samples[bestIdx].fwhmPx + 1.5f
+                    } else {
+                        -samples[bestIdx + 1].sharpnessScore
+                    }
+                    val denom = yPrev - 2.0f * yCur + yNext
+                    if (denom > 1e-6f) {
+                        val offsetSteps = (0.5f * (yPrev - yNext) / denom).coerceIn(-0.5f, 0.5f)
+                        optimalDiopter = (samples[bestIdx].diopter + offsetSteps * stepDiopter)
+                            .coerceIn(0.0f, maxLensDiopter)
+                    }
+                }
+
+                // Lock optimal focus distance and persist calibrated infinity per Xiaomi 14U lens ID
+                preferences.saveCalibratedInfinity(lens.id, optimalDiopter)
+                val lockedManual = _uiState.value.manualSettings.copy(
+                    focusAuto = false,
+                    focusDistance = optimalDiopter
+                )
+                cameraController.updateManualSettings(lockedManual, _uiState.value.captureMode)
+
+                val bestFwhm = samples[bestIdx].fwhmPx
+                _uiState.update { cur ->
+                    cur.copy(
+                        manualSettings = lockedManual,
+                        calibratedInfinityByLens = cur.calibratedInfinityByLens + (lens.id to optimalDiopter),
+                        autoFocus = AutoFocusState() // Auto-dismiss V-Curve pill once locked!
+                    )
+                }
+
+                val lockMsg = if (useStarFwhm && bestFwhm > 0.4f) {
+                    String.format(Locale.US, "∞ calibré · %.2f D · FWHM %.1f px", optimalDiopter, bestFwhm)
+                } else {
+                    String.format(Locale.US, "∞ calibré · %.2f D · Netteté optimale", optimalDiopter)
+                }
+                showBanner(lockMsg)
+            } catch (_: CancellationException) {
+                _uiState.update { it.copy(autoFocus = AutoFocusState()) }
+            } catch (t: Throwable) {
+                _uiState.update { it.copy(autoFocus = AutoFocusState()) }
+                showBanner("Auto-Focus interrompu: ${t.message}")
+            } finally {
+                pendingBestStarSearch.set(null)
+                pendingFocusMeasurement.set(null)
+            }
+        }
+    }
+
     private fun processLivePreviewFrame(image: Image) {
         val st = _uiState.value
         if (st.screen != AppScreen.CAMERA) return
-        if (!st.showHistogram && !st.focusLoupe.enabled && !st.focusPeakingEnabled) return
         if (image.planes.size < 3) return
+
+        val starSearchDef = pendingBestStarSearch.getAndSet(null)
+        val afMeasDef = pendingFocusMeasurement.getAndSet(null)
+
+        val needHistogram = st.showHistogram
+        val needLoupe = st.focusLoupe.enabled
+        val needAfMeasure = afMeasDef != null
+        val needPeaking = st.focusPeakingEnabled
+        if (starSearchDef == null && !needHistogram && !needLoupe && !needAfMeasure && !needPeaking) return
 
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
 
+        // One-shot automatic star / lunar peak locator for zero-effort Auto-Focus
+        if (starSearchDef != null && !starSearchDef.isCompleted) {
+            val found = nativeEngine.findBestFocusStar(
+                yPlane.buffer, yPlane.rowStride, yPlane.pixelStride,
+                image.width, image.height
+            )
+            starSearchDef.complete(found)
+        }
+
         var histCopy = st.histogram
         var loupeCopy = st.focusLoupe
 
-        if (st.showHistogram || st.focusLoupe.enabled) {
-            val computeLoupe = st.focusLoupe.enabled
+        if (needHistogram || needLoupe || needAfMeasure) {
+            val computeLoupe = needLoupe || needAfMeasure
+            val targetX = if (needAfMeasure) afMeasureNormX else st.focusLoupe.normX
+            val targetY = if (needAfMeasure) afMeasureNormY else st.focusLoupe.normY
             val metrics = nativeEngine.analyzePreviewYuv(
                 yPlane.buffer, yPlane.rowStride, yPlane.pixelStride,
                 uPlane.buffer, uPlane.rowStride, uPlane.pixelStride,
@@ -573,14 +869,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 image.width, image.height,
                 previewHistR, previewHistG, previewHistB,
                 computeLoupe,
-                st.focusLoupe.normX, st.focusLoupe.normY,
-                if (computeLoupe) loupeBitmapBuf else null
+                targetX, targetY,
+                if (needLoupe) loupeBitmapBuf else null
             )
 
-            if (st.showHistogram) {
+            if (afMeasDef != null && !afMeasDef.isCompleted) {
+                afMeasDef.complete(metrics)
+            }
+
+            if (needHistogram) {
                 histCopy = HistogramData(previewHistR.clone(), previewHistG.clone(), previewHistB.clone())
             }
-            if (computeLoupe) {
+            if (needLoupe) {
                 val bmpCopy = loupeBitmapBuf.copy(Bitmap.Config.ARGB_8888, false)
                 val sharpPoint = if (metrics.starFound && metrics.fwhm > 0.1f) {
                     (10f / metrics.fwhm).coerceIn(0.1f, 15f)
@@ -600,7 +900,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        val peakingCopy = if (st.focusPeakingEnabled) {
+        val peakingCopy = if (needPeaking) {
             val count = nativeEngine.computeFocusPeakingPoints(
                 yPlane.buffer, yPlane.rowStride, yPlane.pixelStride,
                 image.width, image.height,
@@ -658,10 +958,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val mode = st.captureMode
         val manual = st.manualSettings
         val opts = st.modeOptions
+        cancelStarAutoFocus()
         requestFinishEarly.set(false)
 
         captureJob?.cancel()
         captureJob = viewModelScope.launch(Dispatchers.Default) {
+            if (st.vibrationGuardEnabled) {
+                orientationTracker.startVibrationMonitoring()
+            }
             try {
                 // Vibration-free countdown timer
                 val delaySec = st.timerOption.seconds
@@ -684,6 +988,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 when (mode) {
                     CaptureMode.ASTRO_PRO -> runSingleAstroPro(lens, manual, st.outputFormat)
                     CaptureMode.DEEP_SKY -> runDeepSkyStack(lens, manual, opts)
+                    CaptureMode.HDR_ASTRO -> runHdrAstro(lens, manual, opts)
                     CaptureMode.LUNAR_PLANETARY -> runLuckyPlanetary(lens, manual, opts)
                     CaptureMode.STAR_TRAILS -> runStarTrails(lens, manual, opts)
                     CaptureMode.TIMELAPSE -> runTimelapse(lens, manual, opts)
@@ -694,9 +999,224 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (t: Throwable) {
                 showBanner("Erreur capture: ${t.message}")
             } finally {
+                orientationTracker.stopVibrationMonitoring()
                 _uiState.update { it.copy(captureProgress = CaptureProgressState()) }
             }
         }
+    }
+
+    /**
+     * #11 — Automatic Anti-Vibration / Wind Gust Guard:
+     * Waits briefly for tripod stability before firing shutter, monitors high-frequency gyro &
+     * linear-accel throughout the exposure window, and automatically discards & re-shoots any
+     * frame disturbed by a wind gust or tripod bump (up to maxRetries = 3 so it never stalls).
+     */
+    private suspend fun captureFrameWithVibrationGuard(
+        manual: ManualSettings,
+        mode: CaptureMode,
+        preferRaw: Boolean,
+        maxRetries: Int = 3
+    ): AstroCameraController.CapturedFrame? {
+        if (!_uiState.value.vibrationGuardEnabled) {
+            return cameraController.captureSingleFrame(manual, mode, preferRaw)
+        }
+
+        for (attempt in 0..maxRetries) {
+            if (!coroutineContext.isActive || requestFinishEarly.get()) return null
+            orientationTracker.waitUntilStable(maxWaitMs = 2000L)
+            if (!coroutineContext.isActive || requestFinishEarly.get()) return null
+
+            orientationTracker.beginExposureWindow()
+            val frame = cameraController.captureSingleFrame(manual, mode, preferRaw)
+            val vib = orientationTracker.endExposureWindow()
+
+            if (frame == null) return null
+            if (vib.wasShaken && attempt < maxRetries) {
+                frame.close()
+                _uiState.update { st ->
+                    val nextRej = st.captureProgress.vibrationRejectedCount + 1
+                    st.copy(
+                        captureProgress = st.captureProgress.copy(
+                            vibrationRejectedCount = nextRej,
+                            statusText = "Coup de vent rejeté ($nextRej) · Nouvelle pose..."
+                        )
+                    )
+                }
+                delay(200L)
+                continue
+            }
+            return frame
+        }
+        return null
+    }
+
+    private fun autoLabParametersForMode(mode: CaptureMode): LabParameters = when (mode) {
+        CaptureMode.DEEP_SKY -> LabParameters(
+            autoStf = true,
+            bgRemovalStrength = 0.50f,
+            bgNeutralize = true,
+            scnrStrength = 0.35f,
+            denoiseStrength = 0.16f,
+            saturation = 1.18f,
+            deconvolution = 0.25f,
+            chromaticAberrationFix = 0.65f
+        )
+        CaptureMode.HDR_ASTRO -> LabParameters(
+            autoStf = true,
+            asinhBeta = 55f,
+            bgRemovalStrength = 0.40f,
+            bgNeutralize = true,
+            scnrStrength = 0.30f,
+            denoiseStrength = 0.14f,
+            saturation = 1.22f,
+            deconvolution = 0.25f,
+            chromaticAberrationFix = 0.65f
+        )
+        CaptureMode.ASTRO_PRO -> LabParameters(
+            autoStf = true,
+            bgRemovalStrength = 0.35f,
+            bgNeutralize = true,
+            scnrStrength = 0.25f,
+            denoiseStrength = 0.12f,
+            saturation = 1.12f,
+            deconvolution = 0.20f,
+            chromaticAberrationFix = 0.65f
+        )
+        CaptureMode.LUNAR_PLANETARY -> LabParameters(
+            autoStf = false,
+            blackPoint = 0.02f,
+            midtones = 0.46f,
+            whitePoint = 0.98f,
+            bgNeutralize = false,
+            waveletFine = 0.25f,
+            waveletMedium = 0.15f,
+            denoiseStrength = 0.06f,
+            saturation = 1.05f,
+            deconvolution = 0.50f,
+            chromaticAberrationFix = 0.65f
+        )
+        CaptureMode.STAR_TRAILS -> LabParameters(
+            autoStf = false,
+            blackPoint = 0.01f,
+            midtones = 0.48f,
+            whitePoint = 1.0f,
+            bgNeutralize = false,
+            saturation = 1.10f,
+            deconvolution = 0.0f,
+            chromaticAberrationFix = 0.65f
+        )
+        else -> LabParameters(autoStf = true, bgNeutralize = true, chromaticAberrationFix = 0.65f)
+    }
+
+    /**
+     * Zero-Effort Automatic Post-Capture Pipeline:
+     * Saves lossless .astro32 master, runs optimal Auto-STF + Anti-CA + Deconvolution in C++20,
+     * exports a polished ready-to-share HD JPEG straight into Xiaomi Gallery (DCIM/AstroPro14U),
+     * registers the session thumbnail, and notifies the user with a crisp 1-line toast.
+     */
+    private fun finalizeAndAutoDevelopSession(
+        mode: CaptureMode,
+        lens: LensInfo,
+        manual: ManualSettings,
+        filePrefix: String,
+        galleryFileName: String,
+        title: String,
+        exifExposureSec: Float,
+        stackCount: Int,
+        toastDetail: String
+    ): Boolean {
+        _uiState.update { st ->
+            st.copy(
+                captureProgress = st.captureProgress.copy(
+                    estimatedRemainingTotalSec = 0.0,
+                    isFinalizing = true,
+                    statusText = "Auto-STF + Anti-CA · Export Galerie HD..."
+                )
+            )
+        }
+
+        val astroFile = store.newAstro32File(filePrefix)
+        val thumbFile = store.newThumbFile(filePrefix)
+        val dateObs = store.nowIsoUtc()
+        val ok = nativeEngine.finishStackSession(
+            cameraModel = "Xiaomi 14 Ultra",
+            lensName = "${lens.displayName} ${lens.sensorHint}",
+            dateObs = dateObs,
+            modeName = mode.label,
+            focalMm = lens.focalLengthMm,
+            apertureF = manual.aperture,
+            exposureSec = manual.shutterSeconds.toFloat(),
+            iso = manual.iso.toFloat(),
+            saveAstro32Path = astroFile.absolutePath,
+            outPreviewBitmap = null
+        )
+        if (!ok) return false
+
+        val autoParams = autoLabParametersForMode(mode)
+        val (rawW, rawH) = nativeEngine.getActiveImageSize()
+        val hdW: Int
+        val hdH: Int
+        if (rawW > 0 && rawH > 0) {
+            val longest = maxOf(rawW, rawH)
+            val maxHdEdge = 3200
+            if (longest <= maxHdEdge) {
+                hdW = rawW
+                hdH = rawH
+            } else {
+                val sc = maxHdEdge.toFloat() / longest.toFloat()
+                hdW = (rawW * sc).roundToInt().coerceAtLeast(64)
+                hdH = (rawH * sc).roundToInt().coerceAtLeast(64)
+            }
+        } else {
+            hdW = 1600
+            hdH = 1200
+        }
+
+        val hdBmp = Bitmap.createBitmap(hdW, hdH, Bitmap.Config.ARGB_8888)
+        val rendered = nativeEngine.renderFullExportBitmap(autoParams, hdBmp)
+        if (!rendered) {
+            hdBmp.recycle()
+            return false
+        }
+
+        // Save crisp 800px session thumbnail
+        val thumbScale = 800f / maxOf(hdW, hdH).toFloat()
+        val thumbBmp = if (thumbScale < 1f) {
+            Bitmap.createScaledBitmap(
+                hdBmp,
+                (hdW * thumbScale).roundToInt().coerceAtLeast(64),
+                (hdH * thumbScale).roundToInt().coerceAtLeast(64),
+                true
+            )
+        } else {
+            hdBmp.copy(Bitmap.Config.ARGB_8888, false)
+        }
+
+        store.saveThumbnail(thumbBmp, thumbFile)
+        store.saveJpegWithExifToGallery(
+            hdBmp,
+            galleryFileName,
+            lens.focalLengthMm,
+            manual.aperture,
+            exifExposureSec,
+            manual.iso
+        )
+        hdBmp.recycle()
+
+        registerNewSession(
+            astroFile = astroFile,
+            thumbFile = thumbFile,
+            thumbBmp = thumbBmp,
+            title = title,
+            modeName = mode.label,
+            lensName = lens.displayName,
+            exposureSec = manual.shutterSeconds.toFloat(),
+            iso = manual.iso,
+            stackCount = stackCount,
+            dateObs = dateObs
+        )
+        showBanner(toastDetail)
+        return true
     }
 
     private fun estimateRemainingSec(
@@ -717,7 +1237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return remaining * avgCycle
     }
 
-    private suspend fun runSingleAstroPro(lens: LensInfo, manual: ManualSettings, format: OutputFormatOption) {
+    private suspend fun runSingleAstroPro(lens: LensInfo, manual: ManualSettings, @Suppress("UNUSED_PARAMETER") format: OutputFormatOption) {
         val showLiveExposureRing = !manual.shutterAuto && manual.shutterSeconds >= 1.0
         _uiState.update {
             it.copy(
@@ -764,13 +1284,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 try {
-                    cameraController.captureSingleFrame(manual, CaptureMode.ASTRO_PRO, preferRaw = true)
+                    captureFrameWithVibrationGuard(manual, CaptureMode.ASTRO_PRO, preferRaw = true)
                 } finally {
                     ticker.cancel()
                 }
             }
         } else {
-            cameraController.captureSingleFrame(manual, CaptureMode.ASTRO_PRO, preferRaw = true)
+            captureFrameWithVibrationGuard(manual, CaptureMode.ASTRO_PRO, preferRaw = true)
         }
 
         if (frame == null) {
@@ -778,80 +1298,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        _uiState.update { st ->
-            st.copy(
-                captureProgress = st.captureProgress.copy(
-                    exposureProgress = 1f,
-                    remainingExposureSec = 0.0,
-                    isFinalizing = true,
-                    statusText = "Développement RAW 16-bit..."
-                )
-            )
-        }
-
         frame.use { cap ->
             // Export authentic 16-bit DNG if RAW_SENSOR was acquired
-            var dngMsg = ""
+            var dngTag = ""
             if (cap.rawImage != null) {
                 val tmpDng = store.newExportTempFile("ASTRO14U_${store.nowFileStamp()}.dng")
                 if (cameraController.writeDngFile(cap, tmpDng)) {
                     store.copyFileToPicturesMediaStore(tmpDng, tmpDng.name, "image/x-adobe-dng")
                     tmpDng.delete()
-                    dngMsg = "DNG 16b + "
+                    dngTag = "DNG 16b + "
                 }
             }
 
-            val previewBmp = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
-            feedFrameToNative(cap, manual, previewBmp)
-
-            val astroFile = store.newAstro32File("ASTRO_PRO")
-            val thumbFile = store.newThumbFile("ASTRO_PRO")
-            val dateObs = store.nowIsoUtc()
-            val ok = nativeEngine.finishStackSession(
-                cameraModel = "Xiaomi 14 Ultra",
-                lensName = "${lens.displayName} ${lens.sensorHint}",
-                dateObs = dateObs,
-                modeName = CaptureMode.ASTRO_PRO.label,
-                focalMm = lens.focalLengthMm,
-                apertureF = manual.aperture,
-                exposureSec = manual.shutterSeconds.toFloat(),
-                iso = manual.iso.toFloat(),
-                saveAstro32Path = astroFile.absolutePath,
-                outPreviewBitmap = previewBmp
+            feedFrameToNative(cap, manual, previewBitmap = null)
+            finalizeAndAutoDevelopSession(
+                mode = CaptureMode.ASTRO_PRO,
+                lens = lens,
+                manual = manual,
+                filePrefix = "ASTRO_PRO",
+                galleryFileName = "ASTRO14U_${store.nowFileStamp()}.jpg",
+                title = "Astro Pro ${lens.displayName}",
+                exifExposureSec = manual.shutterSeconds.toFloat(),
+                stackCount = 1,
+                toastDetail = "${dngTag}Photo prête dans Galerie · Auto-STF + Anti-CA appliqués"
             )
-
-            if (ok) {
-                store.saveThumbnail(previewBmp, thumbFile)
-                if (format == OutputFormatOption.RAW_PLUS_JPG) {
-                    store.saveJpegWithExifToGallery(
-                        previewBmp,
-                        "ASTRO14U_${store.nowFileStamp()}.jpg",
-                        lens.focalLengthMm, manual.aperture, manual.shutterSeconds.toFloat(), manual.iso
-                    )
-                }
-                registerNewSession(
-                    astroFile = astroFile,
-                    thumbFile = thumbFile,
-                    thumbBmp = previewBmp,
-                    title = "Astro Pro ${lens.displayName}",
-                    modeName = CaptureMode.ASTRO_PRO.label,
-                    lensName = lens.displayName,
-                    exposureSec = manual.shutterSeconds.toFloat(),
-                    iso = manual.iso,
-                    stackCount = 1,
-                    dateObs = dateObs
-                )
-                showBanner("${dngMsg}Session 16b enregistrée")
-            }
         }
     }
 
     private suspend fun runDeepSkyStack(lens: LensInfo, manual: ManualSettings, opts: ModeOptions) {
         syncActiveCalibrationMasters(useDark = opts.useAutoDark, useFlat = opts.useAutoFlat)
+        var flags = 0
+        if (opts.deepSkyLandscapeAuto) flags = flags or AstroNativeEngine.FLAG_LANDSCAPE_AUTO
+        if (opts.deepSkyDrizzle2x) flags = flags or AstroNativeEngine.FLAG_DRIZZLE_2X
+
         nativeEngine.startStackSession(
             AstroNativeEngine.STACK_MODE_DEEP_SKY,
             opts.deepSkySigmaKappa,
-            3.0f
+            3.0f,
+            0.0f,
+            flags
         )
 
         val liveBmp = Bitmap.createBitmap(720, 540, Bitmap.Config.ARGB_8888)
@@ -861,6 +1346,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         var accepted = 0
         var rejected = 0
         var totalExpSec = 0.0
+        var horizonDetected = false
 
         for (i in 1..opts.deepSkyFrames) {
             if (!coroutineContext.isActive || requestFinishEarly.get()) break
@@ -875,6 +1361,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         framesTarget = opts.deepSkyFrames,
                         framesAccepted = accepted,
                         framesRejected = rejected,
+                        landscapeHorizonDetected = horizonDetected,
                         elapsedExposureSec = totalExpSec,
                         estimatedRemainingTotalSec = etaSec,
                         statusText = "Pose $i/${opts.deepSkyFrames} (${NpfCalculator.formatShutter(manual.shutterSeconds)})"
@@ -882,12 +1369,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-            val cap = cameraController.captureSingleFrame(manual, CaptureMode.DEEP_SKY, preferRaw = true) ?: continue
+            val cap = captureFrameWithVibrationGuard(manual, CaptureMode.DEEP_SKY, preferRaw = true) ?: continue
             val rep = cap.use { feedFrameToNative(it, manual, liveBmp) }
             captured++
             accepted = rep.totalAccepted
             rejected = rep.totalRejected
             if (rep.accepted) totalExpSec += manual.shutterSeconds
+            if (accepted == 1 && opts.deepSkyLandscapeAuto) {
+                horizonDetected = nativeEngine.hasDetectedForeground()
+            }
             val nextEtaSec = estimateRemainingSec(sessionStartMs, captured, opts.deepSkyFrames, nominalCycleSec)
 
             _uiState.update {
@@ -896,12 +1386,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         framesCaptured = captured,
                         framesAccepted = accepted,
                         framesRejected = rejected,
+                        landscapeHorizonDetected = horizonDetected,
                         starsDetected = rep.starsDetected,
                         residualPx = rep.residualPx,
                         elapsedExposureSec = totalExpSec,
                         estimatedRemainingTotalSec = nextEtaSec,
                         liveStackPreview = liveBmp.copy(Bitmap.Config.ARGB_8888, false),
-                        statusText = if (rep.accepted) "Aligné (${rep.starsMatched}★)" else "Pose rejetée (flou/bougé)"
+                        statusText = when {
+                            !rep.accepted -> "Pose rejetée (flou/bougé)"
+                            horizonDetected -> "Ciel + Sol séparés (${rep.starsMatched}★)"
+                            else -> "Aligné (${rep.starsMatched}★)"
+                        }
                     )
                 )
             }
@@ -912,44 +1407,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val astroFile = store.newAstro32File("DEEPSKY_${accepted}x")
-        val thumbFile = store.newThumbFile("DEEPSKY_${accepted}x")
-        val dateObs = store.nowIsoUtc()
-        val finalThumb = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
-        val ok = nativeEngine.finishStackSession(
-            cameraModel = "Xiaomi 14 Ultra",
-            lensName = "${lens.displayName} ${lens.sensorHint}",
-            dateObs = dateObs,
-            modeName = "CIEL PROFOND",
-            focalMm = lens.focalLengthMm,
-            apertureF = manual.aperture,
-            exposureSec = manual.shutterSeconds.toFloat(),
-            iso = manual.iso.toFloat(),
-            saveAstro32Path = astroFile.absolutePath,
-            outPreviewBitmap = finalThumb
+        val extras = buildList {
+            if (horizonDetected) add("Paysage Auto")
+            if (opts.deepSkyDrizzle2x) add("Drizzle 2×")
+        }.joinToString(" · ")
+        val suffix = if (extras.isNotEmpty()) " · $extras" else ""
+
+        finalizeAndAutoDevelopSession(
+            mode = CaptureMode.DEEP_SKY,
+            lens = lens,
+            manual = manual,
+            filePrefix = "DEEPSKY_${accepted}x",
+            galleryFileName = "DEEPSKY_${accepted}x_${store.nowFileStamp()}.jpg",
+            title = "Ciel Profond ${accepted}×${NpfCalculator.formatShutter(manual.shutterSeconds)}",
+            exifExposureSec = totalExpSec.toFloat(),
+            stackCount = accepted,
+            toastDetail = "Photo prête dans Galerie · $accepted poses$suffix · Auto-STF + Anti-CA"
         )
-        if (ok) {
-            store.saveThumbnail(finalThumb, thumbFile)
-            store.saveJpegWithExifToGallery(
-                finalThumb, "DEEPSKY_${accepted}x_${store.nowFileStamp()}.jpg",
-                lens.focalLengthMm, manual.aperture, totalExpSec.toFloat(), manual.iso
-            )
-            registerNewSession(
-                astroFile, thumbFile, finalThumb,
-                "Ciel Profond ${accepted}×${NpfCalculator.formatShutter(manual.shutterSeconds)}",
-                "CIEL PROFOND", lens.displayName, manual.shutterSeconds.toFloat(), manual.iso, accepted, dateObs
-            )
-            showBanner("Empilement terminé: $accepted poses (${NpfCalculator.formatIntegrationTime(totalExpSec)})")
+    }
+
+    /**
+     * #4 — Zero-Effort 100% Automatic HDR Astro Mode (3 EV or 5 EV linear 32-bit radiance fusion).
+     */
+    private suspend fun runHdrAstro(lens: LensInfo, manual: ManualSettings, opts: ModeOptions) {
+        val evStops = if (opts.hdrBrackets >= 5) {
+            listOf(-3.0, -1.5, 0.0, 1.5, 3.0)
+        } else {
+            listOf(-2.0, 0.0, 2.0)
         }
+        val nBrackets = evStops.size
+
+        syncActiveCalibrationMasters(useDark = opts.useAutoDark, useFlat = opts.useAutoFlat)
+        nativeEngine.startStackSession(
+            AstroNativeEngine.STACK_MODE_HDR_ASTRO,
+            nBrackets.toFloat()
+        )
+
+        val baseShutter = manual.shutterSeconds.coerceIn(lens.minExposureSec, lens.maxExposureSec)
+        val baseIso = manual.iso.coerceIn(lens.minIso, lens.maxIso)
+        val baseExposureProduct = max(1e-9, baseShutter * baseIso)
+
+        val liveBmp = Bitmap.createBitmap(720, 540, Bitmap.Config.ARGB_8888)
+        var captured = 0
+        var totalExpSec = 0.0
+
+        for ((idx, ev) in evStops.withIndex()) {
+            if (!coroutineContext.isActive || requestFinishEarly.get()) break
+
+            val targetFactor = 2.0.pow(ev)
+            val idealShutter = baseShutter * targetFactor
+            val clampedShutter = idealShutter.coerceIn(lens.minExposureSec, lens.maxExposureSec)
+            val leftoverFactor = (targetFactor * baseShutter) / max(1e-9, clampedShutter)
+            val clampedIso = (baseIso * leftoverFactor).roundToInt().coerceIn(lens.minIso, lens.maxIso)
+            val actualEvMul = ((clampedShutter * clampedIso) / baseExposureProduct).toFloat().coerceIn(0.01f, 64.0f)
+
+            val bracketManual = manual.copy(
+                shutterAuto = false,
+                shutterSeconds = clampedShutter,
+                isoAuto = false,
+                iso = clampedIso
+            )
+
+            _uiState.update {
+                it.copy(
+                    captureProgress = it.captureProgress.copy(
+                        active = true,
+                        mode = CaptureMode.HDR_ASTRO,
+                        countdownSec = 0,
+                        framesCaptured = captured,
+                        framesTarget = nBrackets,
+                        framesAccepted = captured,
+                        elapsedExposureSec = totalExpSec,
+                        statusText = String.format(
+                            Locale.US,
+                            "HDR %d/%d (%+.1f EV · %s · ISO %d)",
+                            idx + 1, nBrackets, ev, NpfCalculator.formatShutter(clampedShutter), clampedIso
+                        )
+                    )
+                )
+            }
+
+            val cap = captureFrameWithVibrationGuard(bracketManual, CaptureMode.HDR_ASTRO, preferRaw = true) ?: continue
+            val rep = cap.use { feedFrameToNative(it, bracketManual, liveBmp, evMultiplier = actualEvMul) }
+            if (rep.accepted) {
+                captured++
+                totalExpSec += clampedShutter
+                _uiState.update {
+                    it.copy(
+                        captureProgress = it.captureProgress.copy(
+                            framesCaptured = captured,
+                            framesAccepted = captured,
+                            elapsedExposureSec = totalExpSec,
+                            liveStackPreview = liveBmp.copy(Bitmap.Config.ARGB_8888, false)
+                        )
+                    )
+                }
+            }
+        }
+
+        if (captured == 0) {
+            showBanner("Aucune exposition HDR capturée")
+            return
+        }
+
+        finalizeAndAutoDevelopSession(
+            mode = CaptureMode.HDR_ASTRO,
+            lens = lens,
+            manual = manual,
+            filePrefix = "HDR_${captured}EV",
+            galleryFileName = "HDR_ASTRO_${captured}EV_${store.nowFileStamp()}.jpg",
+            title = "HDR Astro ${captured} EV ${lens.displayName}",
+            exifExposureSec = totalExpSec.toFloat(),
+            stackCount = captured,
+            toastDetail = "Photo prête dans Galerie · HDR $captured EV 32-bit · Auto-STF + Anti-CA"
+        )
     }
 
     private suspend fun runLuckyPlanetary(lens: LensInfo, manual: ManualSettings, opts: ModeOptions) {
         nativeEngine.clearCalibrationMasters(clearDark = true, clearFlat = true, clearBias = true)
+        val flags = if (opts.planetaryDrizzle2x) AstroNativeEngine.FLAG_DRIZZLE_2X else 0
         nativeEngine.startStackSession(
             AstroNativeEngine.STACK_MODE_LUCKY_PLANETARY,
             opts.planetaryFrames.toFloat(),
             opts.planetaryKeepPercent,
-            if (opts.planetaryAutoWavelets) 1.15f else 0.0f
+            if (opts.planetaryAutoWavelets) 1.15f else 0.0f,
+            flags
         )
 
         val liveBmp = Bitmap.createBitmap(720, 540, Bitmap.Config.ARGB_8888)
@@ -972,7 +1554,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
             }
-            val cap = cameraController.captureSingleFrame(manual, CaptureMode.LUNAR_PLANETARY, preferRaw = true) ?: continue
+            val cap = captureFrameWithVibrationGuard(manual, CaptureMode.LUNAR_PLANETARY, preferRaw = true) ?: continue
             val rep = cap.use { feedFrameToNative(it, manual, liveBmp) }
             captured++
             val nextEtaSec = estimateRemainingSec(sessionStartMs, captured, opts.planetaryFrames, nominalCycleSec)
@@ -991,44 +1573,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         if (captured == 0) return
 
-        _uiState.update {
-            it.copy(
-                captureProgress = it.captureProgress.copy(
-                    estimatedRemainingTotalSec = 0.0,
-                    statusText = "Alignement planétaire + Ondelettes À Trous...",
-                    isFinalizing = true
-                )
-            )
-        }
-        val astroFile = store.newAstro32File("PLANETARY_${captured}x")
-        val thumbFile = store.newThumbFile("PLANETARY_${captured}x")
-        val dateObs = store.nowIsoUtc()
-        val finalThumb = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
-        val ok = nativeEngine.finishStackSession(
-            cameraModel = "Xiaomi 14 Ultra",
-            lensName = "${lens.displayName} ${lens.sensorHint}",
-            dateObs = dateObs,
-            modeName = "LUNE / PLANÈTES",
-            focalMm = lens.focalLengthMm,
-            apertureF = manual.aperture,
-            exposureSec = manual.shutterSeconds.toFloat(),
-            iso = manual.iso.toFloat(),
-            saveAstro32Path = astroFile.absolutePath,
-            outPreviewBitmap = finalThumb
+        val drizzleTag = if (opts.planetaryDrizzle2x) " · Drizzle 2×" else ""
+        finalizeAndAutoDevelopSession(
+            mode = CaptureMode.LUNAR_PLANETARY,
+            lens = lens,
+            manual = manual,
+            filePrefix = "PLANETARY_${captured}x",
+            galleryFileName = "PLANETARY_${store.nowFileStamp()}.jpg",
+            title = "Lucky Imaging Top ${(opts.planetaryKeepPercent * 100).toInt()}%",
+            exifExposureSec = manual.shutterSeconds.toFloat(),
+            stackCount = captured,
+            toastDetail = "Photo prête dans Galerie · Lucky Imaging$drizzleTag · Déconv + Anti-CA"
         )
-        if (ok) {
-            store.saveThumbnail(finalThumb, thumbFile)
-            store.saveJpegWithExifToGallery(
-                finalThumb, "PLANETARY_${store.nowFileStamp()}.jpg",
-                lens.focalLengthMm, manual.aperture, manual.shutterSeconds.toFloat(), manual.iso
-            )
-            registerNewSession(
-                astroFile, thumbFile, finalThumb,
-                "Lucky Imaging Top ${(opts.planetaryKeepPercent * 100).toInt()}%",
-                "LUNE / PLANÈTES", lens.displayName, manual.shutterSeconds.toFloat(), manual.iso, captured, dateObs
-            )
-            showBanner("Lucky Imaging + Ondelettes enregistré")
-        }
     }
 
     private suspend fun runStarTrails(lens: LensInfo, manual: ManualSettings, opts: ModeOptions) {
@@ -1061,7 +1617,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
             }
-            val cap = cameraController.captureSingleFrame(manual, CaptureMode.STAR_TRAILS, preferRaw = true) ?: continue
+            val cap = captureFrameWithVibrationGuard(manual, CaptureMode.STAR_TRAILS, preferRaw = true) ?: continue
             cap.use { feedFrameToNative(it, manual, liveBmp) }
             captured++
             totalExpSec += manual.shutterSeconds
@@ -1080,29 +1636,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (captured == 0) return
-        val astroFile = store.newAstro32File("STARTRAILS_${captured}x")
-        val thumbFile = store.newThumbFile("STARTRAILS_${captured}x")
-        val dateObs = store.nowIsoUtc()
-        val finalThumb = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
-        if (nativeEngine.finishStackSession(
-                "Xiaomi 14 Ultra", "${lens.displayName} ${lens.sensorHint}",
-                dateObs, "STAR TRAILS", lens.focalLengthMm, manual.aperture,
-                manual.shutterSeconds.toFloat(), manual.iso.toFloat(),
-                astroFile.absolutePath, finalThumb
-            )
-        ) {
-            store.saveThumbnail(finalThumb, thumbFile)
-            store.saveJpegWithExifToGallery(
-                finalThumb, "STARTRAILS_${store.nowFileStamp()}.jpg",
-                lens.focalLengthMm, manual.aperture, totalExpSec.toFloat(), manual.iso
-            )
-            registerNewSession(
-                astroFile, thumbFile, finalThumb,
-                "Star Trails (${opts.starTrailStyle.label}) ${captured}×",
-                "STAR TRAILS", lens.displayName, manual.shutterSeconds.toFloat(), manual.iso, captured, dateObs
-            )
-            showBanner("Star Trails sauvegardé ($captured poses)")
-        }
+
+        finalizeAndAutoDevelopSession(
+            mode = CaptureMode.STAR_TRAILS,
+            lens = lens,
+            manual = manual,
+            filePrefix = "STARTRAILS_${captured}x",
+            galleryFileName = "STARTRAILS_${store.nowFileStamp()}.jpg",
+            title = "Star Trails (${opts.starTrailStyle.label}) ${captured}×",
+            exifExposureSec = totalExpSec.toFloat(),
+            stackCount = captured,
+            toastDetail = "Photo prête dans Galerie · Star Trails ($captured poses) · Anti-CA"
+        )
     }
 
     private suspend fun runTimelapse(lens: LensInfo, manual: ManualSettings, opts: ModeOptions) {
@@ -1203,7 +1748,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val etaSec = estimateRemainingSec(sessionStartMs, captured, opts.calibrationFrames, nominalCycleSec)
             _uiState.update {
                 it.copy(
-                    captureProgress = CaptureProgressState(
+                    captureProgress = it.captureProgress.copy(
                         active = true,
                         mode = CaptureMode.CALIBRATION,
                         framesCaptured = captured,
@@ -1215,7 +1760,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
             }
-            val cap = cameraController.captureSingleFrame(calManual, CaptureMode.CALIBRATION, preferRaw = useRaw) ?: continue
+            val cap = captureFrameWithVibrationGuard(calManual, CaptureMode.CALIBRATION, preferRaw = useRaw) ?: continue
             cap.use { c ->
                 if (useRaw && c.rawImage != null) {
                     val plane = c.rawImage.planes[0]
@@ -1274,7 +1819,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun feedFrameToNative(
         cap: AstroCameraController.CapturedFrame,
         manual: ManualSettings,
-        previewBitmap: Bitmap?
+        previewBitmap: Bitmap?,
+        evMultiplier: Float = 1.0f
     ) = if (cap.rawImage != null) {
         val raw = cap.rawImage
         val plane = raw.planes[0]
@@ -1285,7 +1831,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         nativeEngine.addRawFrame(
             plane.buffer, raw.width, raw.height, plane.rowStride,
             cap.lens.cfaPattern, cap.lens.blackLevel, cap.lens.whiteLevel,
-            wbArr, bin2x2, previewBitmap
+            wbArr, bin2x2, previewBitmap, evMultiplier
         )
     } else if (cap.yuvImage != null && cap.yuvImage.planes.size >= 3) {
         val yuv = cap.yuvImage
@@ -1297,7 +1843,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             y.buffer, y.rowStride, y.pixelStride,
             u.buffer, u.rowStride, u.pixelStride,
             v.buffer, v.rowStride, v.pixelStride,
-            yuv.width, yuv.height, ds, previewBitmap
+            yuv.width, yuv.height, ds, previewBitmap, evMultiplier
         )
     } else {
         com.astropro.xiaomi14u.nativeengine.NativeStackReport()
@@ -1372,15 +1918,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(activeLabSession = item, labBusy = true, labShowOriginal = false) }
             val dims = nativeEngine.loadAstro32(item.astro32Path)
             if (dims != null) {
-                val useAuto = item.modeName.contains("PROFOND") || item.modeName.contains("PRO")
-                val defaultParams = LabParameters(
-                    autoStf = useAuto,
-                    bgNeutralize = useAuto
-                )
+                val matchedMode = CaptureMode.entries.firstOrNull {
+                    item.modeName.equals(it.label, ignoreCase = true) ||
+                        item.modeName.contains(it.shortLabel, ignoreCase = true)
+                } ?: CaptureMode.ASTRO_PRO
+                val defaultParams = autoLabParametersForMode(matchedMode)
                 _uiState.update {
                     it.copy(
                         labParams = defaultParams,
-                        activeLabPreset = if (useAuto) LabPreset.AUTO_STF else null,
+                        activeLabPreset = if (defaultParams.autoStf) LabPreset.AUTO_STF else null,
                         labBusy = false
                     )
                 }
@@ -1599,6 +2145,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             TargetCategory.DEEP_SKY -> CaptureMode.DEEP_SKY
             else -> CaptureMode.ASTRO_PRO
         }
+        _uiState.update { it.copy(compassTargetId = vis.target.id) }
         if (targetLens != null) {
             selectLens(targetLens)
         }
@@ -1606,10 +2153,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (targetMode != CaptureMode.LUNAR_PLANETARY && targetLens != null) {
             val npf = targetLens.npfSeconds(targetLens.defaultAperture, vis.target.decDeg)
             val snapped = NpfCalculator.snapToCameraShutter(npf, targetLens.minExposureSec, targetLens.maxExposureSec)
+            val calInf = calibratedInfinityFor(targetLens)
             updateManualSettings {
                 it.copy(
                     focusAuto = false,
-                    focusDistance = 0.0f,
+                    focusDistance = calInf,
                     shutterAuto = false,
                     shutterSeconds = snapped
                 )
@@ -1623,13 +2171,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         bannerJob?.cancel()
         _uiState.update { it.copy(statusBanner = message) }
         bannerJob = viewModelScope.launch {
-            delay(3200L)
+            delay(3600L)
             _uiState.update { it.copy(statusBanner = null) }
         }
     }
 
     override fun onCleared() {
         super.onCleared()
+        autoFocusJob?.cancel()
         captureJob?.cancel()
         orientationTracker.stop()
         cameraController.release()

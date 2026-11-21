@@ -215,7 +215,29 @@ class AstroSessionStore(private val context: Context) {
                 exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH, "${(focalMm * 100).toInt()}/100")
                 exif.saveAttributes()
             }
-            copyFileToPicturesMediaStore(tmp, fileName, "image/jpeg")
+            copyFileToDcimMediaStore(tmp, fileName, "image/jpeg")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun copyFileToDcimMediaStore(sourceFile: File, displayName: String, mimeType: String): String? {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/AstroPro14U")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return sourceFile.absolutePath
+            resolver.openOutputStream(uri)?.use { os ->
+                FileInputStream(sourceFile).use { fis -> fis.copyTo(os) }
+            }
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            "DCIM/AstroPro14U/$displayName"
         } catch (_: Throwable) {
             null
         }

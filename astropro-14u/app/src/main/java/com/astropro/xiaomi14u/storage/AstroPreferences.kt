@@ -11,6 +11,8 @@ data class SavedAstroPreferences(
     val showGridLevel: Boolean = true,
     val showHistogram: Boolean = true,
     val focusPeakingEnabled: Boolean = false,
+    val arSkyOverlayEnabled: Boolean = false,
+    val vibrationGuardEnabled: Boolean = true,
     val outputFormat: OutputFormatOption = OutputFormatOption.DNG_16B,
     val timerOption: TimerOption = TimerOption.OFF,
     val dimScreenDuringStack: Boolean = false,
@@ -18,7 +20,8 @@ data class SavedAstroPreferences(
 )
 
 /**
- * Lightweight SharedPreferences persistence for field astrophotography toggles and last observer location.
+ * Lightweight SharedPreferences persistence for field astrophotography toggles,
+ * per-lens calibrated infinity focus diopters, and last observer location.
  */
 class AstroPreferences(context: Context) {
 
@@ -52,6 +55,8 @@ class AstroPreferences(context: Context) {
             showGridLevel = prefs.getBoolean(KEY_SHOW_GRID_LEVEL, true),
             showHistogram = prefs.getBoolean(KEY_SHOW_HISTOGRAM, true),
             focusPeakingEnabled = prefs.getBoolean(KEY_FOCUS_PEAKING, false),
+            arSkyOverlayEnabled = prefs.getBoolean(KEY_AR_SKY_OVERLAY, false),
+            vibrationGuardEnabled = prefs.getBoolean(KEY_VIBRATION_GUARD, true),
             outputFormat = format,
             timerOption = timer,
             dimScreenDuringStack = prefs.getBoolean(KEY_DIM_DURING_STACK, false),
@@ -75,6 +80,14 @@ class AstroPreferences(context: Context) {
         prefs.edit().putBoolean(KEY_FOCUS_PEAKING, enabled).apply()
     }
 
+    fun setArSkyOverlay(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AR_SKY_OVERLAY, enabled).apply()
+    }
+
+    fun setVibrationGuard(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_VIBRATION_GUARD, enabled).apply()
+    }
+
     fun setOutputFormat(option: OutputFormatOption) {
         prefs.edit().putString(KEY_OUTPUT_FORMAT, option.name).apply()
     }
@@ -95,17 +108,48 @@ class AstroPreferences(context: Context) {
             .apply()
     }
 
+    /**
+     * Persists the V-Curve calibrated infinity diopter for a specific Xiaomi 14 Ultra physical lens ID.
+     */
+    fun saveCalibratedInfinity(lensId: String, diopter: Float) {
+        prefs.edit().putFloat("$KEY_CAL_INF_PREFIX$lensId", diopter.coerceAtLeast(0.0f)).apply()
+    }
+
+    /**
+     * Returns the saved calibrated infinity diopter for a lens ID, defaulting to 0.0f if not yet calibrated.
+     */
+    fun getCalibratedInfinity(lensId: String): Float {
+        return prefs.getFloat("$KEY_CAL_INF_PREFIX$lensId", 0.0f).coerceAtLeast(0.0f)
+    }
+
+    fun hasCalibratedInfinity(lensId: String): Boolean {
+        return prefs.contains("$KEY_CAL_INF_PREFIX$lensId")
+    }
+
+    fun getAllCalibratedInfinities(): Map<String, Float> {
+        val result = mutableMapOf<String, Float>()
+        for ((k, v) in prefs.all) {
+            if (k.startsWith(KEY_CAL_INF_PREFIX) && v is Float) {
+                result[k.removePrefix(KEY_CAL_INF_PREFIX)] = v
+            }
+        }
+        return result
+    }
+
     private companion object {
         const val PREFS_NAME = "astropro_14u_prefs"
         const val KEY_NIGHT_VISION = "night_vision"
         const val KEY_SHOW_GRID_LEVEL = "show_grid_level"
         const val KEY_SHOW_HISTOGRAM = "show_histogram"
         const val KEY_FOCUS_PEAKING = "focus_peaking"
+        const val KEY_AR_SKY_OVERLAY = "ar_sky_overlay"
+        const val KEY_VIBRATION_GUARD = "vibration_guard"
         const val KEY_OUTPUT_FORMAT = "output_format"
         const val KEY_TIMER_OPTION = "timer_option"
         const val KEY_DIM_DURING_STACK = "dim_during_stack"
         const val KEY_LOC_NAME = "obs_loc_name"
         const val KEY_LOC_LAT_BITS = "obs_loc_lat_bits"
         const val KEY_LOC_LON_BITS = "obs_loc_lon_bits"
+        const val KEY_CAL_INF_PREFIX = "cal_infinity_diopter_"
     }
 }

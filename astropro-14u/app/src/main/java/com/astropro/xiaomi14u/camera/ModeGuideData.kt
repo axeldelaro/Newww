@@ -21,6 +21,7 @@ data class ModeRecommendedPreset(
     // Mode-specific options
     val deepSkyFrames: Int? = null,
     val deepSkySigmaKappa: Float? = null,
+    val hdrBrackets: Int? = null,
     val planetaryFrames: Int? = null,
     val planetaryKeepPercent: Float? = null,
     val planetaryAutoWavelets: Boolean? = null,
@@ -36,6 +37,7 @@ data class ModeRecommendedPreset(
     fun applyToModeOptions(current: ModeOptions): ModeOptions = current.copy(
         deepSkyFrames = deepSkyFrames ?: current.deepSkyFrames,
         deepSkySigmaKappa = deepSkySigmaKappa ?: current.deepSkySigmaKappa,
+        hdrBrackets = hdrBrackets ?: current.hdrBrackets,
         planetaryFrames = planetaryFrames ?: current.planetaryFrames,
         planetaryKeepPercent = planetaryKeepPercent ?: current.planetaryKeepPercent,
         planetaryAutoWavelets = planetaryAutoWavelets ?: current.planetaryAutoWavelets,
@@ -56,6 +58,7 @@ data class ModeRecommendedPreset(
         add(shutterChipLabel)
         add("${wbKelvin}K")
         deepSkyFrames?.let { add("${it} poses") }
+        hdrBrackets?.let { add("${it} EV HDR") }
         planetaryKeepPercent?.let { add("Top ${(it * 100).toInt()}%") }
         starTrailStyle?.let { add(it.label) }
         timelapseIntervalSec?.let { add("Int. ${it}s") }
@@ -75,7 +78,7 @@ data class ModeGuideEntry(
 )
 
 /**
- * Curated field astrophotography guidance and Xiaomi 14 Ultra presets for all 6 capture modes.
+ * Curated field astrophotography guidance and Xiaomi 14 Ultra presets for all 7 capture modes.
  * Kept concise and scannable at night under Vision Nocturne.
  */
 object ModeGuideData {
@@ -83,6 +86,7 @@ object ModeGuideData {
     val ORDERED_MODES: List<CaptureMode> = listOf(
         CaptureMode.ASTRO_PRO,
         CaptureMode.DEEP_SKY,
+        CaptureMode.HDR_ASTRO,
         CaptureMode.LUNAR_PLANETARY,
         CaptureMode.STAR_TRAILS,
         CaptureMode.TIMELAPSE,
@@ -140,6 +144,32 @@ object ModeGuideData {
                 wbKelvin = 4200,
                 deepSkyFrames = 60,
                 deepSkySigmaKappa = 2.5f
+            )
+        ),
+        ModeGuideEntry(
+            mode = CaptureMode.HDR_ASTRO,
+            drawableRes = R.drawable.sample_hdr_astro,
+            title = "HDR ASTRO",
+            subtitle = "HDR ASTRO · Fusion 32-bit linéaire multi-EV",
+            quickHint = "HDR Astro · 1 clic · Fusionne 3 ou 5 expositions sans brûler le cœur",
+            sampleCaption = "120mm · 3 EV (-2/0/+2) · ISO 800 · Fusion 32b",
+            briefPoints = listOf(
+                ModeGuideBullet("Usage idéal", "Cœur brillant de M42 Orion, éclipses lunaires et Lune cendrée sans saturation."),
+                ModeGuideBullet("Objectif 14U", "Périscope 5x 120mm f/2.5 ou 3.2x 75mm f/1.8 sur trépied stable."),
+                ModeGuideBullet("Réglage clé", "Choisissez 3 EV ou 5 EV puis déclenchez : les paliers sont calculés tout seuls."),
+                ModeGuideBullet("Moteur C++", "Alignement auto + fusion radiance 32-bit linéaire + développement Auto-STF.")
+            ),
+            recommendedPreset = ModeRecommendedPreset(
+                recommendedZoomBadge = "5",
+                recommendedLensLabel = "5x 120mm",
+                recommendedEqMm = 120,
+                useNpfShutter = false,
+                shutterSec = 2.0,
+                shutterChipLabel = "2.0s",
+                iso = 800,
+                focusInfinity = true,
+                wbKelvin = 4200,
+                hdrBrackets = 3
             )
         ),
         ModeGuideEntry(

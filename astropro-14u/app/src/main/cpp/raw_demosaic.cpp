@@ -566,4 +566,203 @@ int computeFocusPeakingPoints(
     return outCount;
 }
 
+BestFocusStarResult findBestFocusStar(
+    const uint8_t* yPlane, int yRowStride, int yPixelStride,
+    int width, int height
+) {
+    BestFocusStarResult res{};
+    if (!yPlane || width < 32 || height < 32) return res;
+
+    const int pStride = std::max(1, yPixelStride);
+    const int rStride = yRowStride > 0 ? yRowStride : (width * pStride);
+
+    auto pixAt = [&](int x, int y) -> float {
+        return static_cast<float>(yPlane[static_cast<size_t>(y) * rStride + static_cast<size_t>(x) * pStride]);
+    };
+
+    // Search strictly inside the central 70% of the frame (auto-rejects border hot pixels & edge coma)
+    const int marginX = std::max(8, static_cast<int>(width * 0.15f));
+    const int marginY = std::max(8, static_cast<int>(height * 0.15f));
+    const int x0 = std::min(marginX, width / 2 - 4);
+    const int x1 = std::max(width - marginX, width / 2 + 4);
+    const int y0 = std::min(marginY, height / 2 - 4);
+    const int y1 = std::max(height - marginY, height / 2 + 4);
+
+    // 1. Estimate sky background median & MAD sigma inside central search window
+    const int bgStep = std::max(1, std::min(x1 - x0, y1 - y0) / 48);
+    std::vector<float> samples;
+    samples.reserve(4096);
+    for (int y = y0; y < y1; y += bgStep) {
+        for (int x = x0; x < x1; x += bgStep) {
+            samples.push_back(pixAt(x, y));
+        }
+    }
+    if (samples.empty()) return res;
+
+    const size_t mid = samples.size() / 2;
+    std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
+    const float bgMed = samples[mid];
+    for (float& v : samples) v = std::abs(v - bgMed);
+    std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
+    const float bgSig = std::max(1.4826f * samples[mid], 1.2f);
+
+    const float detThresh = bgMed + std::max(6.0f * bgSig, 12.0f);
+    const float nbrThresh = bgMed + std::max(2.0f * bgSig, 5.0f);
+
+    BestFocusStarResult bestUnsat{};
+    float bestUnsatScore = -1.0f;
+    BestFocusStarResult bestSat{};
+    float bestSatScore = -1.0f;
+
+    static constexpr int kRingDx[8] = {7, 5, 0, -5, -7, -5, 0, 5};
+    static constexpr int kRingDy[8] = {0, 5, 7, 5, 0, -5, -7, -5};
+
+    // 2. Scan for compact bright unsaturated stars in central 70%
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const float v = pixAt(x, y);
+            if (v < detThresh) continue;
+
+            // Strict 5x5 local maximum
+            bool isMax = true;
+            for (int dy = -2; dy <= 2 && isMax; ++dy) {
+                for (int dx = -2; dx <= 2; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    const float nv = pixAt(x + dx, y + dy);
+                    if (nv > v || (nv == v && (dy < 0 || (dy == 0 && dx < 0)))) {
+                        isMax = false;
+                        break;
+                    }
+                }
+            }
+            if (!isMax) continue;
+
+            // Reject single-pixel hot pixels (require >= 2 of 4 direct neighbors above bg + 2*sigma)
+            const float nL = pixAt(x - 1, y);
+            const float nR = pixAt(x + 1, y);
+            const float nU = pixAt(x, y - 1);
+            const float nD = pixAt(x, y + 1);
+            int brightNbrs = 0;
+            if (nL > nbrThresh) brightNbrs++;
+            if (nR > nbrThresh) brightNbrs++;
+            if (nU > nbrThresh) brightNbrs++;
+            if (nD > nbrThresh) brightNbrs++;
+            if (brightNbrs < 2) continue;
+
+            // Verify compact star PSF (outer radius-7 ring must fall back toward background)
+            float ringSum = 0.0f;
+            for (int k = 0; k < 8; ++k) {
+                ringSum += pixAt(x + kRingDx[k], y + kRingDy[k]);
+            }
+            const float ringMean = ringSum * 0.125f;
+            const float aboveBg = v - bgMed;
+            if (ringMean > bgMed + 0.45f * aboveBg) continue;
+
+            // Sub-pixel centroid & integrated flux in 9x9 aperture
+            double sumW = 0.0, sumX = 0.0, sumY = 0.0;
+            int satPixels = 0;
+            for (int dy = -4; dy <= 4; ++dy) {
+                for (int dx = -4; dx <= 4; ++dx) {
+                    if (dx * dx + dy * dy > 18) continue;
+                    const float pv = pixAt(x + dx, y + dy);
+                    if (pv >= 250.0f) satPixels++;
+                    const float excess = pv - bgMed;
+                    if (excess > 2.0f * bgSig) {
+                        sumW += excess;
+                        sumX += excess * (x + dx);
+                        sumY += excess * (y + dy);
+                    }
+                }
+            }
+            if (sumW <= 1.0) continue;
+
+            const float cx = static_cast<float>(sumX / sumW);
+            const float cy = static_cast<float>(sumY / sumW);
+            const float snr = aboveBg / bgSig;
+            // Subtle center preference (1.0 at center -> 0.85 near 70% edge)
+            const float distNorm = std::hypot((cx / width) - 0.5f, (cy / height) - 0.5f);
+            const float centerWeight = std::max(0.80f, 1.0f - 0.4f * distNorm);
+            const float score = static_cast<float>(sumW) * centerWeight;
+
+            const bool isSaturated = (v >= 247.0f) || (satPixels >= 2);
+            if (!isSaturated) {
+                if (score > bestUnsatScore) {
+                    bestUnsatScore = score;
+                    bestUnsat.found = true;
+                    bestUnsat.isStar = true;
+                    bestUnsat.normX = std::clamp(cx / static_cast<float>(width), 0.05f, 0.95f);
+                    bestUnsat.normY = std::clamp(cy / static_cast<float>(height), 0.05f, 0.95f);
+                    bestUnsat.peak = v / 255.0f;
+                    bestUnsat.snr = snr;
+                }
+            } else {
+                if (score > bestSatScore) {
+                    bestSatScore = score;
+                    bestSat.found = true;
+                    bestSat.isStar = true;
+                    bestSat.normX = std::clamp(cx / static_cast<float>(width), 0.05f, 0.95f);
+                    bestSat.normY = std::clamp(cy / static_cast<float>(height), 0.05f, 0.95f);
+                    bestSat.peak = v / 255.0f;
+                    bestSat.snr = snr;
+                }
+            }
+        }
+    }
+
+    if (bestUnsat.found) return bestUnsat;
+    if (bestSat.found) return bestSat;
+
+    // 3. Fallback: sharpest lunar crater / horizon high-contrast tile inside central 70%
+    constexpr int kTilesX = 10;
+    constexpr int kTilesY = 8;
+    const int spanX = std::max(1, x1 - x0);
+    const int spanY = std::max(1, y1 - y0);
+    const int step = std::max(1, std::min(spanX, spanY) / 160);
+
+    double bestTileGrad = 35.0; // Noise floor
+    float bestTx = 0.5f, bestTy = 0.5f;
+    bool foundContrast = false;
+
+    for (int ty = 0; ty < kTilesY; ++ty) {
+        const int ty0 = y0 + (ty * spanY) / kTilesY;
+        const int ty1 = y0 + ((ty + 1) * spanY) / kTilesY;
+        for (int tx = 0; tx < kTilesX; ++tx) {
+            const int tx0 = x0 + (tx * spanX) / kTilesX;
+            const int tx1 = x0 + ((tx + 1) * spanX) / kTilesX;
+            double gradSum = 0.0;
+            int cnt = 0;
+            for (int y = std::max(1, ty0); y < std::min(height - 1, ty1); y += step) {
+                for (int x = std::max(1, tx0); x < std::min(width - 1, tx1); x += step) {
+                    const float gx = -pixAt(x - 1, y - 1) + pixAt(x + 1, y - 1)
+                                     - 2.0f * pixAt(x - 1, y) + 2.0f * pixAt(x + 1, y)
+                                     - pixAt(x - 1, y + 1) + pixAt(x + 1, y + 1);
+                    const float gy = -pixAt(x - 1, y - 1) - 2.0f * pixAt(x, y - 1) - pixAt(x + 1, y - 1)
+                                     + pixAt(x - 1, y + 1) + 2.0f * pixAt(x, y + 1) + pixAt(x + 1, y + 1);
+                    gradSum += static_cast<double>(gx * gx + gy * gy);
+                    cnt++;
+                }
+            }
+            if (cnt > 0) {
+                const double meanGrad = gradSum / static_cast<double>(cnt);
+                if (meanGrad > bestTileGrad) {
+                    bestTileGrad = meanGrad;
+                    bestTx = (0.5f * (tx0 + tx1)) / static_cast<float>(width);
+                    bestTy = (0.5f * (ty0 + ty1)) / static_cast<float>(height);
+                    foundContrast = true;
+                }
+            }
+        }
+    }
+
+    if (foundContrast) {
+        res.found = true;
+        res.isStar = false;
+        res.normX = std::clamp(bestTx, 0.15f, 0.85f);
+        res.normY = std::clamp(bestTy, 0.15f, 0.85f);
+        res.peak = 1.0f;
+        res.snr = static_cast<float>(std::sqrt(bestTileGrad));
+    }
+    return res;
+}
+
 } // namespace astro

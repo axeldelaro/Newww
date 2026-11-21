@@ -18,15 +18,16 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 2. AstroPro 14U (`astropro-14u/` — v1.1.0)
-**Appareil Photo Astrophotographie Dédié Xiaomi 14 Ultra — Interface HyperOS / Leica Pro**
+## 2. AstroPro 14U (`astropro-14u/` — v2.0.0)
+**Appareil Photo Astrophotographie Dédié Xiaomi 14 Ultra — Interface HyperOS / Leica Pro + Pipeline Automatique**
 
 - **Package** : `com.astropro.xiaomi14u` (Android 10+ / `arm64-v8a`, zéro permission réseau)
-- **Guide Terrain & Exemples Photo par Mode (Style Xiaomi HyperOS)** :
-  - **6 exemples photo astrophotographiques réalistes** (1 par mode : *Astro Pro*, *Ciel Profond*, *Lune & Planètes*, *Star Trails Comète*, *Timelapse*, *Calibration Avant/Après*), **4 points explicatifs brefs** et bouton 1-tap **« Appliquer ces réglages »** (100 % compatible Vision Nocturne OLED rouge).
-- **Détection Multi-Objectifs Xiaomi 14 Ultra (`XiaomiLensProbe`)** : Scan 3 niveaux (`cameraIdList` + `physicalCameraIds` + IDs `0..64` HyperOS/CamX), bascule 3 paliers, ouverture variable `f/1.63–f/4.0` (23 mm 1" LYT-900), 12 mm UGA, 75 mm 3.2×, 120 mm 5×, diagnostic HAL JSON.
-- **Interface Fidèle Xiaomi HyperOS Camera Pro** : Noir OLED pur `#000000`, Or Pro `#F5B82E`, molettes crantées haptiques (`WB`, `F` + `∞`, `S` + `NPF`, `ISO`, `f/`, `EV`), **Focus Peaking C++ temps réel (`0,3 ms`)**, anneau compte à rebours pose longue + ETA empilement, histogramme RGB live, niveau 2 axes, loupe 10× **FWHM / HFD**, déclenchement sans vibration, **Mode Vision Nocturne OLED Rouge** 1-tap et persistance automatique des préférences.
-- **Moteur C++20 16-Bit Natif (`libastropro_native.so`)** : Astro Pro RAW DNG, Ciel Profond (Live Stacking alignement par astérismes + Kappa-Sigma), Lune & Planètes (Lucky Imaging + ondelettes À Trous), Star Trails (+ Comète), Timelapse MP4 matériel, Calibration Dark/Flat/Bias, **Labo 16-bit avec Presets 1-tap** + exports **TIFF 16-bit / FITS 32-bit / DNG / JPEG HD**, et Éphémérides Jean Meeus hors-ligne.
+- **Autofocus Stellaire Courbe en V (`AF ★`) + Infini Mémorisé par Objectif** : repère tout seul la meilleure étoile non saturée, balaie 12 pas autour de l’infini, verrouille le minimum FWHM/HFD et mémorise la calibration par objectif (`12 / 23 / 75 / 120 mm`).
+- **AR Sky Overlay sur le Viseur (toggle `AR`)** : projette en direct la Voie Lactée, Polaris et les 12 cibles majeures selon le `FOV` optique réel + flèche de guidage vers la cible (100 % Vision Nocturne OLED rouge).
+- **Paysage + Ciel Séparé 100 % Automatique** : détection auto de l’horizon en C++20 ; empile le ciel aligné sur les étoiles et le premier plan fixe sans flou de bougé (zéro tracé manuel).
+- **Mode HDR Astro Automatique (`3 EV / 5 EV`)** + **Super-Résolution Drizzle 2×** + **Déconvolution Richardson-Lucy & Anti-Aberration Chromatique automatiques** + **Rejet Anti-Vibration / Vent automatique** (gyroscope + accéléromètre).
+- **Pipeline Post-Capture Zéro Effort** : Auto-STF + retrait gradient 2D + Anti-CA + netteté appliqués automatiquement, JPEG HD directement dans `DCIM/AstroPro14U` + master 32-bit `.astro32`.
+- **Guide Terrain & 7 Exemples Photo Réalistes par Mode** (1 par mode + bouton 1-tap *Appliquer ces réglages*), détection multi-objectifs Xiaomi 14 Ultra (`0..64` CamX, `f/1.63–f/4.0`), Focus Peaking C++ (`0,3 ms`), Live Stacking Kappa-Sigma, Lucky Imaging + ondelettes, Star Trails, Timelapse MP4, exports **TIFF 16-bit / FITS 32-bit / DNG / JPEG HD**, Éphémérides Jean Meeus.
 
 ---
 

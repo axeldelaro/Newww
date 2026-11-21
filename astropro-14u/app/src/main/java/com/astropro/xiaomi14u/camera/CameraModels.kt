@@ -101,6 +101,7 @@ enum class CaptureMode(val label: String, val shortLabel: String) {
     CALIBRATION("CALIBRATION", "CALIBRATION"),
     TIMELAPSE("TIMELAPSE", "TIMELAPSE"),
     STAR_TRAILS("STAR TRAILS", "STAR TRAILS"),
+    HDR_ASTRO("HDR ASTRO", "HDR Astro"),
     ASTRO_PRO("ASTRO PRO", "ASTRO PRO"),
     DEEP_SKY("CIEL PROFOND", "CIEL PROFOND"),
     LUNAR_PLANETARY("LUNE / PLANÈTES", "LUNE / PLANÈTES")
@@ -165,10 +166,15 @@ data class ModeOptions(
     val deepSkySigmaKappa: Float = 2.5f,
     val useAutoDark: Boolean = true,
     val useAutoFlat: Boolean = true,
+    val deepSkyLandscapeAuto: Boolean = true,
+    val deepSkyDrizzle2x: Boolean = false,
+    // HDR Astro
+    val hdrBrackets: Int = 3, // 3 (-2/0/+2 EV) or 5 (-3/-1.5/0/+1.5/+3 EV)
     // Lunar / Planetary
     val planetaryFrames: Int = 60,
     val planetaryKeepPercent: Float = 0.25f,
     val planetaryAutoWavelets: Boolean = true,
+    val planetaryDrizzle2x: Boolean = false,
     // Star Trails
     val starTrailStyle: StarTrailStyle = StarTrailStyle.STANDARD,
     val cometTailLength: CometTailLength = CometTailLength.MEDIUM,
@@ -181,6 +187,25 @@ data class ModeOptions(
     // Calibration
     val calibrationKind: CalibrationKind = CalibrationKind.DARK,
     val calibrationFrames: Int = 15
+)
+
+data class AutoFocusSample(
+    val diopter: Float,
+    val fwhmPx: Float,
+    val hfdPx: Float,
+    val sharpnessScore: Float,
+    val starFound: Boolean
+)
+
+data class AutoFocusState(
+    val running: Boolean = false,
+    val currentStep: Int = 0,
+    val totalSteps: Int = 12,
+    val currentDiopter: Float = 0.0f,
+    val samples: List<AutoFocusSample> = emptyList(),
+    val bestDiopter: Float? = null,
+    val bestFwhmPx: Float? = null,
+    val statusText: String = ""
 )
 
 data class HistogramData(
@@ -231,6 +256,8 @@ data class CaptureProgressState(
     val framesTarget: Int = 1, // 0 = unlimited
     val framesAccepted: Int = 0,
     val framesRejected: Int = 0,
+    val vibrationRejectedCount: Int = 0,
+    val landscapeHorizonDetected: Boolean = false,
     val starsDetected: Int = 0,
     val residualPx: Float = 0f,
     val elapsedExposureSec: Double = 0.0,
@@ -272,7 +299,10 @@ data class LevelOrientationState(
     val rollDeg: Float = 0f,
     val pitchDeg: Float = 0f,
     val azimuthDeg: Float = 0f,
-    val altitudeDeg: Float = 0f
+    val altitudeDeg: Float = 0f,
+    val cameraAzimuthDeg: Float = 0f,
+    val cameraAltitudeDeg: Float = 0f,
+    val cameraRollDeg: Float = 0f
 ) {
     val isLevel: Boolean get() = kotlin.math.abs(rollDeg) < 0.5f && kotlin.math.abs(pitchDeg) < 0.5f
 }

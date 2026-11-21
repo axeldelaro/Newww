@@ -60,6 +60,9 @@ fun XiaomiProTickDial(
     tertiaryActionLabel: String? = null,
     tertiaryActionActive: Boolean = false,
     onTertiaryAction: (() -> Unit)? = null,
+    quaternaryActionLabel: String? = null,
+    quaternaryActionActive: Boolean = false,
+    onQuaternaryAction: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -81,13 +84,13 @@ fun XiaomiProTickDial(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp),
+                .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
                 if (quickActionLabel != null && onQuickAction != null) {
                     DialQuickPill(
@@ -119,12 +122,22 @@ fun XiaomiProTickDial(
                         }
                     )
                 }
+                if (quaternaryActionLabel != null && onQuaternaryAction != null) {
+                    DialQuickPill(
+                        label = quaternaryActionLabel,
+                        active = quaternaryActionActive,
+                        onClick = {
+                            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            onQuaternaryAction()
+                        }
+                    )
+                }
             }
 
             // Active value directly aligned over center needle
             Text(
                 text = if (quickActionActive && quickActionLabel != null) quickActionLabel else currentLabel,
-                style = tabularStyle(size = 14.sp, weight = FontWeight.SemiBold, color = colors.accent)
+                style = tabularStyle(size = 13.5.sp, weight = FontWeight.SemiBold, color = colors.accent)
             )
 
             Text(

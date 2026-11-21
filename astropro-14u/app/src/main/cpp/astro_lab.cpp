@@ -364,6 +364,346 @@ void applyBilateralDenoise(FloatImageRGB& img, float strength) {
     img.b.swap(outB);
 }
 
+namespace {
+
+inline float sampleBilinearPlane(const std::vector<float>& ch, int w, int h, float x, float y) {
+    const float cx = std::clamp(x, 0.0f, static_cast<float>(w - 1));
+    const float cy = std::clamp(y, 0.0f, static_cast<float>(h - 1));
+    const int x0 = static_cast<int>(cx);
+    const int y0 = static_cast<int>(cy);
+    const int x1 = std::min(x0 + 1, w - 1);
+    const int y1 = std::min(y0 + 1, h - 1);
+    const float fx = cx - x0;
+    const float fy = cy - y0;
+    const size_t r0 = static_cast<size_t>(y0) * w;
+    const size_t r1 = static_cast<size_t>(y1) * w;
+    const float top = ch[r0 + x0] * (1.0f - fx) + ch[r0 + x1] * fx;
+    const float bot = ch[r1 + x0] * (1.0f - fx) + ch[r1 + x1] * fx;
+    return top * (1.0f - fy) + bot * fy;
+}
+
+void convolveGaussianSeparable(
+    const std::vector<float>& src, int w, int h,
+    const std::vector<float>& kernel, int rad,
+    std::vector<float>& tmp, std::vector<float>& dst
+) {
+    const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+    tmp.resize(n);
+    dst.resize(n);
+
+    // Horizontal pass
+    for (int y = 0; y < h; ++y) {
+        const float* sRow = src.data() + static_cast<size_t>(y) * w;
+        float* tRow = tmp.data() + static_cast<size_t>(y) * w;
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            for (int k = -rad; k <= rad; ++k) {
+                const int sx = std::clamp(x + k, 0, w - 1);
+                acc += kernel[static_cast<size_t>(k + rad)] * sRow[sx];
+            }
+            tRow[x] = acc;
+        }
+    }
+
+    // Vertical pass
+    for (int y = 0; y < h; ++y) {
+        float* dRow = dst.data() + static_cast<size_t>(y) * w;
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            for (int k = -rad; k <= rad; ++k) {
+                const int sy = std::clamp(y + k, 0, h - 1);
+                acc += kernel[static_cast<size_t>(k + rad)] * tmp[static_cast<size_t>(sy) * w + x];
+            }
+            dRow[x] = acc;
+        }
+    }
+}
+
+} // namespace
+
+void applyChromaticAberrationFix(FloatImageRGB& img, float strength) {
+    if (!img.valid() || img.width < 16 || img.height < 16 || strength <= 0.005f) return;
+    const float s = std::clamp(strength, 0.0f, 1.0f);
+    const int w = img.width;
+    const int h = img.height;
+    const size_t n = img.pixelCount();
+
+    float madG = 0.005f;
+    const float medG = computeChannelMedianAndMad(img.g, madG);
+    float maxG = 0.01f;
+    for (size_t i = 0; i < n; ++i) {
+        if (img.g[i] > maxG) maxG = img.g[i];
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 1: Automatic Sub-Pixel Radial Lateral CA Estimation & Realignment
+    // -----------------------------------------------------------------
+    const float cx = 0.5f * static_cast<float>(w - 1);
+    const float cy = 0.5f * static_cast<float>(h - 1);
+    const float maxR = std::max(1.0f, std::hypot(cx, cy));
+
+    struct EdgeSample {
+        float x, y;
+        float ux, uy;
+        float dG;
+    };
+    std::vector<EdgeSample> samples;
+    samples.reserve(900);
+
+    const float gradFloor = std::max(3.5f * madG, (maxG - medG) * 0.035f);
+    const int step = std::max(1, std::min(w, h) / 140);
+
+    for (int y = 4; y < h - 4; y += step) {
+        for (int x = 4; x < w - 4; x += step) {
+            const float dx = static_cast<float>(x) - cx;
+            const float dy = static_cast<float>(y) - cy;
+            const float r = std::hypot(dx, dy);
+            if (r < 0.28f * maxR || r > 0.96f * maxR) continue;
+            const float invR = 1.0f / r;
+            const float ux = dx * invR;
+            const float uy = dy * invR;
+            const float gP = sampleBilinearPlane(img.g, w, h, x + ux, y + uy);
+            const float gM = sampleBilinearPlane(img.g, w, h, x - ux, y - uy);
+            const float dG = gP - gM;
+            if (std::abs(dG) > gradFloor) {
+                samples.push_back({static_cast<float>(x), static_cast<float>(y), ux, uy, dG});
+                if (samples.size() >= 900) break;
+            }
+        }
+        if (samples.size() >= 900) break;
+    }
+
+    auto estimateRadialDelta = [&](const std::vector<float>& ch) -> float {
+        if (samples.size() < 12) return 0.0f;
+
+        auto evalCorr = [&](float delta) -> double {
+            double dot = 0.0, normG = 0.0, normC = 0.0;
+            const float scale = 1.0f + delta;
+            for (const auto& sp : samples) {
+                const float sx = cx + (sp.x - cx) * scale;
+                const float sy = cy + (sp.y - cy) * scale;
+                if (sx < 2.0f || sx > w - 3.0f || sy < 2.0f || sy > h - 3.0f) continue;
+                const float cP = sampleBilinearPlane(ch, w, h, sx + sp.ux, sy + sp.uy);
+                const float cM = sampleBilinearPlane(ch, w, h, sx - sp.ux, sy - sp.uy);
+                const float dC = cP - cM;
+                dot += static_cast<double>(sp.dG) * static_cast<double>(dC);
+                normG += static_cast<double>(sp.dG) * static_cast<double>(sp.dG);
+                normC += static_cast<double>(dC) * static_cast<double>(dC);
+            }
+            const double denom = std::sqrt(normG * normC);
+            return denom > 1e-12 ? (dot / denom) : 0.0;
+        };
+
+        constexpr int kSteps = 17;
+        constexpr float kStepSize = 0.002f; // searches [-1.6% .. +1.6%] radial scale
+        double scores[kSteps];
+        int bestIdx = kSteps / 2;
+        double bestScore = -2.0;
+
+        for (int i = 0; i < kSteps; ++i) {
+            const float delta = (i - kSteps / 2) * kStepSize;
+            scores[i] = evalCorr(delta);
+            if (scores[i] > bestScore) {
+                bestScore = scores[i];
+                bestIdx = i;
+            }
+        }
+
+        const double zeroScore = scores[kSteps / 2];
+        if (bestScore < 0.35 || bestScore <= zeroScore + 0.0015) {
+            return 0.0f;
+        }
+
+        float bestDelta = (bestIdx - kSteps / 2) * kStepSize;
+        if (bestIdx > 0 && bestIdx < kSteps - 1) {
+            const double yM = scores[bestIdx - 1];
+            const double y0 = scores[bestIdx];
+            const double yP = scores[bestIdx + 1];
+            const double den = yM - 2.0 * y0 + yP;
+            if (den < -1e-10) {
+                const float off = std::clamp(static_cast<float>(0.5 * (yM - yP) / den), -0.5f, 0.5f);
+                bestDelta += off * kStepSize;
+            }
+        }
+        return std::clamp(bestDelta, -0.018f, 0.018f);
+    };
+
+    const float deltaR = estimateRadialDelta(img.r) * s;
+    const float deltaB = estimateRadialDelta(img.b) * s;
+
+    if (std::abs(deltaR) > 1e-4f || std::abs(deltaB) > 1e-4f) {
+        std::vector<float> newR(n), newB(n);
+        const float scaleR = 1.0f + deltaR;
+        const float scaleB = 1.0f + deltaB;
+        for (int y = 0; y < h; ++y) {
+            const float dy = static_cast<float>(y) - cy;
+            const float syR = cy + dy * scaleR;
+            const float syB = cy + dy * scaleB;
+            const size_t row = static_cast<size_t>(y) * w;
+            for (int x = 0; x < w; ++x) {
+                const float dx = static_cast<float>(x) - cx;
+                newR[row + x] = (std::abs(deltaR) > 1e-4f)
+                    ? sampleBilinearPlane(img.r, w, h, cx + dx * scaleR, syR)
+                    : img.r[row + x];
+                newB[row + x] = (std::abs(deltaB) > 1e-4f)
+                    ? sampleBilinearPlane(img.b, w, h, cx + dx * scaleB, syB)
+                    : img.b[row + x];
+            }
+        }
+        img.r.swap(newR);
+        img.b.swap(newB);
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 2: High-Contrast Axial Purple/Magenta & Green Fringe Suppression
+    // -----------------------------------------------------------------
+    std::vector<float> edgeMag(n, 0.0f);
+    for (int y = 1; y < h - 1; ++y) {
+        const size_t rPrev = static_cast<size_t>(y - 1) * w;
+        const size_t rCurr = static_cast<size_t>(y) * w;
+        const size_t rNext = static_cast<size_t>(y + 1) * w;
+        for (int x = 1; x < w - 1; ++x) {
+            const float gx = -img.g[rPrev + x - 1] + img.g[rPrev + x + 1]
+                             - 2.0f * img.g[rCurr + x - 1] + 2.0f * img.g[rCurr + x + 1]
+                             - img.g[rNext + x - 1] + img.g[rNext + x + 1];
+            const float gy = -img.g[rPrev + x - 1] - 2.0f * img.g[rPrev + x] - img.g[rPrev + x + 1]
+                             + img.g[rNext + x - 1] + 2.0f * img.g[rNext + x] + img.g[rNext + x + 1];
+            edgeMag[rCurr + x] = 0.25f * std::hypot(gx, gy);
+        }
+    }
+
+    const float spanG = std::max(0.02f, maxG - medG);
+    const float edgeLo = std::max(2.5f * madG, spanG * 0.020f);
+    const float edgeHi = std::max(10.0f * madG, spanG * 0.12f);
+    const float invEdgeSpan = 1.0f / std::max(1e-5f, edgeHi - edgeLo);
+    const float fringeFloor = std::max(1.8f * madG, spanG * 0.012f);
+
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            // 3x3 max edge strength catches fringes right outside high-contrast star & lunar edges
+            float localEdge = 0.0f;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const size_t row = static_cast<size_t>(y + dy) * w;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    localEdge = std::max(localEdge, edgeMag[row + (x + dx)]);
+                }
+            }
+            const float edgeW = std::clamp((localEdge - edgeLo) * invEdgeSpan, 0.0f, 1.0f);
+            if (edgeW <= 0.01f) continue;
+
+            const size_t idx = static_cast<size_t>(y) * w + x;
+            float r = img.r[idx];
+            float g = img.g[idx];
+            float b = img.b[idx];
+
+            // Axial purple/magenta fringe (both R and B exceed G; preserves pure red Ha & pure blue nebulae!)
+            const float minRB = std::min(r, b);
+            const float purpleExcess = minRB - g;
+            if (purpleExcess > fringeFloor) {
+                const float pull = s * edgeW * 0.88f;
+                r = std::max(0.0f, r - purpleExcess * pull);
+                b = std::max(0.0f, b - purpleExcess * pull);
+                g = g + purpleExcess * pull * 0.25f;
+            } else {
+                // Green axial fringe on opposite focus side
+                const float maxRB = std::max(r, b);
+                const float greenExcess = g - maxRB;
+                if (greenExcess > fringeFloor) {
+                    g = std::max(0.0f, g - greenExcess * (s * edgeW * 0.72f));
+                }
+            }
+
+            img.r[idx] = r;
+            img.g[idx] = g;
+            img.b[idx] = b;
+        }
+    }
+}
+
+void applyRichardsonLucyDeconv(FloatImageRGB& img, float strength, float psfSigma) {
+    if (!img.valid() || img.width < 8 || img.height < 8 || strength <= 0.005f) return;
+    const float s = std::clamp(strength, 0.0f, 1.0f);
+    const int w = img.width;
+    const int h = img.height;
+    const size_t n = img.pixelCount();
+
+    const int iters = std::clamp(static_cast<int>(std::round(1.0f + s * 5.0f)), 1, 6);
+    const float sigma = std::clamp(psfSigma, 0.65f, 2.5f);
+    const int rad = std::clamp(static_cast<int>(std::ceil(sigma * 3.0f)), 2, 6);
+
+    // Normalized 1D separable Gaussian PSF kernel
+    std::vector<float> kernel(static_cast<size_t>(2 * rad + 1));
+    float kSum = 0.0f;
+    const float inv2s2 = 1.0f / (2.0f * sigma * sigma);
+    for (int k = -rad; k <= rad; ++k) {
+        const float v = std::exp(-(static_cast<float>(k * k)) * inv2s2);
+        kernel[static_cast<size_t>(k + rad)] = v;
+        kSum += v;
+    }
+    for (float& kv : kernel) kv /= kSum;
+
+    // Extract luminance L0
+    std::vector<float> luma0(n);
+    for (size_t i = 0; i < n; ++i) {
+        luma0[i] = std::max(0.0f, 0.2126f * img.r[i] + 0.7152f * img.g[i] + 0.0722f * img.b[i]);
+    }
+
+    // Automatic sky-noise protection damping mask (smooth ramp above median + 2.5*MAD)
+    float bgMad = 0.002f;
+    const float bgMed = computeChannelMedianAndMad(luma0, bgMad);
+    const float maskLo = bgMed + 2.5f * bgMad;
+    const float maskHi = bgMed + 5.5f * bgMad;
+    const float invMaskSpan = 1.0f / std::max(1e-5f, maskHi - maskLo);
+
+    std::vector<float> dampMask(n, 0.0f);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float lMax = 0.0f;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int ny = std::clamp(y + dy, 0, h - 1);
+                const size_t row = static_cast<size_t>(ny) * w;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int nx = std::clamp(x + dx, 0, w - 1);
+                    lMax = std::max(lMax, luma0[row + nx]);
+                }
+            }
+            const float t = std::clamp((lMax - maskLo) * invMaskSpan, 0.0f, 1.0f);
+            dampMask[static_cast<size_t>(y) * w + x] = t * t * (3.0f - 2.0f * t);
+        }
+    }
+
+    std::vector<float> est = luma0;
+    std::vector<float> conv(n), ratio(n), corr(n), tmp(n);
+    const float stepGain = 0.65f + 0.35f * s;
+
+    for (int it = 0; it < iters; ++it) {
+        convolveGaussianSeparable(est, w, h, kernel, rad, tmp, conv);
+        for (size_t i = 0; i < n; ++i) {
+            ratio[i] = std::clamp(luma0[i] / std::max(conv[i], 1e-5f), 0.15f, 4.5f);
+        }
+        convolveGaussianSeparable(ratio, w, h, kernel, rad, tmp, corr);
+        for (size_t i = 0; i < n; ++i) {
+            const float m = dampMask[i];
+            if (m <= 1e-4f) continue;
+            const float factor = std::clamp(1.0f + m * stepGain * (corr[i] - 1.0f), 0.35f, 2.2f);
+            est[i] = std::max(0.0f, est[i] * factor);
+        }
+    }
+
+    // Blend deconvolved luminance and reconstruct RGB preserving color ratios cleanly
+    const float blend = std::clamp(0.35f + 0.65f * s, 0.0f, 1.0f);
+    for (size_t i = 0; i < n; ++i) {
+        const float oldL = luma0[i];
+        if (oldL > 1e-5f) {
+            const float newL = oldL * (1.0f - blend) + est[i] * blend;
+            const float rMul = std::clamp(newL / oldL, 0.25f, 3.0f);
+            img.r[i] = std::max(0.0f, img.r[i] * rMul);
+            img.g[i] = std::max(0.0f, img.g[i] * rMul);
+            img.b[i] = std::max(0.0f, img.b[i] * rMul);
+        }
+    }
+}
+
 void processAstroLab(
     const FloatImageRGB& inputLinear,
     const LabParams& params,
@@ -396,6 +736,35 @@ void processAstroLab(
             out.r[i] = std::max(0.0f, out.r[i] * rGain);
             out.g[i] = std::max(0.0f, out.g[i] * gGain);
             out.b[i] = std::max(0.0f, out.b[i] * bGain);
+        }
+    }
+
+    // 3b. Linear Regularized Richardson-Lucy Deconvolution (physically exact before non-linear stretch!)
+    if (params.deconvolution > 0.005f) {
+        applyRichardsonLucyDeconv(out, params.deconvolution, 1.15f);
+    }
+
+    // 3c. Linear Chromatic Aberration Fix (sub-pixel radial R/B alignment + purple/green fringe removal)
+    if (params.chromaticAberrationFix > 0.005f) {
+        applyChromaticAberrationFix(out, params.chromaticAberrationFix);
+    }
+
+    // 3d. Automatic HDR Linear Radiance Soft-Shoulder Compression (preserves >1.0 unclipped HDR nebula cores!)
+    float maxLinear = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        maxLinear = std::max(maxLinear, std::max(out.r[i], std::max(out.g[i], out.b[i])));
+    }
+    if (maxLinear > 1.05f) {
+        const float kHdr = 3.5f;
+        const float invNorm = 1.0f / std::asinh(kHdr * maxLinear);
+        for (size_t i = 0; i < n; ++i) {
+            const float I = (out.r[i] + out.g[i] + out.b[i]) * (1.0f / 3.0f);
+            if (I > 1e-7f) {
+                const float factor = (std::asinh(kHdr * I) * invNorm) / I;
+                out.r[i] = std::clamp(out.r[i] * factor, 0.0f, 1.0f);
+                out.g[i] = std::clamp(out.g[i] * factor, 0.0f, 1.0f);
+                out.b[i] = std::clamp(out.b[i] * factor, 0.0f, 1.0f);
+            }
         }
     }
 
