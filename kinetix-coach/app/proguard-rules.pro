@@ -1,0 +1,3 @@
+-keep class com.kinetix.coach.llm.LlamaBridge { *; }
+-keep interface com.kinetix.coach.llm.TokenCallback { *; }
+-keep class com.google.mediapipe.** { *; }

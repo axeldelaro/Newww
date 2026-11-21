@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Left vertical precision pillar of K -->
+    <path
+        android:fillColor="#F5F6F8"
+        android:pathData="M33,28h10v52h-10z" />
+    <!-- Upper angular stroke in Signal Orange -->
+    <path
+        android:fillColor="#FF4D1C"
+        android:pathData="M46,52L66,28h12L55,54z" />
+    <!-- Lower angular drive stroke in Crisp White -->
+    <path
+        android:fillColor="#F5F6F8"
+        android:pathData="M48,54L56,49L78,80h-12z" />
+    <!-- Signal Orange calibration dot -->
+    <path
+        android:fillColor="#FF4D1C"
+        android:pathData="M71,28h7v7h-7z" />
+</vector>

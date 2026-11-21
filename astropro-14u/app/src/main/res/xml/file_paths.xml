@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="astro_files" path="." />
+    <cache-path name="astro_cache" path="." />
+    <external-files-path name="astro_external" path="." />
+</paths>

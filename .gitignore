@@ -1,0 +1,25 @@
+# Gradle & Android build artifacts
+.gradle/
+**/build/
+**/.cxx/
+**/local.properties
+*.iml
+.idea/
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# Large bundled AI models (downloaded via fetch script & embedded directly in release APKs)
+*.gguf
+*.task
+*.tflite
+*.onnx
+
+# OS & Python cache
+.DS_Store
+__pycache__/
+*.pyc
