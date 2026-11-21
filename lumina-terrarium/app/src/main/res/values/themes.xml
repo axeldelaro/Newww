@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.LuminaTerrarium" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF0B1419</item>
+        <item name="android:navigationBarColor">#FF0B1419</item>
+        <item name="android:windowBackground">#FF0B1419</item>
+    </style>
+</resources>

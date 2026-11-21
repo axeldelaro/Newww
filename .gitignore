@@ -19,6 +19,8 @@ captures/
 *.task
 *.tflite
 *.onnx
+aura-companion/app/libs/*.aar
+aura-companion/app/src/main/assets/voice/
 
 # OS & Python cache
 .DS_Store

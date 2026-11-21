@@ -1,0 +1,135 @@
+name: Build & Publish Offline Companion APKs (Lumina, StepQuest, Aura Live)
+
+on:
+  push:
+    tags:
+      - "companions-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name"
+        required: true
+        default: "companions-v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-lumina:
+    name: Build Lumina Terrarium APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass newww2026offline -keypass newww2026offline \
+            -dname "CN=Newww Companions, OU=OfflineAI, O=Newww, L=Paris, ST=IDF, C=FR"
+      - name: Test & Assemble Lumina Terrarium Release APK
+        working-directory: lumina-terrarium
+        env:
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-companions-v1.0.0}"
+          gradle testDebugUnitTest assembleRelease --no-daemon --console=plain
+          OUT="/tmp/Lumina-Terrarium-${TAG}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$OUT"
+          echo "APK_PATH=$OUT" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumina-terrarium-apk
+          path: ${{ env.APK_PATH }}
+
+  build-stepquest:
+    name: Build StepQuest Companion APK (Bundled Gemma-3 1B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Fetch Embedded Offline AI Models
+        run: bash scripts/fetch_companions_ai.sh
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass newww2026offline -keypass newww2026offline \
+            -dname "CN=Newww Companions, OU=OfflineAI, O=Newww, L=Paris, ST=IDF, C=FR"
+      - name: Test & Assemble StepQuest Release APK
+        working-directory: stepquest-companion
+        env:
+          LLAMA_CPP_DIR: /tmp/offline-ai-cache/llama.cpp
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-companions-v1.0.0}"
+          gradle :app:testDebugUnitTest -x externalNativeBuildDebug -x mergeDebugAssets --no-daemon --console=plain
+          gradle assembleRelease --no-daemon --console=plain
+          OUT="/tmp/StepQuest-Companion-${TAG}-arm64.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$OUT"
+          echo "APK_PATH=$OUT" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stepquest-companion-apk
+          path: ${{ env.APK_PATH }}
+
+  build-aura:
+    name: Build Aura Live Companion APK (Photo AI + Voice FR + Gemma-3 1B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Fetch Embedded Offline AI Models
+        run: bash scripts/fetch_companions_ai.sh
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass newww2026offline -keypass newww2026offline \
+            -dname "CN=Newww Companions, OU=OfflineAI, O=Newww, L=Paris, ST=IDF, C=FR"
+      - name: Test & Assemble Aura Live Release APK
+        working-directory: aura-companion
+        env:
+          LLAMA_CPP_DIR: /tmp/offline-ai-cache/llama.cpp
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-companions-v1.0.0}"
+          gradle :app:testDebugUnitTest -x externalNativeBuildDebug -x mergeDebugAssets --no-daemon --console=plain
+          gradle assembleRelease --no-daemon --console=plain
+          OUT="/tmp/Aura-Live-Companion-${TAG}-arm64.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$OUT"
+          echo "APK_PATH=$OUT" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aura-companion-apk
+          path: ${{ env.APK_PATH }}

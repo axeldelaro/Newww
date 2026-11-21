@@ -1,0 +1,20 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#1B1629" android:pathData="M0,0h108v108h-108z" />
+    <!-- Golden compass halo -->
+    <path android:fillColor="#26F4C05A" android:pathData="M54,16a38,38 0 1,0 0,76a38,38 0 1,0 0,-76z" />
+    <!-- Mountain silhouette -->
+    <path android:fillColor="#334B5E" android:pathData="M14,82L42,40L64,70L76,52L96,82Z" />
+    <path android:fillColor="#4E6E82" android:pathData="M42,40L52,55L45,57L42,51L37,57L32,54Z" />
+    <!-- Winding path -->
+    <path android:fillColor="#00000000" android:strokeColor="#F7C96B" android:strokeWidth="4" android:strokeLineCap="round"
+        android:pathData="M24,84Q46,72 54,66T82,42" />
+    <!-- Glowing compass star -->
+    <path android:fillColor="#FFE082" android:pathData="M78,24L81,31L88,34L81,37L78,44L75,37L68,34L75,31Z" />
+    <!-- Adventurer cloak dot -->
+    <path android:fillColor="#FF7043" android:pathData="M54,57a6,6 0 1,0 0.01,0z" />
+    <path android:fillColor="#FFF3E0" android:pathData="M54,53a3.5,3.5 0 1,0 0.01,0z" />
+</vector>

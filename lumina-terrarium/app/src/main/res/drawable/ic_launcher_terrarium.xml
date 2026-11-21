@@ -1,0 +1,60 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep nocturnal emerald background -->
+    <path
+        android:fillColor="#0E2228"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Subtle outer aura -->
+    <path
+        android:fillColor="#223CE8A7"
+        android:pathData="M54,18a36,36 0 1,0 0,72a36,36 0 1,0 0,-72z" />
+    <!-- Glass jar silhouette -->
+    <path
+        android:fillColor="#25A3F7D6"
+        android:strokeColor="#99D6FFF0"
+        android:strokeWidth="2.5"
+        android:pathData="M39,24h30v7c11,5 17,17 17,31c0,16 -12,26 -32,26s-32,-10 -32,-26c0,-14 6,-26 17,-31z" />
+    <!-- Cork lid -->
+    <path
+        android:fillColor="#A46D43"
+        android:pathData="M41,17h26c2,0 3,1 3,3v5h-32v-5c0,-2 1,-3 3,-3z" />
+    <!-- Moss soil base -->
+    <path
+        android:fillColor="#2D7B52"
+        android:pathData="M24,69c8,12 19,17 30,17s22,-5 30,-17c-10,-4 -20,-3 -30,-3s-20,-1 -30,3z" />
+    <!-- Glowing Moss Spirit -->
+    <path
+        android:fillColor="#7CF7B4"
+        android:pathData="M54,43c9,0 15,6 15,14c0,7 -6,12 -15,12s-15,-5 -15,-12c0,-8 6,-14 15,-14z" />
+    <!-- Little leaf sprout on top -->
+    <path
+        android:fillColor="#38D37A"
+        android:pathData="M54,43c-2,-7 -8,-9 -11,-6c2,4 6,7 11,6z" />
+    <path
+        android:fillColor="#5CEB96"
+        android:pathData="M54,43c2,-7 8,-9 11,-6c-2,4 -6,7 -11,6z" />
+    <!-- Cute eyes -->
+    <path
+        android:fillColor="#112A22"
+        android:pathData="M48,55a2.3,2.3 0 1,0 0.01,0z" />
+    <path
+        android:fillColor="#112A22"
+        android:pathData="M60,55a2.3,2.3 0 1,0 0.01,0z" />
+    <!-- Eye shine -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M47.3,54.2a0.8,0.8 0 1,0 0.01,0z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M59.3,54.2a0.8,0.8 0 1,0 0.01,0z" />
+    <!-- Firefly sparks -->
+    <path
+        android:fillColor="#FFF08A"
+        android:pathData="M34,46a2,2 0 1,0 0.01,0z" />
+    <path
+        android:fillColor="#FFF08A"
+        android:pathData="M73,41a1.6,1.6 0 1,0 0.01,0z" />
+</vector>

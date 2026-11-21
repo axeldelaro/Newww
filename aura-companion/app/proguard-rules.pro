@@ -1,0 +1,5 @@
+-keep class com.newww.auracompanion.model.** { *; }
+-keep class com.newww.auracompanion.ai.AuraLlamaEngine { *; }
+-keep class com.newww.auracompanion.ai.AuraTokenCallback { *; }
+-keep class com.k2fsa.sherpa.onnx.** { *; }
+-keep class com.google.mediapipe.** { *; }

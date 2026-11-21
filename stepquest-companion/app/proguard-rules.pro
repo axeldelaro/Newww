@@ -1,0 +1,3 @@
+-keep class com.newww.stepquest.model.** { *; }
+-keep class com.newww.stepquest.ai.NativeLlamaEngine { *; }
+-keep class com.newww.stepquest.ai.TokenCallback { *; }

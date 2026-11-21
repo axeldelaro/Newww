@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.AuraCompanion" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF120C18</item>
+        <item name="android:navigationBarColor">#FF120C18</item>
+        <item name="android:windowBackground">#FF120C18</item>
+    </style>
+</resources>
