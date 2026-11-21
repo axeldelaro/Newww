@@ -1,7 +1,10 @@
 package com.kinetix.coach.ui.vision
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -32,6 +35,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.LocalFireDepartment
@@ -92,6 +96,7 @@ import com.kinetix.coach.ui.theme.SignalOrange
 import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
 import com.kinetix.coach.vision.AngleCorrection
+import com.kinetix.coach.vision.DetectionStrictness
 import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseLandmarkerHelper
@@ -111,6 +116,7 @@ fun VisionScreen(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val challengeRecords by viewModel.challengeRecords.collectAsStateWithLifecycle()
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -125,8 +131,40 @@ fun VisionScreen(
         hasCameraPermission = granted
     }
 
+    // Android Storage Access Framework launcher for local MP3 / M4A / WAV / OGG music
+    val customAudioLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            var displayName = "Ma musique locale"
+            runCatching {
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        val name = c.getString(0)
+                        if (!name.isNullOrBlank()) displayName = name
+                    }
+                }
+            }
+            viewModel.setCustomMusicUri(uri.toString(), displayName)
+        }
+    }
+
     var showExercisePicker by remember { mutableStateOf(false) }
+    var showChallengesSheet by remember { mutableStateOf(false) }
     var demoPreviewExercise by remember { mutableStateOf<ExerciseType?>(null) }
+
+    // Ensure offline music stops cleanly if the user switches away from the Vision tab
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.pauseBackgroundAudio()
+        }
+    }
 
     // Haptic pulse when rest timer completes
     LaunchedEffect(uiState.restFinishedEvent) {
@@ -197,7 +235,7 @@ fun VisionScreen(
 
                     Spacer(Modifier.width(6.dp))
 
-                    // Exercise Selector Trigger
+                    // Exercise Selector Trigger + Auto-Detected Variant Pill
                     Surface(
                         modifier = Modifier
                             .weight(1f)
@@ -217,22 +255,46 @@ fun VisionScreen(
                         val subLabel = if (uiState.isAutoDetectEnabled && confPct < 55) {
                             "${uiState.autoDetectStatusFr} · ${uiState.delegateLabel}"
                         } else {
-                            "${uiState.selectedExercise.musclesFr} · ${uiState.delegateLabel}"
+                            "${uiState.selectedExercise.musclesFr} · ${uiState.detectionStrictness.labelFr}"
                         }
+                        val detectedVariant = if (uiState.frame.poseDetected) uiState.frame.detectedVariantFr else null
+
                         Row(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = titleLabel,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = CrispWhite,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Text(
+                                        text = titleLabel,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = CrispWhite,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    if (!detectedVariant.isNullOrBlank()) {
+                                        Surface(
+                                            shape = RoundedCornerShape(4.dp),
+                                            color = SignalOrangeDim,
+                                            border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.75f))
+                                        ) {
+                                            Text(
+                                                text = detectedVariant,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SignalOrange,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
+                                }
                                 Text(
                                     text = subLabel,
                                     style = MaterialTheme.typography.labelSmall,
@@ -312,7 +374,7 @@ fun VisionScreen(
 
                 Spacer(Modifier.height(7.dp))
 
-                // Compact Telemetry Sub-Bar: 3D Viewpoint + Live Calories + Framing Alert (only when needed)
+                // Compact Telemetry Sub-Bar: 3D Viewpoint + Live Calories + Défis Pill + Framing Alert
                 val vp = uiState.viewpointInfo
                 val liveTotalKcal = uiState.sessionTotalCaloriesKcal + uiState.currentSetCaloriesKcal
                 Row(
@@ -367,6 +429,34 @@ fun VisionScreen(
                         }
                     }
 
+                    // Crisp "Défis" Challenges & Music Pill Button
+                    val challengeActive = uiState.activeChallenge != null
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = if (challengeActive) SignalOrange else ObsidianBg.copy(alpha = 0.90f),
+                        border = BorderStroke(1.dp, SignalOrange),
+                        modifier = Modifier.clickable { showChallengesSheet = true }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.EmojiEvents,
+                                contentDescription = "Ouvrir les défis",
+                                tint = if (challengeActive) CrispWhite else SignalOrange,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = "Défis",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
                     // Framing Alert Chip (only appears if body parts are clipped out of frame)
                     val framingWarn = vp.framingWarningFr
                     if (uiState.frame.poseDetected && !framingWarn.isNullOrBlank()) {
@@ -400,8 +490,23 @@ fun VisionScreen(
                     }
                 }
 
+                // Active Camera-Verified Challenge Banner
+                uiState.activeChallenge?.let { activeSnap ->
+                    Spacer(Modifier.height(8.dp))
+                    ActiveChallengeBanner(
+                        snapshot = activeSnap,
+                        selectedTrack = uiState.selectedMusicTrack,
+                        customMusicName = uiState.customMusicName,
+                        isMusicMuted = uiState.isMusicMuted,
+                        onToggleMute = { viewModel.toggleMusicMute() },
+                        onCycleTrack = { viewModel.cycleQuickMusicTrack() },
+                        onPickCustomAudio = { customAudioLauncher.launch(arrayOf("audio/*")) },
+                        onStopChallenge = { viewModel.stopActiveChallenge() }
+                    )
+                }
+
                 // Active Smart Rest Countdown Overlay Pill
-                if (uiState.isResting) {
+                if (uiState.isResting && uiState.activeChallenge == null) {
                     Spacer(Modifier.height(8.dp))
                     RestCountdownOverlayPill(
                         remainingSec = uiState.restRemainingSec,
@@ -620,7 +725,7 @@ fun VisionScreen(
         }
     }
 
-    // 16-Exercise Selector Sheet (with inline "Voir la vidéo" trigger on every exercise)
+    // 16-Exercise Selector Sheet (with Adaptatif/Strict mode toggle + inline "Voir la vidéo" trigger)
     if (showExercisePicker) {
         ModalBottomSheet(
             onDismissRequest = { showExercisePicker = false },
@@ -638,10 +743,57 @@ fun VisionScreen(
                     text = "Sélectionner un exercice",
                     trailing = "${ExerciseType.entries.size} MOUVEMENTS · VIDÉO"
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(10.dp))
+
+                // 1-Tap Adaptatif / Strict Detection Strictness Toggle
+                IndustrialCard(containerColor = ObsidianBg) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "MODE DE DÉTECTION",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SteelGray,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = uiState.detectionStrictness.descFr,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CrispWhite,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            DetectionStrictness.entries.forEach { mode ->
+                                val isSel = uiState.detectionStrictness == mode
+                                Surface(
+                                    shape = RoundedCornerShape(7.dp),
+                                    color = if (isSel) SignalOrange else ElevatedSurface,
+                                    border = BorderStroke(1.dp, if (isSel) SignalOrange else BorderHairline),
+                                    modifier = Modifier.clickable { viewModel.setDetectionStrictness(mode) }
+                                ) {
+                                    Text(
+                                        text = mode.labelFr,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isSel) CrispWhite else SteelGray,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.height(450.dp)
+                    modifier = Modifier.height(420.dp)
                 ) {
                     items(ExerciseType.entries) { ex ->
                         val selected = ex == uiState.selectedExercise
@@ -724,6 +876,33 @@ fun VisionScreen(
                 }
             }
         }
+    }
+
+    // Challenges & Offline Music Modal Bottom Sheet
+    if (showChallengesSheet) {
+        ChallengesAndMusicSheet(
+            currentExercise = uiState.selectedExercise,
+            selectedTrack = uiState.selectedMusicTrack,
+            customMusicUri = uiState.customMusicUri,
+            customMusicName = uiState.customMusicName,
+            records = challengeRecords,
+            onSelectTrack = { viewModel.selectMusicTrack(it) },
+            onPickCustomAudio = { customAudioLauncher.launch(arrayOf("audio/*")) },
+            onLaunchChallenge = { cfg ->
+                showChallengesSheet = false
+                viewModel.startChallenge(cfg)
+            },
+            onDismiss = { showChallengesSheet = false }
+        )
+    }
+
+    // Challenge Victory / Summary Modal Bottom Sheet
+    uiState.completedChallengeResult?.let { result ->
+        ChallengeResultSheet(
+            result = result,
+            onReplay = { viewModel.replayLastChallenge() },
+            onClose = { viewModel.dismissChallengeResult() }
+        )
     }
 
     // Exercise Studio Demo Modal Bottom Sheet (MP4 + 0.5× slow-mo + 4-phase guide + checklist)

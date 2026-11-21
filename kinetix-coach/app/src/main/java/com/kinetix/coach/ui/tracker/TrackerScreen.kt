@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material3.Button
@@ -61,6 +62,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kinetix.coach.data.AthleteProfile
+import com.kinetix.coach.data.ChallengeRecord
+import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.WorkoutSession
 import com.kinetix.coach.ui.components.FilterChipPill
 import com.kinetix.coach.ui.components.HairlineDivider
@@ -77,7 +80,9 @@ import com.kinetix.coach.ui.theme.FormFault
 import com.kinetix.coach.ui.theme.FormGood
 import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
+import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
+import com.kinetix.coach.vision.ChallengeType
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -117,6 +122,7 @@ private val ACTIVITY_LEVELS = listOf(
 @Composable
 fun TrackerScreen(viewModel: TrackerViewModel) {
     val sessions by viewModel.sessions.collectAsStateWithLifecycle()
+    val challengeRecords by viewModel.challengeRecords.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val savedFeedback by viewModel.profileSavedFeedback.collectAsStateWithLifecycle()
 
@@ -190,6 +196,7 @@ fun TrackerScreen(viewModel: TrackerViewModel) {
         when (selectedTab) {
             TrackerTab.HISTORY -> HistoryTabContent(
                 sessions = sessions,
+                challengeRecords = challengeRecords,
                 onDeleteSession = { viewModel.deleteSession(it) },
                 modifier = Modifier.weight(1f)
             )
@@ -211,6 +218,7 @@ fun TrackerScreen(viewModel: TrackerViewModel) {
 @Composable
 private fun HistoryTabContent(
     sessions: List<WorkoutSession>,
+    challengeRecords: List<ChallengeRecord>,
     onDeleteSession: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -220,6 +228,18 @@ private fun HistoryTabContent(
     val avgScore = if (sessions.isNotEmpty()) {
         sessions.map { it.avgFormScore }.average().roundToInt()
     } else 0
+
+    // Compute best personal record per (challengeId, exerciseId) pair
+    val personalBests = remember(challengeRecords) {
+        challengeRecords
+            .groupBy { it.challengeId to it.exerciseId }
+            .mapNotNull { (key, list) ->
+                val type = ChallengeType.fromId(key.first)
+                if (type.lowerIsBetter) list.minByOrNull { it.scoreValue }
+                else list.maxByOrNull { it.scoreValue }
+            }
+            .sortedByDescending { it.timestampMs }
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
@@ -251,6 +271,11 @@ private fun HistoryTabContent(
                     )
                 }
             }
+        }
+
+        // Personal Records & Camera-Verified Challenges Section
+        item {
+            ChallengeRecordsCard(records = personalBests)
         }
 
         // Form Score Progression Chart
@@ -298,6 +323,89 @@ private fun HistoryTabContent(
                     session = session,
                     onDelete = { onDeleteSession(session.id) }
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChallengeRecordsCard(records: List<ChallengeRecord>) {
+    IndustrialCard {
+        SectionLabel(
+            text = "Records & Défis",
+            trailing = if (records.isNotEmpty()) "${records.size} RECORDS" else "7 DÉFIS"
+        )
+        Spacer(Modifier.height(10.dp))
+        if (records.isEmpty()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Filled.EmojiEvents,
+                    contentDescription = null,
+                    tint = SignalOrange,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = "Aucun record établi — ouvrez « Défis » dans Vision (Bip & Go, Luc Léger, Gainage Musical, Tabata, EMOM…).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SteelGray
+                )
+            }
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                records.take(8).forEachIndexed { idx, rec ->
+                    val chType = ChallengeType.fromId(rec.challengeId)
+                    val exType = ExerciseType.fromId(rec.exerciseId)
+                    val dateStr = remember(rec.timestampMs) {
+                        SimpleDateFormat("dd MMM", Locale.FRENCH).format(Date(rec.timestampMs))
+                    }
+                    if (idx > 0) HairlineDivider()
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.EmojiEvents,
+                                contentDescription = null,
+                                tint = SignalOrange,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = chType.titleFr,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = CrispWhite,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "${exType.labelFr} · $dateStr",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SteelGray
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = SignalOrangeDim,
+                            border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = rec.scoreLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SignalOrange,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
             }
         }
     }

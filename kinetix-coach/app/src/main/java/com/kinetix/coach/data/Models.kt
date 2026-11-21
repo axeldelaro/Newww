@@ -140,6 +140,17 @@ data class WorkoutSession(
     val caloriesKcal: Double = 0.0
 )
 
+data class ChallengeRecord(
+    val id: Long = 0L,
+    val timestampMs: Long = System.currentTimeMillis(),
+    val challengeId: String,
+    val exerciseId: String,
+    val scoreValue: Double,
+    val scoreLabel: String,
+    val durationSec: Int,
+    val caloriesKcal: Double
+)
+
 data class ChatMessage(
     val id: Long = 0L,
     val timestampMs: Long = System.currentTimeMillis(),

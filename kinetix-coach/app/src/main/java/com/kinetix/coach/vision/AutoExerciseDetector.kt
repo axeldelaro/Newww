@@ -42,6 +42,7 @@ class AutoExerciseDetector(
         val kneeDeg: Float,
         val hipDeg: Float,
         val elbowDeg: Float,
+        val minElbowDeg: Float,
         val shoulderDeg: Float,
         val armFullDeg: Float,
         val torsoTiltDeg: Float,
@@ -50,6 +51,7 @@ class AutoExerciseDetector(
         val hipAboveAnklesTl: Float,
         val shAboveAnklesTl: Float,
         val wristAboveShTl: Float,
+        val shAboveWristTl: Float,
         val wristAboveHipTl: Float,
         val ankleAboveHipTl: Float,
         val footDistTl: Float,
@@ -224,6 +226,7 @@ class AutoExerciseDetector(
         val kneeDeg = if (both) minOf(leftKnee, rightKnee) * 0.6f + ((leftKnee + rightKnee) * 0.5f) * 0.4f else if (useLeft) leftKnee else rightKnee
         val hipDeg = if (both) (leftHip + rightHip) * 0.5f else if (useLeft) leftHip else rightHip
         val elbowDeg = if (both) (leftElbow + rightElbow) * 0.5f else if (useLeft) leftElbow else rightElbow
+        val minElbowDeg = if (both) minOf(leftElbow, rightElbow) else elbowDeg
         val shoulderDeg = if (both) (leftSh + rightSh) * 0.5f else if (useLeft) leftSh else rightSh
         val armFullDeg = if (both) (leftArm + rightArm) * 0.5f else if (useLeft) leftArm else rightArm
 
@@ -247,6 +250,7 @@ class AutoExerciseDetector(
         val hipAboveAnklesTl = (midAnkle.y - midHip.y) / torsoLen
         val shAboveAnklesTl = (midAnkle.y - midSh.y) / torsoLen
         val wristAboveShTl = (midSh.y - midWrist.y) / torsoLen
+        val shAboveWristTl = (midWrist.y - midSh.y) / torsoLen
         val wristAboveHipTl = (midHip.y - midWrist.y) / torsoLen
         val ankleAboveHipTl = (midHip.y - midAnkle.y) / torsoLen
         val ankleAboveShTl = (midSh.y - midAnkle.y) / torsoLen
@@ -278,6 +282,7 @@ class AutoExerciseDetector(
             kneeDeg = kneeDeg,
             hipDeg = hipDeg,
             elbowDeg = elbowDeg,
+            minElbowDeg = minElbowDeg,
             shoulderDeg = shoulderDeg,
             armFullDeg = armFullDeg,
             torsoTiltDeg = torsoTiltDeg,
@@ -286,6 +291,7 @@ class AutoExerciseDetector(
             hipAboveAnklesTl = hipAboveAnklesTl,
             shAboveAnklesTl = shAboveAnklesTl,
             wristAboveShTl = wristAboveShTl,
+            shAboveWristTl = shAboveWristTl,
             wristAboveHipTl = wristAboveHipTl,
             ankleAboveHipTl = ankleAboveShTl,
             footDistTl = footDistTl,
@@ -314,11 +320,11 @@ class AutoExerciseDetector(
             return BodyPosture.SUPINE_FLOOR
         }
 
-        // Prone floor: horizontal body with hands supporting below shoulders toward floor level
-        val looksProne = (bodyTiltDeg >= 52f || torsoTiltDeg >= 58f) &&
-            wristAboveShTl <= -0.15f &&
-            hipAboveAnklesTl <= 0.95f &&
-            shAboveAnklesTl <= 1.25f
+        // Prone floor: horizontal or inclined/pike/knee push-up posture with hands supporting below shoulders toward floor level
+        val looksProne = (bodyTiltDeg >= 48f || torsoTiltDeg >= 52f) &&
+            wristAboveShTl <= -0.10f &&
+            hipAboveAnklesTl <= 1.05f &&
+            shAboveAnklesTl <= 1.35f
         if (looksProne) {
             return BodyPosture.PRONE_FLOOR
         }
@@ -342,6 +348,7 @@ class AutoExerciseDetector(
         val knees = FloatArray(buffer.size)
         val hips = FloatArray(buffer.size)
         val elbows = FloatArray(buffer.size)
+        val minElbows = FloatArray(buffer.size)
         val shoulders = FloatArray(buffer.size)
         val armsFull = FloatArray(buffer.size)
         val torsoTilts = FloatArray(buffer.size)
@@ -350,6 +357,7 @@ class AutoExerciseDetector(
         val hipAboveAnk = FloatArray(buffer.size)
         val shAboveAnk = FloatArray(buffer.size)
         val wristAboveSh = FloatArray(buffer.size)
+        val shAboveWrist = FloatArray(buffer.size)
         val wristAboveHip = FloatArray(buffer.size)
         val ankleAboveHip = FloatArray(buffer.size)
         val footDists = FloatArray(buffer.size)
@@ -369,6 +377,7 @@ class AutoExerciseDetector(
             knees[i] = s.kneeDeg
             hips[i] = s.hipDeg
             elbows[i] = s.elbowDeg
+            minElbows[i] = s.minElbowDeg
             shoulders[i] = s.shoulderDeg
             armsFull[i] = s.armFullDeg
             torsoTilts[i] = s.torsoTiltDeg
@@ -377,6 +386,7 @@ class AutoExerciseDetector(
             hipAboveAnk[i] = s.hipAboveAnklesTl
             shAboveAnk[i] = s.shAboveAnklesTl
             wristAboveSh[i] = s.wristAboveShTl
+            shAboveWrist[i] = s.shAboveWristTl
             wristAboveHip[i] = s.wristAboveHipTl
             ankleAboveHip[i] = s.ankleAboveHipTl
             footDists[i] = s.footDistTl
@@ -393,6 +403,7 @@ class AutoExerciseDetector(
         val kneeS = stats(knees)
         val hipS = stats(hips)
         val elbowS = stats(elbows)
+        val minElbowS = stats(minElbows)
         val shS = stats(shoulders)
         val armS = stats(armsFull)
         val torsoS = stats(torsoTilts)
@@ -401,6 +412,7 @@ class AutoExerciseDetector(
         val hipAnkS = stats(hipAboveAnk)
         val shAnkS = stats(shAboveAnk)
         val wrShS = stats(wristAboveSh)
+        val shWrS = stats(shAboveWrist)
         val wrHipS = stats(wristAboveHip)
         val ankHipS = stats(ankleAboveHip)
         val footS = stats(footDists)
@@ -463,22 +475,31 @@ class AutoExerciseDetector(
             rampDown(proneRatio, 0.05f, 0.20f)
         )
 
-        // 5. PUSHUP: Prone horizontal + dynamic elbow flexion/extension
+        // 5. PUSHUP: Prone/pike/knee + dynamic elbow flexion OR vertical shoulder-to-wrist drop (wide/diamond/archer!)
+        val pushupDynamicMotion = maxOf(
+            rampUp(maxOf(elbowS.range, minElbowS.range), 18f, 44f),
+            rampUp(shWrS.range, 0.14f, 0.34f)
+        )
+        val pushupDepthFactor = maxOf(
+            rampDown(minElbowS.min, 122f, 146f),
+            rampUp(shWrS.range, 0.16f, 0.36f)
+        )
         scores[ExerciseType.PUSHUP] = product(
             rampUp(proneRatio, 0.55f, 0.85f),
-            rampUp(bodyTiltS.mean, 48f, 68f),
-            rampUp(elbowS.range, 22f, 50f),
-            rampDown(elbowS.min, 115f, 140f),
-            rampDown(wrShS.mean, -0.10f, 0.15f),
+            rampUp(maxOf(bodyTiltS.mean, torsoS.mean), 46f, 66f),
+            pushupDynamicMotion,
+            pushupDepthFactor,
+            rampDown(wrShS.mean, -0.08f, 0.15f),
             rampDown(standingRatio, 0.12f, 0.30f)
         )
 
-        // 6. PLANK: Prone horizontal + isometric stability (very low joint excursion)
+        // 6. PLANK: Prone horizontal + strict isometric stability (low elbow AND shoulder-to-wrist excursion)
         scores[ExerciseType.PLANK] = product(
             rampUp(proneRatio, 0.65f, 0.90f),
             rampUp(bodyTiltS.mean, 52f, 70f),
             band(alignS.mean, 130f, 155f, 200f, 225f),
-            rampDown(elbowS.range, 12f, 24f),
+            rampDown(maxOf(elbowS.range, minElbowS.range), 12f, 24f),
+            rampDown(shWrS.range, 0.08f, 0.20f),
             rampDown(hipS.range, 12f, 24f),
             rampDown(kneeS.range, 12f, 24f),
             rampDown(bodyTiltS.range, 10f, 22f),

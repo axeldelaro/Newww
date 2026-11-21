@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.kinetix.coach.KinetixApp
 import com.kinetix.coach.data.AthleteProfile
+import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.WorkoutSession
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -107,6 +108,9 @@ class TrackerViewModel(application: Application) : AndroidViewModel(application)
     private val app = application as KinetixApp
 
     val sessions: StateFlow<List<WorkoutSession>> = app.userDb.sessions
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val challengeRecords: StateFlow<List<ChallengeRecord>> = app.userDb.challengeRecords
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val profile: StateFlow<AthleteProfile> = app.userDb.profile

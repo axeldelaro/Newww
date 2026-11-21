@@ -14,6 +14,20 @@ import kotlin.math.sqrt
 
 enum class FormQuality { GOOD, CAUTION, FAULT }
 
+enum class DetectionStrictness(val labelFr: String, val descFr: String) {
+    ADAPTIVE("Adaptatif", "Fluide sur toutes les variantes et angles caméra"),
+    STRICT("Strict", "Amplitude compétition et seuils exigeants")
+}
+
+enum class PushupVariant(val labelFr: String) {
+    STANDARD("Classique"),
+    WIDE("Large"),
+    DIAMOND("Diamant"),
+    KNEE("Genoux"),
+    PIKE("Piquée"),
+    ARCHER("Archer")
+}
+
 data class PosePoint(
     val x: Float,
     val y: Float,
@@ -73,19 +87,21 @@ data class BiomechanicsFrame(
     val repCompletedNow: Boolean = false,
     val completedRepRomPct: Int = 0,
     val completedRepDurationSec: Float = 0f,
-    val isometricDeltaSec: Float = 0f
+    val isometricDeltaSec: Float = 0f,
+    val detectedVariantFr: String? = null
 )
 
 /**
  * Pure-Kotlin real-time 3D multi-angle biomechanics analyzer for all 16 KINETIX exercises.
  * Uses MediaPipe 33-landmark screen & 3D metric world coordinates with adaptive Casiez One-Euro
- * filtering, viewpoint-invariant 3D joint geometry, bilateral symmetry checks, and degree-exact
- * visual/vocal angle corrections.
+ * filtering, viewpoint-invariant 3D joint geometry, multi-signal fused depth tracking,
+ * automatic variant recognition, bilateral symmetry checks, and degree-exact corrections.
  */
 class BiomechanicsEngine(
     initialExercise: ExerciseType = ExerciseType.SQUAT,
     private val emaAlpha: Float = 0.42f,
-    private val useOneEuroFilter: Boolean = emaAlpha < 0.999f
+    private val useOneEuroFilter: Boolean = emaAlpha < 0.999f,
+    initialStrictness: DetectionStrictness = DetectionStrictness.ADAPTIVE
 ) {
     companion object {
         // MediaPipe Pose Landmark indices
@@ -262,6 +278,9 @@ class BiomechanicsEngine(
     var currentExercise: ExerciseType = initialExercise
         private set
 
+    var strictness: DetectionStrictness = initialStrictness
+        private set
+
     private val screenSmoother = PoseOneEuroSmoother()
     private val worldSmoother = PoseOneEuroSmoother()
     private var legacySmoothedScreen: MutableList<PosePoint>? = null
@@ -275,6 +294,11 @@ class BiomechanicsEngine(
     private var lastFrameTsMs: Long = 0L
     private var repStartTsMs: Long = 0L
 
+    // Adaptive multi-signal vertical drop & variant latch trackers
+    private var adaptivePushupTopHeight: Float = 0f
+    private var adaptiveDipTopHeight: Float = 0f
+    private var latchedPushupVariant: PushupVariant? = null
+
     // Session metrics accumulators
     private var formScoreSum: Long = 0L
     private var formScoreSamples: Int = 0
@@ -283,6 +307,10 @@ class BiomechanicsEngine(
     private var romSamples: Int = 0
     private val faultCounts = linkedMapOf<String, Int>()
     private var currentRepFault: String? = null
+
+    fun setStrictness(mode: DetectionStrictness) {
+        strictness = mode
+    }
 
     fun setExercise(exercise: ExerciseType) {
         currentExercise = exercise
@@ -301,6 +329,9 @@ class BiomechanicsEngine(
         plankHoldMs = 0L
         lastFrameTsMs = 0L
         repStartTsMs = 0L
+        adaptivePushupTopHeight = 0f
+        adaptiveDipTopHeight = 0f
+        latchedPushupVariant = null
         formScoreSum = 0L
         formScoreSamples = 0
         repRomPeak = 0
@@ -451,6 +482,9 @@ class BiomechanicsEngine(
         var completedRepRom = 0
         var completedRepDurSec = 0f
         var isometricDeltaSec = 0f
+        var detectedVariantFr: String? = null
+
+        val isStrict = strictness == DetectionStrictness.STRICT
 
         val badges = mutableListOf<JointAngleBadge>()
         val corrections = mutableListOf<AngleCorrection>()
@@ -494,7 +528,7 @@ class BiomechanicsEngine(
 
         when (currentExercise) {
             ExerciseType.SQUAT -> {
-                romPct = mapRange(kneeAngle, 168f, 82f)
+                romPct = mapRange(kneeAngle, 168f, if (isStrict) 82f else 90f)
                 var kneeTargetHint: Int? = null
                 var hipTargetHint: Int? = null
 
@@ -608,12 +642,25 @@ class BiomechanicsEngine(
                     }
                 }
 
-                // 3. Cycle update
+                // 3. Multi-signal cycle update: knee angle + hip-to-knee vertical parallel drop in ADAPTIVE
+                val midHipY = if (bothVisible) (geomPts[LEFT_HIP].y + geomPts[RIGHT_HIP].y) * 0.5f else geomPts[hpIdx].y
+                val midKneeY = if (bothVisible) (geomPts[LEFT_KNEE].y + geomPts[RIGHT_KNEE].y) * 0.5f else geomPts[knIdx].y
+                val thighLen = if (use3D) {
+                    dist3D(geomPts[hpIdx], geomPts[knIdx]).coerceAtLeast(0.24f)
+                } else {
+                    dist2D(hpS, knS).coerceAtLeast(0.08f)
+                }
+                val hipNearParallel = kneeAngle < 126f && (midKneeY - midHipY) <= thighLen * 0.22f
+                val effectiveSquatMetric = if (!isStrict && hipNearParallel) minOf(kneeAngle, 104f) else kneeAngle
+                if (!isStrict && hipNearParallel && romPct < 88) {
+                    romPct = maxOf(romPct, 88)
+                }
+
                 val cycle = updateDownUpCycle(
-                    metric = kneeAngle,
-                    startThreshold = 152f,
-                    bottomThreshold = 98f,
-                    finishThreshold = 158f,
+                    metric = effectiveSquatMetric,
+                    startThreshold = if (isStrict) 152f else 148f,
+                    bottomThreshold = if (isStrict) 98f else 108f,
+                    finishThreshold = if (isStrict) 156f else 150f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -622,7 +669,7 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                // 4. Precision depth angle guidance when descending / paused above parallel (98°..132°)
+                // 4. Precision depth angle guidance when descending / paused above parallel
                 if (!reachedBottom && kneeAngle in 98.5f..132f && !valgusDetected) {
                     val delta = (kneeAngle - 95f).roundToInt().coerceAtLeast(1)
                     score -= 4
@@ -676,7 +723,7 @@ class BiomechanicsEngine(
                         quality = kneeBadgeQuality,
                         parentIndex = hpIdx,
                         childIndex = anIdx,
-                        targetRangeText = "≤95°",
+                        targetRangeText = if (isStrict) "≤95°" else "≤108°",
                         targetDegHint = kneeTargetHint
                     )
                 )
@@ -694,7 +741,11 @@ class BiomechanicsEngine(
                     )
                 )
                 feedback = faultMsg ?: when (phase) {
-                    MovementPhase.BOTTOM -> "Bonne profondeur (${kneeAngle.roundToInt()}°) — poussez !"
+                    MovementPhase.BOTTOM -> if (kneeAngle <= 96f) {
+                        "Profondeur complète (${kneeAngle.roundToInt()}°) — poussez !"
+                    } else {
+                        "Parallèle validée (${kneeAngle.roundToInt()}°) — poussez !"
+                    }
                     MovementPhase.ECCENTRIC -> corrections.firstOrNull()?.instructionFr ?: "Contrôlez la descente, dos neutre."
                     MovementPhase.CONCENTRIC -> "Poussez fort dans tout le pied."
                     else -> "Prêt — descendez genoux dans l'axe."
@@ -702,64 +753,143 @@ class BiomechanicsEngine(
             }
 
             ExerciseType.PUSHUP -> {
-                romPct = mapRange(elbowAngle, 165f, 82f)
+                // 1. Auto-detect Push-up Variant cleanly across 3D & 2D viewpoints
+                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
+                val minElbow = minOf(leftElbow, rightElbow)
+                val maxElbow = maxOf(leftElbow, rightElbow)
+                val bestElbow = if (bothArmsVis) minElbow else if (lArmW >= rArmW) leftElbow else rightElbow
+
+                val isProneBody = torsoTilt >= 34f || fullBodyTilt >= 42f
+                val leftAnkleAboveKnee = screenPts[LEFT_ANKLE].visibility >= 0.35f &&
+                    screenPts[LEFT_KNEE].visibility >= 0.35f &&
+                    geomPts[LEFT_ANKLE].y < geomPts[LEFT_KNEE].y - 0.03f
+                val rightAnkleAboveKnee = screenPts[RIGHT_ANKLE].visibility >= 0.35f &&
+                    screenPts[RIGHT_KNEE].visibility >= 0.35f &&
+                    geomPts[RIGHT_ANKLE].y < geomPts[RIGHT_KNEE].y - 0.03f
+                val ankleLifted = when {
+                    lLegW >= 0.35f && rLegW >= 0.35f -> leftAnkleAboveKnee || rightAnkleAboveKnee
+                    useLeft -> leftAnkleAboveKnee
+                    else -> rightAnkleAboveKnee
+                }
+                val isKnee = isProneBody && (ankleLifted || kneeAngle < 125f)
+
+                val midWristYGeom = if (bothArmsVis) {
+                    (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
+                } else {
+                    geomPts[wrIdx].y
+                }
+                val midShYGeom = if (bothArmsVis) {
+                    (geomPts[LEFT_SHOULDER].y + geomPts[RIGHT_SHOULDER].y) * 0.5f
+                } else {
+                    geomPts[shIdx].y
+                }
+                val handsNearFloor = midWristYGeom >= midShYGeom - (if (use3D) 0.05f else 0.02f)
+                val isPike = !isKnee && hipAngle < 125f && bodyLineAlign > 205f && handsNearFloor
+
+                val isArcherNow = bothArmsVis && maxElbow > 145f && minElbow < 115f
+                if (isArcherNow) {
+                    latchedPushupVariant = PushupVariant.ARCHER
+                } else if (phase == MovementPhase.READY && maxElbow > 148f && minElbow > 148f) {
+                    latchedPushupVariant = null
+                }
+                val isArcher = isArcherNow || (latchedPushupVariant == PushupVariant.ARCHER && phase != MovementPhase.READY)
+
+                val canMeasureHandSpan = (use3D && lArmW >= 0.35f && rArmW >= 0.35f) ||
+                    (bothVisible && lArmW >= 0.40f && rArmW >= 0.40f)
+                val shWidthPushup = if (use3D) {
+                    dist3D(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]).coerceAtLeast(0.18f)
+                } else {
+                    dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.05f)
+                }
+                val wristSpanPushup = if (use3D) {
+                    dist3D(worldPts[LEFT_WRIST], worldPts[RIGHT_WRIST])
+                } else {
+                    dist2D(screenPts[LEFT_WRIST], screenPts[RIGHT_WRIST])
+                }
+                val wristRatio = if (canMeasureHandSpan) wristSpanPushup / shWidthPushup else 1.0f
+                val isWide = canMeasureHandSpan && wristRatio > 1.55f
+                val isDiamond = canMeasureHandSpan && wristRatio < 0.55f
+
+                val pushupVariant = when {
+                    isPike -> PushupVariant.PIKE
+                    isArcher -> PushupVariant.ARCHER
+                    isKnee -> PushupVariant.KNEE
+                    isWide -> PushupVariant.WIDE
+                    isDiamond -> PushupVariant.DIAMOND
+                    else -> PushupVariant.STANDARD
+                }
+                detectedVariantFr = pushupVariant.labelFr
+
+                // 2. Variant-aware alignment check (shoulder-hip-knee for Knee push-ups; exempt Pike from high-hip fault)
+                val effectiveAlign = if (isKnee) {
+                    val lKneeAlign = bodyAlign(LEFT_SHOULDER, LEFT_HIP, LEFT_KNEE)
+                    val rKneeAlign = bodyAlign(RIGHT_SHOULDER, RIGHT_HIP, RIGHT_KNEE)
+                    fuseSide(lKneeAlign, rKneeAlign, minOf(lTorsoW, lLegW), minOf(rTorsoW, rLegW), useLeft, bothVisible)
+                } else {
+                    bodyLineAlign
+                }
+                val alignEndIdx = if (isKnee) knIdx else anIdx
+                val alignEndS = if (isKnee) knS else anS
+
                 var elbowHint: Int? = null
                 var hipHint: Int? = null
 
-                if (bodyLineAlign < 158f) {
-                    val delta = (172f - bodyLineAlign).roundToInt().coerceAtLeast(1)
-                    score -= 30
-                    faultMsg = "Gainez les abdos : ne creusez pas le bas du dos"
-                    hipHint = 175
-                    val (gx, gy) = bodyLineGhost(shS, hpS, anS)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Hanches",
-                            currentDeg = bodyLineAlign.roundToInt(),
-                            targetMinDeg = 162,
-                            targetMaxDeg = 198,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = -1f,
-                            ghostAnchorIndex = shIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "HANCHES +$delta°",
-                            instructionFr = "Remontez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 165–195°)",
-                            voiceCueFr = "Gainez les abdos, remontez les hanches"
+                if (!isPike) {
+                    if (effectiveAlign < 156f) {
+                        val delta = (172f - effectiveAlign).roundToInt().coerceAtLeast(1)
+                        score -= 28
+                        faultMsg = "Gainez les abdos : ne creusez pas le bas du dos"
+                        hipHint = 175
+                        val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
+                        corrections.add(
+                            AngleCorrection(
+                                jointIndex = hpIdx,
+                                jointLabelFr = "Hanches",
+                                currentDeg = effectiveAlign.roundToInt(),
+                                targetMinDeg = 160,
+                                targetMaxDeg = 200,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = -1f,
+                                ghostAnchorIndex = shIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "HANCHES +$delta°",
+                                instructionFr = "Remontez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 162–198°)",
+                                voiceCueFr = "Gainez les abdos, remontez les hanches"
+                            )
                         )
-                    )
-                } else if (bodyLineAlign > 202f) {
-                    val delta = (bodyLineAlign - 188f).roundToInt().coerceAtLeast(1)
-                    score -= 22
-                    faultMsg = "Abaissez légèrement les hanches"
-                    hipHint = 180
-                    val (gx, gy) = bodyLineGhost(shS, hpS, anS)
-                    corrections.add(
-                        AngleCorrection(
-                            jointIndex = hpIdx,
-                            jointLabelFr = "Hanches",
-                            currentDeg = bodyLineAlign.roundToInt(),
-                            targetMinDeg = 162,
-                            targetMaxDeg = 198,
-                            deltaDeg = delta,
-                            severity = FormQuality.FAULT,
-                            arrowDx = 0f,
-                            arrowDy = 1f,
-                            ghostAnchorIndex = shIdx,
-                            ghostTargetX = gx,
-                            ghostTargetY = gy,
-                            shortBadgeFr = "HANCHES -$delta°",
-                            instructionFr = "Abaissez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 165–195°)",
-                            voiceCueFr = "Abaissez les hanches pour aligner le corps"
+                    } else if (effectiveAlign > 204f) {
+                        val delta = (effectiveAlign - 188f).roundToInt().coerceAtLeast(1)
+                        score -= 20
+                        faultMsg = "Abaissez légèrement les hanches"
+                        hipHint = 180
+                        val (gx, gy) = bodyLineGhost(shS, hpS, alignEndS)
+                        corrections.add(
+                            AngleCorrection(
+                                jointIndex = hpIdx,
+                                jointLabelFr = "Hanches",
+                                currentDeg = effectiveAlign.roundToInt(),
+                                targetMinDeg = 160,
+                                targetMaxDeg = 200,
+                                deltaDeg = delta,
+                                severity = FormQuality.FAULT,
+                                arrowDx = 0f,
+                                arrowDy = 1f,
+                                ghostAnchorIndex = shIdx,
+                                ghostTargetX = gx,
+                                ghostTargetY = gy,
+                                shortBadgeFr = "HANCHES -$delta°",
+                                instructionFr = "Abaissez les hanches de $delta° (${effectiveAlign.roundToInt()}° → 162–198°)",
+                                voiceCueFr = "Abaissez les hanches pour aligner le corps"
+                            )
                         )
-                    )
+                    }
                 }
 
-                // Elbow flare detection in 3D when shoulders visible
-                if (use3D && bothVisible && elbowAngle < 125f && shoulderAngle > 78f) {
+                // Elbow flare check (exempt Wide, Pike, and Archer variants where wider abduction is expected)
+                if (!isWide && !isPike && !isArcher && use3D && bothVisible && elbowAngle < 125f && shoulderAngle > 78f) {
                     val delta = (shoulderAngle - 55f).roundToInt().coerceAtLeast(1)
                     score -= 12
                     corrections.add(
@@ -780,11 +910,56 @@ class BiomechanicsEngine(
                     )
                 }
 
-                val cycle = updateDownUpCycle(
-                    metric = elbowAngle,
-                    startThreshold = 148f,
-                    bottomThreshold = 95f,
-                    finishThreshold = 156f,
+                // 3. Multi-Signal Fused Push-Up Depth (Signal A: Active Elbow + Signal B: Adaptive Vertical Chest Drop)
+                val activeElbow = when {
+                    isArcher -> bestElbow
+                    !isStrict && !bothVisible -> bestElbow
+                    !isStrict && bothArmsVis -> 0.35f * elbowAngle + 0.65f * minElbow
+                    else -> elbowAngle
+                }
+                val elbowBottomTarget = when {
+                    isStrict && isWide -> 106f
+                    isStrict -> 95f
+                    isWide -> 116f
+                    else -> 108f
+                }
+                val elbowProgress = ((148f - activeElbow) / (148f - elbowBottomTarget).coerceAtLeast(10f))
+                    .coerceIn(0f, 1.25f)
+
+                val pushupTorsoLen = if (use3D) {
+                    val midShW = if (bothVisible) midpoint(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]) else worldPts[shIdx]
+                    val midHpW = if (bothVisible) midpoint(worldPts[LEFT_HIP], worldPts[RIGHT_HIP]) else worldPts[hpIdx]
+                    dist3D(midShW, midHpW).coerceAtLeast(0.28f)
+                } else {
+                    val midShS = if (bothVisible) midpoint(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]) else shS
+                    val midHpS = if (bothVisible) midpoint(screenPts[LEFT_HIP], screenPts[RIGHT_HIP]) else hpS
+                    dist2D(midShS, midHpS).coerceAtLeast(0.10f)
+                }
+                val currentPushupHeight = ((midWristYGeom - midShYGeom) / pushupTorsoLen).coerceAtLeast(0f)
+                val inPushupAttitude = isProneBody || isPike
+                if (inPushupAttitude && currentPushupHeight > 0.05f) {
+                    if (adaptivePushupTopHeight <= 0.01f || currentPushupHeight > adaptivePushupTopHeight) {
+                        adaptivePushupTopHeight = currentPushupHeight
+                    } else if (phase == MovementPhase.READY) {
+                        adaptivePushupTopHeight = adaptivePushupTopHeight * 0.996f + currentPushupHeight * 0.004f
+                    }
+                }
+                val chestDropProgress = if (inPushupAttitude && adaptivePushupTopHeight > 0.12f) {
+                    ((adaptivePushupTopHeight - currentPushupHeight) / (adaptivePushupTopHeight * 0.36f))
+                        .coerceIn(0f, 1.2f)
+                } else {
+                    0f
+                }
+
+                val pushupDepth = maxOf(elbowProgress, chestDropProgress * 0.96f)
+                romPct = (pushupDepth * 100f).roundToInt().coerceIn(0, 100)
+
+                val peakThresh = if (isStrict) 0.80f else 0.62f
+                val cycle = updateProgressCycle(
+                    progress = pushupDepth,
+                    startThreshold = 0.22f,
+                    peakThreshold = peakThresh,
+                    finishThreshold = 0.26f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -793,53 +968,84 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (!reachedBottom && elbowAngle in 98f..130f) {
-                    val delta = (elbowAngle - 95f).roundToInt().coerceAtLeast(1)
-                    elbowHint = 95
+                val activeElIdx = if (isArcher && bothArmsVis) {
+                    if (leftElbow <= rightElbow) LEFT_ELBOW else RIGHT_ELBOW
+                } else {
+                    elIdx
+                }
+                val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
+                val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
+                val activeElS = screenPts[activeElIdx]
+
+                // Gentle depth coaching without blocking rep counting
+                if (!reachedBottom && pushupDepth in 0.28f..(peakThresh - 0.04f) && activeElbow in (elbowBottomTarget + 4f)..134f) {
+                    val targetDeg = elbowBottomTarget.roundToInt()
+                    val delta = (activeElbow - elbowBottomTarget).roundToInt().coerceAtLeast(1)
+                    elbowHint = targetDeg
                     corrections.add(
                         AngleCorrection(
-                            jointIndex = elIdx,
+                            jointIndex = activeElIdx,
                             jointLabelFr = "Coude",
-                            currentDeg = elbowAngle.roundToInt(),
-                            targetMinDeg = 70,
-                            targetMaxDeg = 95,
+                            currentDeg = activeElbow.roundToInt(),
+                            targetMinDeg = 75,
+                            targetMaxDeg = targetDeg,
                             deltaDeg = delta,
                             severity = FormQuality.CAUTION,
                             arrowDx = 0f,
                             arrowDy = 1f,
                             shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Descendez encore $delta° (${elbowAngle.roundToInt()}° → ≤95°)",
-                            voiceCueFr = "Descendez la poitrine plus bas"
+                            instructionFr = "Descendez encore $delta° (${activeElbow.roundToInt()}° → ≤$targetDeg°)",
+                            voiceCueFr = if (isPike) "Descendez la tête vers les mains" else "Descendez la poitrine plus bas"
                         )
                     )
                 }
 
-                addSymmetryCorrectionIfNeeded(
-                    leftElbow, rightElbow, lArmW, rArmW,
-                    active = elbowAngle < 138f,
-                    jointLabel = "coudes",
-                    leftJointIdx = LEFT_ELBOW,
-                    rightJointIdx = RIGHT_ELBOW
-                )
+                if (!isArcher) {
+                    addSymmetryCorrectionIfNeeded(
+                        leftElbow, rightElbow, lArmW, rArmW,
+                        active = activeElbow < 138f,
+                        jointLabel = "coudes",
+                        leftJointIdx = LEFT_ELBOW,
+                        rightJointIdx = RIGHT_ELBOW
+                    )
+                }
 
                 if (repCompletedNow) voiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        elIdx, elS.x, elS.y, elbowAngle.roundToInt(),
+                        activeElIdx, activeElS.x, activeElS.y, activeElbow.roundToInt(),
                         if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤95°", targetDegHint = elbowHint
+                        parentIndex = activeShIdx,
+                        childIndex = activeWrIdx,
+                        targetRangeText = "≤${elbowBottomTarget.roundToInt()}°",
+                        targetDegHint = elbowHint
                     )
                 )
                 badges.add(
                     JointAngleBadge(
-                        hpIdx, hpS.x, hpS.y, bodyLineAlign.roundToInt(),
-                        if (bodyLineAlign in 160f..200f) FormQuality.GOOD else FormQuality.FAULT,
-                        parentIndex = shIdx, childIndex = anIdx, targetRangeText = "162–198°", targetDegHint = hipHint
+                        hpIdx, hpS.x, hpS.y,
+                        if (isPike) hipAngle.roundToInt() else effectiveAlign.roundToInt(),
+                        if (isPike || effectiveAlign in 156f..204f) FormQuality.GOOD else FormQuality.FAULT,
+                        parentIndex = shIdx,
+                        childIndex = alignEndIdx,
+                        targetRangeText = if (isPike) "V inversé" else "160–200°",
+                        targetDegHint = hipHint
                     )
                 )
                 feedback = faultMsg ?: when (phase) {
-                    MovementPhase.BOTTOM -> "Amplitude validée — repoussez le sol !"
-                    else -> "Corps aligné (${bodyLineAlign.roundToInt()}°), coudes à 45°."
+                    MovementPhase.BOTTOM -> if (isPike) {
+                        "Pompe piquée validée — repoussez fort !"
+                    } else {
+                        "Amplitude ${pushupVariant.labelFr} validée — repoussez !"
+                    }
+                    else -> when (pushupVariant) {
+                        PushupVariant.PIKE -> "Piquée détectée — descendez la tête entre les mains."
+                        PushupVariant.ARCHER -> "Archer détectée — fléchissez le bras actif en contrôle."
+                        PushupVariant.KNEE -> "Pompes genoux (${effectiveAlign.roundToInt()}°) — buste gainé."
+                        PushupVariant.WIDE -> "Prise large — poitrine vers le sol, amplitude fluide."
+                        PushupVariant.DIAMOND -> "Prise diamant — coudes près des côtes, triceps engagés."
+                        PushupVariant.STANDARD -> "Corps aligné (${effectiveAlign.roundToInt()}°), coudes contrôlés."
+                    }
                 }
             }
 
@@ -854,7 +1060,7 @@ class BiomechanicsEngine(
                 val activeAnIdx = if (activeLeft) LEFT_ANKLE else RIGHT_ANKLE
                 val activeKnS = screenPts[activeKnIdx]
 
-                romPct = mapRange(minKnee, 165f, 88f)
+                romPct = mapRange(minKnee, 162f, if (isStrict) 88f else 96f)
                 val maxTilt = if (currentExercise == ExerciseType.BULGARIAN_SQUAT) 34f else 28f
                 var kneeHint: Int? = null
 
@@ -920,11 +1126,12 @@ class BiomechanicsEngine(
                     }
                 }
 
+                val bottomThresh = if (isStrict) 100f else 110f
                 val cycle = updateDownUpCycle(
                     metric = minKnee,
-                    startThreshold = 148f,
-                    bottomThreshold = 102f,
-                    finishThreshold = 155f,
+                    startThreshold = if (isStrict) 148f else 142f,
+                    bottomThreshold = bottomThresh,
+                    finishThreshold = if (isStrict) 154f else 144f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -933,7 +1140,7 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (!reachedBottom && minKnee in 103f..132f) {
+                if (!reachedBottom && minKnee in (bottomThresh + 2f)..132f) {
                     val delta = (minKnee - 95f).roundToInt().coerceAtLeast(1)
                     kneeHint = 95
                     corrections.add(
@@ -959,14 +1166,17 @@ class BiomechanicsEngine(
                     JointAngleBadge(
                         activeKnIdx, activeKnS.x, activeKnS.y, minKnee.roundToInt(),
                         if (kneeHint != null) FormQuality.CAUTION else scoreToQuality(score),
-                        parentIndex = activeHpIdx, childIndex = activeAnIdx, targetRangeText = "≤95°", targetDegHint = kneeHint
+                        parentIndex = activeHpIdx,
+                        childIndex = activeAnIdx,
+                        targetRangeText = if (isStrict) "≤100°" else "≤110°",
+                        targetDegHint = kneeHint
                     )
                 )
                 feedback = faultMsg ?: "Amplitude ${romPct}% — contrôlez la stabilité du genou."
             }
 
             ExerciseType.DEADLIFT -> {
-                romPct = mapRange(hipAngle, 170f, 85f)
+                romPct = mapRange(hipAngle, 168f, if (isStrict) 88f else 102f)
                 var hipHint: Int? = null
                 var kneeHint: Int? = null
 
@@ -992,8 +1202,9 @@ class BiomechanicsEngine(
                         )
                     )
                 }
-                if (hipAngle > 185f || (phase == MovementPhase.READY && bodyLineAlign > 192f && torsoTilt > 12f)) {
-                    val cur = maxOf(hipAngle, bodyLineAlign).roundToInt()
+                // Fixed 3D-compatible hyperextension check via signed bodyLineAlign (>192°) instead of impossible 3D hipAngle > 185°
+                if (bodyLineAlign > 192f && torsoTilt > 10f && hipAngle > 158f) {
+                    val cur = bodyLineAlign.roundToInt()
                     val delta = (cur - 180).coerceAtLeast(5)
                     score -= 22
                     faultMsg = "Stoppez droit — ne cambrez pas en arrière"
@@ -1023,8 +1234,8 @@ class BiomechanicsEngine(
                 val cycle = updateDownUpCycle(
                     metric = hipAngle,
                     startThreshold = 150f,
-                    bottomThreshold = 105f,
-                    finishThreshold = 162f,
+                    bottomThreshold = if (isStrict) 105f else 116f,
+                    finishThreshold = if (isStrict) 162f else 154f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1045,7 +1256,7 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "85–175°", targetDegHint = hipHint
+                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "90–175°", targetDegHint = hipHint
                     )
                 )
                 badges.add(
@@ -1072,7 +1283,7 @@ class BiomechanicsEngine(
                 } else {
                     wrS.y < shS.y
                 }
-                romPct = if (overheadOk) mapRange(elbowAngle, 75f, 165f) else mapRange(elbowAngle, 75f, 165f) / 2
+                romPct = if (overheadOk) mapRange(elbowAngle, 85f, if (isStrict) 165f else 155f) else mapRange(elbowAngle, 85f, 165f) / 2
                 var elbowHint: Int? = null
 
                 if (torsoTilt > 18f) {
@@ -1101,11 +1312,12 @@ class BiomechanicsEngine(
                     )
                 }
 
+                val topThresh = if (isStrict) 155f else 146f
                 val cycle = updateUpDownCycle(
                     metric = elbowAngle,
-                    startThreshold = 100f,
-                    topThreshold = 155f,
-                    finishThreshold = 95f,
+                    startThreshold = if (isStrict) 100f else 106f,
+                    topThreshold = topThresh,
+                    finishThreshold = if (isStrict) 95f else 110f,
                     extraTopCondition = overheadOk,
                     currentRom = romPct,
                     fault = faultMsg,
@@ -1115,16 +1327,16 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (overheadOk && !reachedBottom && elbowAngle in 118f..154f) {
-                    val delta = (162f - elbowAngle).roundToInt().coerceAtLeast(1)
-                    elbowHint = 162
+                if (overheadOk && !reachedBottom && elbowAngle in 118f..(topThresh - 2f)) {
+                    val delta = (topThresh + 6f - elbowAngle).roundToInt().coerceAtLeast(1)
+                    elbowHint = (topThresh + 6f).roundToInt()
                     val (gx, gy) = straightenLimbGhost(shS, elS, wrS)
                     corrections.add(
                         AngleCorrection(
                             jointIndex = elIdx,
                             jointLabelFr = "Verrouillage",
                             currentDeg = elbowAngle.roundToInt(),
-                            targetMinDeg = 160,
+                            targetMinDeg = topThresh.roundToInt(),
                             targetMaxDeg = 180,
                             deltaDeg = delta,
                             severity = FormQuality.CAUTION,
@@ -1134,7 +1346,7 @@ class BiomechanicsEngine(
                             ghostTargetX = gx,
                             ghostTargetY = gy,
                             shortBadgeFr = "COUDE +$delta°",
-                            instructionFr = "Verrouillez les coudes (+$delta° : ${elbowAngle.roundToInt()}° → ≥160°)",
+                            instructionFr = "Verrouillez les coudes (+$delta° : ${elbowAngle.roundToInt()}° → ≥${topThresh.roundToInt()}°)",
                             voiceCueFr = "Verrouillez les bras en haut"
                         )
                     )
@@ -1153,38 +1365,50 @@ class BiomechanicsEngine(
                     JointAngleBadge(
                         elIdx, elS.x, elS.y, elbowAngle.roundToInt(),
                         if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≥160°", targetDegHint = elbowHint
+                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≥${topThresh.roundToInt()}°", targetDegHint = elbowHint
                     )
                 )
                 feedback = faultMsg ?: "Poussée verticale stricte — verrouillez au-dessus."
             }
 
             ExerciseType.BICEP_CURL -> {
-                romPct = mapRange(elbowAngle, 160f, 45f)
-                val elbowDrift3D = use3D && shoulderAngle > 34f && elbowAngle < 110f
+                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
+                val isAlternating = bothVisible && bothArmsVis && abs(leftElbow - rightElbow) > 35f
+                val activeLeftCurl = if (isAlternating) leftElbow <= rightElbow else useLeft
+                val activeCurlElbow = if (isAlternating) minOf(leftElbow, rightElbow) else elbowAngle
+                val activeCurlShAngle = if (isAlternating) (if (activeLeftCurl) leftShoulder else rightShoulder) else shoulderAngle
+                val activeElIdx = if (isAlternating) (if (activeLeftCurl) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
+                val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
+                val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
+                val activeElS = screenPts[activeElIdx]
+                val activeShS = screenPts[activeShIdx]
+                if (isAlternating) detectedVariantFr = "Alterné"
+
+                romPct = mapRange(activeCurlElbow, 155f, if (isStrict) 48f else 62f)
+                val elbowDrift3D = use3D && activeCurlShAngle > 34f && activeCurlElbow < 110f
                 val torsoLen2D = dist2D(shS, hpS).coerceAtLeast(0.08f)
-                val elbowDrift2D = !use3D && abs(elS.x - shS.x) > torsoLen2D * 0.42f && elbowAngle < 105f
+                val elbowDrift2D = !use3D && abs(activeElS.x - activeShS.x) > torsoLen2D * 0.42f && activeCurlElbow < 105f
                 if (elbowDrift3D || elbowDrift2D) {
-                    val delta = (shoulderAngle - 25f).roundToInt().coerceAtLeast(8)
+                    val delta = (activeCurlShAngle - 25f).roundToInt().coerceAtLeast(8)
                     score -= 24
                     faultMsg = "Gardez le coude fixe près des côtes"
-                    val pullDx = if (elS.x >= shS.x) -1f else 1f
+                    val pullDx = if (activeElS.x >= activeShS.x) -1f else 1f
                     corrections.add(
                         AngleCorrection(
-                            jointIndex = elIdx,
+                            jointIndex = activeElIdx,
                             jointLabelFr = "Coude",
-                            currentDeg = shoulderAngle.roundToInt(),
+                            currentDeg = activeCurlShAngle.roundToInt(),
                             targetMinDeg = 0,
                             targetMaxDeg = 28,
                             deltaDeg = delta,
                             severity = FormQuality.FAULT,
                             arrowDx = pullDx,
                             arrowDy = 0.25f,
-                            ghostAnchorIndex = shIdx,
-                            ghostTargetX = shS.x,
-                            ghostTargetY = elS.y,
+                            ghostAnchorIndex = activeShIdx,
+                            ghostTargetX = activeShS.x,
+                            ghostTargetY = activeElS.y,
                             shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Reculez le coude près des côtes (${shoulderAngle.roundToInt()}° → ≤28°)",
+                            instructionFr = "Reculez le coude près des côtes (${activeCurlShAngle.roundToInt()}° → ≤28°)",
                             voiceCueFr = "Gardez les coudes collés aux côtes"
                         )
                     )
@@ -1216,10 +1440,10 @@ class BiomechanicsEngine(
                 }
 
                 val cycle = updateDownUpCycle(
-                    metric = elbowAngle,
-                    startThreshold = 140f,
-                    bottomThreshold = 58f,
-                    finishThreshold = 148f,
+                    metric = activeCurlElbow,
+                    startThreshold = if (isStrict) 140f else 136f,
+                    bottomThreshold = if (isStrict) 58f else 74f,
+                    finishThreshold = if (isStrict) 148f else 136f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1228,26 +1452,62 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                addSymmetryCorrectionIfNeeded(
-                    leftElbow, rightElbow, lArmW, rArmW,
-                    active = elbowAngle < 125f,
-                    jointLabel = "bras",
-                    leftJointIdx = LEFT_ELBOW,
-                    rightJointIdx = RIGHT_ELBOW
-                )
+                if (!isAlternating) {
+                    addSymmetryCorrectionIfNeeded(
+                        leftElbow, rightElbow, lArmW, rArmW,
+                        active = activeCurlElbow < 125f,
+                        jointLabel = "bras",
+                        leftJointIdx = LEFT_ELBOW,
+                        rightJointIdx = RIGHT_ELBOW
+                    )
+                }
 
                 if (repCompletedNow) voiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        elIdx, elS.x, elS.y, elbowAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤55°"
+                        activeElIdx, activeElS.x, activeElS.y, activeCurlElbow.roundToInt(), scoreToQuality(score),
+                        parentIndex = activeShIdx,
+                        childIndex = activeWrIdx,
+                        targetRangeText = if (isStrict) "≤58°" else "≤74°"
                     )
                 )
-                feedback = faultMsg ?: "Flexion propre (${elbowAngle.roundToInt()}°), contrôlez la descente."
+                feedback = faultMsg ?: if (isAlternating) {
+                    "Curl alterné propre (${activeCurlElbow.roundToInt()}°) — coude fixe."
+                } else {
+                    "Flexion propre (${activeCurlElbow.roundToInt()}°), contrôlez la descente."
+                }
             }
 
             ExerciseType.TRICEP_DIP -> {
-                romPct = mapRange(elbowAngle, 162f, 82f)
+                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
+                val dipElbowBottom = if (isStrict) 95f else 106f
+                val dipElbowFinish = if (isStrict) 155f else 146f
+                val dipElbowProgress = ((148f - elbowAngle) / (148f - dipElbowBottom).coerceAtLeast(10f)).coerceIn(0f, 1.25f)
+
+                // Adaptive vertical shoulder drop relative to planted wrists (bench & parallel dips)
+                val midWrYDip = if (bothArmsVis) (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f else geomPts[wrIdx].y
+                val midShYDip = if (bothArmsVis) (geomPts[LEFT_SHOULDER].y + geomPts[RIGHT_SHOULDER].y) * 0.5f else geomPts[shIdx].y
+                val dipTorsoLen = if (use3D) {
+                    dist3D(geomPts[shIdx], geomPts[hpIdx]).coerceAtLeast(0.28f)
+                } else {
+                    dist2D(shS, hpS).coerceAtLeast(0.10f)
+                }
+                val currentDipHeight = ((midWrYDip - midShYDip) / dipTorsoLen).coerceAtLeast(0f)
+                if (torsoTilt <= 48f && currentDipHeight > 0.08f) {
+                    if (adaptiveDipTopHeight <= 0.01f || currentDipHeight > adaptiveDipTopHeight) {
+                        adaptiveDipTopHeight = currentDipHeight
+                    } else if (phase == MovementPhase.READY) {
+                        adaptiveDipTopHeight = adaptiveDipTopHeight * 0.996f + currentDipHeight * 0.004f
+                    }
+                }
+                val dipDropProgress = if (adaptiveDipTopHeight > 0.16f && torsoTilt <= 48f) {
+                    ((adaptiveDipTopHeight - currentDipHeight) / (adaptiveDipTopHeight * 0.32f)).coerceIn(0f, 1.2f)
+                } else {
+                    0f
+                }
+
+                val dipDepth = if (isStrict) dipElbowProgress else maxOf(dipElbowProgress, dipDropProgress * 0.94f)
+                romPct = (dipDepth * 100f).roundToInt().coerceIn(0, 100)
                 var elbowHint: Int? = null
                 if (torsoTilt > 38f) {
                     val delta = (torsoTilt - 38f).roundToInt().coerceAtLeast(1)
@@ -1300,35 +1560,48 @@ class BiomechanicsEngine(
                     }
                 }
 
-                val cycle = updateDownUpCycle(
-                    metric = elbowAngle,
-                    startThreshold = 148f,
-                    bottomThreshold = 95f,
-                    finishThreshold = 155f,
-                    currentRom = romPct,
-                    fault = faultMsg,
-                    timestampMs = timestampMs
-                )
+                val cycle = if (isStrict) {
+                    updateDownUpCycle(
+                        metric = elbowAngle,
+                        startThreshold = 148f,
+                        bottomThreshold = dipElbowBottom,
+                        finishThreshold = dipElbowFinish,
+                        currentRom = romPct,
+                        fault = faultMsg,
+                        timestampMs = timestampMs
+                    )
+                } else {
+                    updateProgressCycle(
+                        progress = dipDepth,
+                        startThreshold = 0.20f,
+                        peakThreshold = 0.65f,
+                        finishThreshold = 0.24f,
+                        currentRom = romPct,
+                        fault = faultMsg,
+                        timestampMs = timestampMs
+                    )
+                }
                 repCompletedNow = cycle.completed
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (!reachedBottom && elbowAngle in 98f..128f) {
-                    val delta = (elbowAngle - 95f).roundToInt().coerceAtLeast(1)
-                    elbowHint = 95
+                if (!reachedBottom && elbowAngle in (dipElbowBottom + 3f)..128f) {
+                    val targetDeg = dipElbowBottom.roundToInt()
+                    val delta = (elbowAngle - dipElbowBottom).roundToInt().coerceAtLeast(1)
+                    elbowHint = targetDeg
                     corrections.add(
                         AngleCorrection(
                             jointIndex = elIdx,
                             jointLabelFr = "Coude",
                             currentDeg = elbowAngle.roundToInt(),
                             targetMinDeg = 80,
-                            targetMaxDeg = 95,
+                            targetMaxDeg = targetDeg,
                             deltaDeg = delta,
                             severity = FormQuality.CAUTION,
                             arrowDx = 0f,
                             arrowDy = 1f,
                             shortBadgeFr = "COUDE -$delta°",
-                            instructionFr = "Descendez encore $delta° (${elbowAngle.roundToInt()}° → ≤95°)",
+                            instructionFr = "Descendez encore $delta° (${elbowAngle.roundToInt()}° → ≤$targetDeg°)",
                             voiceCueFr = "Descendez jusqu'à 90 degrés"
                         )
                     )
@@ -1347,27 +1620,61 @@ class BiomechanicsEngine(
                     JointAngleBadge(
                         elIdx, elS.x, elS.y, elbowAngle.roundToInt(),
                         if (elbowHint != null) FormQuality.CAUTION else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤95°", targetDegHint = elbowHint
+                        parentIndex = shIdx,
+                        childIndex = wrIdx,
+                        targetRangeText = "≤${dipElbowBottom.roundToInt()}°",
+                        targetDegHint = elbowHint
                     )
                 )
-                feedback = faultMsg ?: "Descendez jusqu'à 90° puis verrouillez proprement."
+                feedback = faultMsg ?: "Descendez contrôlé puis verrouillez proprement."
             }
 
             ExerciseType.PLANK -> {
-                val isHorizontal = if (use3D) {
-                    fullBodyTilt >= 55f
+                val shSpanPlank = if (use3D) {
+                    dist3D(worldPts[LEFT_SHOULDER], worldPts[RIGHT_SHOULDER]).coerceAtLeast(0.18f)
                 } else {
-                    abs(shS.y - anS.y) < abs(shS.x - anS.x) * 0.75f
+                    dist2D(screenPts[LEFT_SHOULDER], screenPts[RIGHT_SHOULDER]).coerceAtLeast(0.06f)
                 }
-                val aligned = isHorizontal && bodyLineAlign in 160f..195f
+                val isSidePlank = bothVisible &&
+                    abs(geomPts[LEFT_SHOULDER].y - geomPts[RIGHT_SHOULDER].y) > shSpanPlank * 0.50f
+                val isForearmPlank = !isSidePlank && elbowAngle in 55f..120f
+                detectedVariantFr = when {
+                    isSidePlank -> "Latérale"
+                    isForearmPlank -> "Avant-bras"
+                    else -> "Haute"
+                }
+
+                val isHorizontal = if (use3D) {
+                    fullBodyTilt >= (if (isStrict) 55f else 48f) || isSidePlank
+                } else {
+                    val classicHoriz = abs(shS.y - anS.y) < abs(shS.x - anS.x) * 0.78f
+                    val bodyLen2D = dist2D(shS, anS).coerceAtLeast(0.05f)
+                    val frontViewPlank = !isStrict &&
+                        abs(shS.y - anS.y) < maxOf(bodyLen2D * 0.35f, 0.28f) &&
+                        abs(shS.y - hpS.y) < 0.16f
+                    classicHoriz || frontViewPlank || isSidePlank
+                }
+
+                val validMin = if (isStrict) 160f else 155f
+                val validMax = if (isStrict) 195f else 202f
+                val aligned = isHorizontal && bodyLineAlign in validMin..validMax
                 var hipHint: Int? = null
                 if (aligned) {
                     plankHoldMs += dtMs
                     isometricDeltaSec = dtMs / 1000f
                     phase = MovementPhase.HOLD
                     romPct = 100
-                    score = 98 - (abs(180f - bodyLineAlign) * 0.8f).roundToInt().coerceAtMost(15)
-                    feedback = "Alignement parfait (${bodyLineAlign.roundToInt()}°) — maintenez !"
+                    val inOptimalGreen = bodyLineAlign in 166f..194f
+                    score = if (inOptimalGreen) {
+                        (98 - (abs(180f - bodyLineAlign) * 0.7f).roundToInt()).coerceIn(84, 100)
+                    } else {
+                        (82 - (abs(180f - bodyLineAlign) * 0.4f).roundToInt()).coerceIn(72, 81)
+                    }
+                    feedback = if (inOptimalGreen) {
+                        "Alignement parfait (${bodyLineAlign.roundToInt()}°) — maintenez !"
+                    } else {
+                        "Planche validée (${bodyLineAlign.roundToInt()}°) — affinez l'alignement."
+                    }
                     val sec = (plankHoldMs / 1000L).toInt()
                     if (sec > 0 && sec % 15 == 0 && (plankHoldMs - dtMs) / 1000L < sec) {
                         voiceCue = "$sec secondes, tenez bon !"
@@ -1378,7 +1685,7 @@ class BiomechanicsEngine(
                     if (!isHorizontal) {
                         score = 60
                         feedback = "Mettez-vous en position planche horizontale."
-                    } else if (bodyLineAlign < 160f) {
+                    } else if (bodyLineAlign < validMin) {
                         val delta = (172f - bodyLineAlign).roundToInt().coerceAtLeast(1)
                         score = 52
                         hipHint = 175
@@ -1390,8 +1697,8 @@ class BiomechanicsEngine(
                                 jointIndex = hpIdx,
                                 jointLabelFr = "Hanches",
                                 currentDeg = bodyLineAlign.roundToInt(),
-                                targetMinDeg = 165,
-                                targetMaxDeg = 195,
+                                targetMinDeg = 166,
+                                targetMaxDeg = 194,
                                 deltaDeg = delta,
                                 severity = FormQuality.FAULT,
                                 arrowDx = 0f,
@@ -1400,7 +1707,7 @@ class BiomechanicsEngine(
                                 ghostTargetX = gx,
                                 ghostTargetY = gy,
                                 shortBadgeFr = "HANCHES +$delta°",
-                                instructionFr = "Remontez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 165–195°)",
+                                instructionFr = "Remontez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 166–194°)",
                                 voiceCueFr = "Remontez les hanches, bas du dos creusé"
                             )
                         )
@@ -1416,8 +1723,8 @@ class BiomechanicsEngine(
                                 jointIndex = hpIdx,
                                 jointLabelFr = "Hanches",
                                 currentDeg = bodyLineAlign.roundToInt(),
-                                targetMinDeg = 165,
-                                targetMaxDeg = 195,
+                                targetMinDeg = 166,
+                                targetMaxDeg = 194,
                                 deltaDeg = delta,
                                 severity = FormQuality.FAULT,
                                 arrowDx = 0f,
@@ -1426,7 +1733,7 @@ class BiomechanicsEngine(
                                 ghostTargetX = gx,
                                 ghostTargetY = gy,
                                 shortBadgeFr = "HANCHES -$delta°",
-                                instructionFr = "Abaissez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 165–195°)",
+                                instructionFr = "Abaissez les hanches de $delta° (${bodyLineAlign.roundToInt()}° → 166–194°)",
                                 voiceCueFr = "Abaissez les hanches"
                             )
                         )
@@ -1435,7 +1742,7 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         hpIdx, hpS.x, hpS.y, bodyLineAlign.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = anIdx, targetRangeText = "165–195°", targetDegHint = hipHint
+                        parentIndex = shIdx, childIndex = anIdx, targetRangeText = "166–194°", targetDegHint = hipHint
                     )
                 )
                 badges.add(
@@ -1448,11 +1755,12 @@ class BiomechanicsEngine(
 
             ExerciseType.BURPEE -> {
                 val bodyHorizontal = if (use3D) {
-                    torsoTilt >= 55f
+                    torsoTilt >= (if (isStrict) 55f else 48f)
                 } else {
-                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.55f
+                    abs(shS.y - hpS.y) < abs(shS.x - hpS.x) * 0.60f
                 }
-                val standingTall = hipAngle > 155f && kneeAngle > 155f && shS.y < hpS.y
+                val standAngleThresh = if (isStrict) 155f else 145f
+                val standingTall = hipAngle > standAngleThresh && kneeAngle > standAngleThresh && shS.y < hpS.y
                 when (burpeeStage) {
                     0 -> {
                         phase = if (kneeAngle < 130f) MovementPhase.ECCENTRIC else MovementPhase.READY
@@ -1530,10 +1838,14 @@ class BiomechanicsEngine(
                 } else {
                     dist2D(screenPts[LEFT_ANKLE], screenPts[RIGHT_ANKLE])
                 }
+                val anklesClearlyVisible = lLegW >= 0.45f && rLegW >= 0.45f &&
+                    viewpointInfo.viewpoint != CameraViewpoint.PROFILE_LEFT &&
+                    viewpointInfo.viewpoint != CameraViewpoint.PROFILE_RIGHT
                 val legsSpread = ankleW > shoulderW * 1.15f
-                romPct = mapRange(armFullAngle, 22f, 152f)
-                if (armFullAngle > 130f && !legsSpread) {
-                    score -= 18
+                romPct = mapRange(armFullAngle, 22f, if (isStrict) 152f else 142f)
+
+                if (anklesClearlyVisible && armFullAngle > 130f && !legsSpread) {
+                    score -= 14
                     faultMsg = "Écartez davantage les jambes en synchronisant"
                     corrections.add(
                         AngleCorrection(
@@ -1552,12 +1864,14 @@ class BiomechanicsEngine(
                         )
                     )
                 }
+                // Never block rep counting on legsSpread when in ADAPTIVE or when ankles are occluded / side-view
+                val requireLegsGate = isStrict && anklesClearlyVisible
                 val cycle = updateUpDownCycle(
                     metric = armFullAngle,
-                    startThreshold = 45f,
-                    topThreshold = 138f,
-                    finishThreshold = 42f,
-                    extraTopCondition = legsSpread,
+                    startThreshold = if (isStrict) 45f else 46f,
+                    topThreshold = if (isStrict) 138f else 128f,
+                    finishThreshold = if (isStrict) 42f else 48f,
+                    extraTopCondition = if (requireLegsGate) legsSpread else true,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1578,7 +1892,7 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         shIdx, shS.x, shS.y, armFullAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = hpIdx, childIndex = wrIdx, targetRangeText = "≥140°"
+                        parentIndex = hpIdx, childIndex = wrIdx, targetRangeText = if (isStrict) "≥138°" else "≥128°"
                     )
                 )
                 feedback = faultMsg ?: "Rythme fluide — bras hauts et pieds écartés."
@@ -1587,15 +1901,28 @@ class BiomechanicsEngine(
             ExerciseType.PULL_UP -> {
                 val noseY = geomPts[NOSE].y
                 val midWristY = (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
-                val chinMargin = if (use3D) 0.05f else 0.03f
+                val chinMargin = if (use3D) 0.06f else 0.035f
                 val chinOverHands = noseY < midWristY + chinMargin
-                romPct = mapRange(elbowAngle, 165f, 55f)
+                val bottomThresh = if (isStrict) 74f else 92f
+                val finishThresh = if (isStrict) 155f else 142f
+                val startThresh = if (isStrict) 148f else 140f
+
+                // Wide-grip pull-ups reach chin-over-bar at ~95-110° elbows -> fuse chinOverHands with elbow flexion
+                val effectivePullMetric = if (chinOverHands && elbowAngle < 122f) {
+                    minOf(elbowAngle, bottomThresh - 2f)
+                } else {
+                    elbowAngle
+                }
+                romPct = maxOf(
+                    mapRange(elbowAngle, 160f, if (isStrict) 58f else 76f),
+                    if (chinOverHands && elbowAngle < 122f) 96 else 0
+                )
 
                 val cycle = updateDownUpCycle(
-                    metric = elbowAngle,
-                    startThreshold = 148f,
-                    bottomThreshold = 72f,
-                    finishThreshold = 155f,
+                    metric = effectivePullMetric,
+                    startThreshold = startThresh,
+                    bottomThreshold = bottomThresh,
+                    finishThreshold = finishThresh,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1604,7 +1931,7 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (reachedBottom && !chinOverHands && elbowAngle < 88f) {
+                if (reachedBottom && !chinOverHands && elbowAngle < bottomThresh + 12f) {
                     val delta = (elbowAngle - 62f).roundToInt().coerceAtLeast(8)
                     score -= 15
                     faultMsg = "Tirez la poitrine plus haut vers la barre"
@@ -1614,7 +1941,7 @@ class BiomechanicsEngine(
                             jointLabelFr = "Tirage",
                             currentDeg = elbowAngle.roundToInt(),
                             targetMinDeg = 45,
-                            targetMaxDeg = 70,
+                            targetMaxDeg = bottomThresh.roundToInt(),
                             deltaDeg = delta,
                             severity = FormQuality.CAUTION,
                             arrowDx = 0f,
@@ -1638,14 +1965,24 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         elIdx, elS.x, elS.y, elbowAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤72°"
+                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤${bottomThresh.roundToInt()}°"
                     )
                 )
                 feedback = faultMsg ?: "Tirez les coudes vers les hanches, amplitude complète."
             }
 
             ExerciseType.BENT_ROW -> {
-                romPct = mapRange(elbowAngle, 160f, 68f)
+                val bothArmsVis = lArmW >= 0.45f && rArmW >= 0.45f
+                val isUnilateral = bothVisible && bothArmsVis && abs(leftElbow - rightElbow) > 32f
+                val activeLeftRow = if (isUnilateral) leftElbow <= rightElbow else useLeft
+                val activeRowElbow = if (isUnilateral) minOf(leftElbow, rightElbow) else elbowAngle
+                val activeElIdx = if (isUnilateral) (if (activeLeftRow) LEFT_ELBOW else RIGHT_ELBOW) else elIdx
+                val activeShIdx = if (activeElIdx == LEFT_ELBOW) LEFT_SHOULDER else RIGHT_SHOULDER
+                val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
+                val activeElS = screenPts[activeElIdx]
+                if (isUnilateral) detectedVariantFr = "Unilatéral"
+
+                romPct = mapRange(activeRowElbow, 155f, if (isStrict) 72f else 88f)
                 var torsoHint: Int? = null
                 if (torsoTilt < 24f) {
                     val delta = (40f - torsoTilt).roundToInt().coerceAtLeast(1)
@@ -1699,11 +2036,12 @@ class BiomechanicsEngine(
                     )
                 }
 
+                val rowBottomThresh = if (isStrict) 82f else 98f
                 val cycle = updateDownUpCycle(
-                    metric = elbowAngle,
-                    startThreshold = 145f,
-                    bottomThreshold = 82f,
-                    finishThreshold = 150f,
+                    metric = activeRowElbow,
+                    startThreshold = if (isStrict) 145f else 138f,
+                    bottomThreshold = rowBottomThresh,
+                    finishThreshold = if (isStrict) 150f else 140f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1712,19 +2050,23 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                addSymmetryCorrectionIfNeeded(
-                    leftElbow, rightElbow, lArmW, rArmW,
-                    active = elbowAngle < 135f,
-                    jointLabel = "tirage",
-                    leftJointIdx = LEFT_ELBOW,
-                    rightJointIdx = RIGHT_ELBOW
-                )
+                if (!isUnilateral) {
+                    addSymmetryCorrectionIfNeeded(
+                        leftElbow, rightElbow, lArmW, rArmW,
+                        active = activeRowElbow < 135f,
+                        jointLabel = "tirage",
+                        leftJointIdx = LEFT_ELBOW,
+                        rightJointIdx = RIGHT_ELBOW
+                    )
+                }
 
                 if (repCompletedNow) voiceCue = "$repCount"
                 badges.add(
                     JointAngleBadge(
-                        elIdx, elS.x, elS.y, elbowAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = wrIdx, targetRangeText = "≤82°"
+                        activeElIdx, activeElS.x, activeElS.y, activeRowElbow.roundToInt(), scoreToQuality(score),
+                        parentIndex = activeShIdx,
+                        childIndex = activeWrIdx,
+                        targetRangeText = "≤${rowBottomThresh.roundToInt()}°"
                     )
                 )
                 badges.add(
@@ -1734,19 +2076,23 @@ class BiomechanicsEngine(
                         parentIndex = shIdx, childIndex = knIdx, targetRangeText = "35–55°", targetDegHint = torsoHint
                     )
                 )
-                feedback = faultMsg ?: "Buste fixe (${torsoTilt.roundToInt()}°) — serrez les omoplates."
+                feedback = faultMsg ?: if (isUnilateral) {
+                    "Rowing unilatéral (${torsoTilt.roundToInt()}°) — tirez le coude vers la hanche."
+                } else {
+                    "Buste fixe (${torsoTilt.roundToInt()}°) — serrez les omoplates."
+                }
             }
 
             ExerciseType.GLUTE_BRIDGE -> {
-                romPct = mapRange(hipAngle, 110f, 172f)
+                romPct = mapRange(hipAngle, if (isStrict) 115f else 128f, if (isStrict) 172f else 164f)
                 var hipHint: Int? = null
                 val supineAlign = if (use3D) {
                     bodyLineAlignment3D(geomPts[shIdx], geomPts[hpIdx], geomPts[knIdx])
                 } else {
                     bodyLineAlignmentDegrees(shS, hpS, knS)
                 }
-                if (hipAngle > 186f || supineAlign > 194f) {
-                    val cur = maxOf(hipAngle, supineAlign).roundToInt()
+                if (supineAlign > 194f) {
+                    val cur = supineAlign.roundToInt()
                     val delta = (cur - 180).coerceAtLeast(6)
                     score -= 20
                     hipHint = 175
@@ -1769,11 +2115,12 @@ class BiomechanicsEngine(
                     )
                 }
 
+                val bridgeTopThresh = if (isStrict) 162f else 156f
                 val cycle = updateUpDownCycle(
                     metric = hipAngle,
-                    startThreshold = 128f,
-                    topThreshold = 162f,
-                    finishThreshold = 125f,
+                    startThreshold = if (isStrict) 128f else 136f,
+                    topThreshold = bridgeTopThresh,
+                    finishThreshold = if (isStrict) 125f else 136f,
                     extraTopCondition = true,
                     currentRom = romPct,
                     fault = faultMsg,
@@ -1783,22 +2130,23 @@ class BiomechanicsEngine(
                 completedRepRom = cycle.completedRom
                 completedRepDurSec = cycle.durationSec
 
-                if (!reachedBottom && hipAngle in 134f..158f) {
-                    val delta = (165f - hipAngle).roundToInt().coerceAtLeast(1)
-                    hipHint = 165
+                if (!reachedBottom && hipAngle in 138f..(bridgeTopThresh - 2f)) {
+                    val targetDeg = bridgeTopThresh.roundToInt()
+                    val delta = (bridgeTopThresh - hipAngle).roundToInt().coerceAtLeast(1)
+                    hipHint = targetDeg
                     corrections.add(
                         AngleCorrection(
                             jointIndex = hpIdx,
                             jointLabelFr = "Hanches",
                             currentDeg = hipAngle.roundToInt(),
-                            targetMinDeg = 165,
+                            targetMinDeg = targetDeg,
                             targetMaxDeg = 180,
                             deltaDeg = delta,
                             severity = FormQuality.CAUTION,
                             arrowDx = 0f,
                             arrowDy = -1f,
                             shortBadgeFr = "HANCHES +$delta°",
-                            instructionFr = "Montez encore les hanches (+$delta° : ${hipAngle.roundToInt()}° → ≥165°)",
+                            instructionFr = "Montez encore les hanches (+$delta° : ${hipAngle.roundToInt()}° → ≥$targetDeg°)",
                             voiceCueFr = "Montez les hanches plus haut"
                         )
                     )
@@ -1809,14 +2157,14 @@ class BiomechanicsEngine(
                     JointAngleBadge(
                         hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(),
                         if (hipHint != null && score < 82) FormQuality.FAULT else scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "165–180°", targetDegHint = hipHint
+                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "≥${bridgeTopThresh.roundToInt()}°", targetDegHint = hipHint
                     )
                 )
                 feedback = faultMsg ?: "Extension complète des hanches (${hipAngle.roundToInt()}°), serrez 1s."
             }
 
             ExerciseType.LEG_RAISE -> {
-                romPct = mapRange(hipAngle, 170f, 92f)
+                romPct = mapRange(hipAngle, if (isStrict) 168f else 156f, if (isStrict) 92f else 102f)
                 var kneeHint: Int? = null
                 if (kneeAngle < 135f) {
                     val delta = (155f - kneeAngle).roundToInt().coerceAtLeast(1)
@@ -1848,11 +2196,12 @@ class BiomechanicsEngine(
                     )
                 }
 
+                val legBottomThresh = if (isStrict) 104f else 112f
                 val cycle = updateDownUpCycle(
                     metric = hipAngle,
-                    startThreshold = 152f,
-                    bottomThreshold = 104f,
-                    finishThreshold = 156f,
+                    startThreshold = if (isStrict) 152f else 145f,
+                    bottomThreshold = legBottomThresh,
+                    finishThreshold = if (isStrict) 156f else 145f,
                     currentRom = romPct,
                     fault = faultMsg,
                     timestampMs = timestampMs
@@ -1865,7 +2214,7 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         hpIdx, hpS.x, hpS.y, hipAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "≤100°"
+                        parentIndex = shIdx, childIndex = knIdx, targetRangeText = "≤${legBottomThresh.roundToInt()}°"
                     )
                 )
                 badges.add(
@@ -1879,7 +2228,7 @@ class BiomechanicsEngine(
             }
 
             ExerciseType.LATERAL_RAISE -> {
-                romPct = mapRange(shoulderAngle, 15f, 90f)
+                romPct = mapRange(shoulderAngle, if (isStrict) 15f else 24f, if (isStrict) 90f else 84f)
                 var shHint: Int? = null
                 if (shoulderAngle > 108f) {
                     val delta = (shoulderAngle - 92f).roundToInt().coerceAtLeast(1)
@@ -1929,11 +2278,12 @@ class BiomechanicsEngine(
                     )
                 }
 
+                val latTopThresh = if (isStrict) 78f else 72f
                 val cycle = updateUpDownCycle(
                     metric = shoulderAngle,
-                    startThreshold = 28f,
-                    topThreshold = 78f,
-                    finishThreshold = 26f,
+                    startThreshold = if (isStrict) 28f else 34f,
+                    topThreshold = latTopThresh,
+                    finishThreshold = if (isStrict) 26f else 34f,
                     extraTopCondition = true,
                     currentRom = romPct,
                     fault = faultMsg,
@@ -1955,7 +2305,7 @@ class BiomechanicsEngine(
                 badges.add(
                     JointAngleBadge(
                         shIdx, shS.x, shS.y, shoulderAngle.roundToInt(), scoreToQuality(score),
-                        parentIndex = hpIdx, childIndex = elIdx, targetRangeText = "80–95°", targetDegHint = shHint
+                        parentIndex = hpIdx, childIndex = elIdx, targetRangeText = "${latTopThresh.roundToInt()}–95°", targetDegHint = shHint
                     )
                 )
                 feedback = faultMsg ?: "Élevez jusqu'à 90° (${shoulderAngle.roundToInt()}°), épaules basses."
@@ -2005,7 +2355,8 @@ class BiomechanicsEngine(
             repCompletedNow = repCompletedNow,
             completedRepRomPct = completedRepRom,
             completedRepDurationSec = completedRepDurSec,
-            isometricDeltaSec = isometricDeltaSec
+            isometricDeltaSec = isometricDeltaSec,
+            detectedVariantFr = detectedVariantFr
         )
     }
 
@@ -2015,7 +2366,80 @@ class BiomechanicsEngine(
         val durationSec: Float
     )
 
-    /** State machine for movements whose active bottom phase decreases the primary angle (Squat, Pushup, Curl...). */
+    /**
+     * Multi-signal normalized progress cycle (0.0 = rest/top -> 1.0 = full bottom/peak -> 0.0 = rep completed).
+     * Used by fused multi-signal exercises (Push-ups, Dips) to work seamlessly across all variants & camera angles.
+     */
+    private fun updateProgressCycle(
+        progress: Float,
+        startThreshold: Float,
+        peakThreshold: Float,
+        finishThreshold: Float,
+        currentRom: Int,
+        fault: String?,
+        timestampMs: Long
+    ): CycleResult {
+        if (currentRom > repRomPeak) repRomPeak = currentRom
+        if (fault != null) currentRepFault = fault
+
+        when (phase) {
+            MovementPhase.READY -> {
+                if (progress >= startThreshold) {
+                    phase = if (progress >= peakThreshold) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
+                    reachedBottom = progress >= peakThreshold
+                    repRomPeak = currentRom
+                    repStartTsMs = timestampMs
+                    currentRepFault = fault
+                }
+            }
+            MovementPhase.ECCENTRIC -> {
+                if (progress >= peakThreshold) {
+                    phase = MovementPhase.BOTTOM
+                    reachedBottom = true
+                } else if (progress < startThreshold * 0.60f) {
+                    phase = MovementPhase.READY
+                    repRomPeak = 0
+                    repStartTsMs = 0L
+                }
+            }
+            MovementPhase.BOTTOM -> {
+                if (progress <= finishThreshold && reachedBottom) {
+                    val peakRom = repRomPeak
+                    val durSec = computeRepDurationSec(timestampMs)
+                    repCount++
+                    recordRom(peakRom)
+                    phase = MovementPhase.READY
+                    reachedBottom = false
+                    repRomPeak = 0
+                    repStartTsMs = 0L
+                    currentRepFault = null
+                    return CycleResult(true, peakRom, durSec)
+                } else if (progress < peakThreshold - 0.12f) {
+                    phase = MovementPhase.CONCENTRIC
+                }
+            }
+            MovementPhase.CONCENTRIC -> {
+                if (progress <= finishThreshold && reachedBottom) {
+                    val peakRom = repRomPeak
+                    val durSec = computeRepDurationSec(timestampMs)
+                    repCount++
+                    recordRom(peakRom)
+                    phase = MovementPhase.READY
+                    reachedBottom = false
+                    repRomPeak = 0
+                    repStartTsMs = 0L
+                    currentRepFault = null
+                    return CycleResult(true, peakRom, durSec)
+                } else if (progress >= peakThreshold) {
+                    phase = MovementPhase.BOTTOM
+                }
+            }
+            else -> phase = MovementPhase.READY
+        }
+        return CycleResult(false, 0, 0f)
+    }
+
+    /** State machine for movements whose active bottom phase decreases the primary angle (Squat, Curl, Pull-up...). */
     private fun updateDownUpCycle(
         metric: Float,
         startThreshold: Float,
@@ -2027,12 +2451,13 @@ class BiomechanicsEngine(
     ): CycleResult {
         if (currentRom > repRomPeak) repRomPeak = currentRom
         if (fault != null) currentRepFault = fault
+        val abortThreshold = maxOf(startThreshold, finishThreshold) + 4f
 
         when (phase) {
             MovementPhase.READY -> {
                 if (metric < startThreshold) {
-                    phase = MovementPhase.ECCENTRIC
-                    reachedBottom = false
+                    phase = if (metric <= bottomThreshold) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
+                    reachedBottom = metric <= bottomThreshold
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
                     currentRepFault = fault
@@ -2042,14 +2467,25 @@ class BiomechanicsEngine(
                 if (metric <= bottomThreshold) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
-                } else if (metric >= finishThreshold) {
+                } else if (metric >= abortThreshold) {
                     phase = MovementPhase.READY
                     repRomPeak = 0
                     repStartTsMs = 0L
                 }
             }
             MovementPhase.BOTTOM -> {
-                if (metric > bottomThreshold + 12f) {
+                if (metric >= finishThreshold && reachedBottom) {
+                    val peakRom = repRomPeak
+                    val durSec = computeRepDurationSec(timestampMs)
+                    repCount++
+                    recordRom(peakRom)
+                    phase = MovementPhase.READY
+                    reachedBottom = false
+                    repRomPeak = 0
+                    repStartTsMs = 0L
+                    currentRepFault = null
+                    return CycleResult(true, peakRom, durSec)
+                } else if (metric > bottomThreshold + 10f) {
                     phase = MovementPhase.CONCENTRIC
                 }
             }
@@ -2085,12 +2521,14 @@ class BiomechanicsEngine(
     ): CycleResult {
         if (currentRom > repRomPeak) repRomPeak = currentRom
         if (fault != null) currentRepFault = fault
+        val abortThreshold = minOf(startThreshold, finishThreshold) - 4f
 
         when (phase) {
             MovementPhase.READY -> {
                 if (metric > startThreshold) {
-                    phase = MovementPhase.CONCENTRIC
-                    reachedBottom = false
+                    val hitTop = metric >= topThreshold && extraTopCondition
+                    phase = if (hitTop) MovementPhase.BOTTOM else MovementPhase.CONCENTRIC
+                    reachedBottom = hitTop
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
                     currentRepFault = fault
@@ -2100,14 +2538,25 @@ class BiomechanicsEngine(
                 if (metric >= topThreshold && extraTopCondition) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
-                } else if (metric <= finishThreshold) {
+                } else if (metric <= abortThreshold) {
                     phase = MovementPhase.READY
                     repRomPeak = 0
                     repStartTsMs = 0L
                 }
             }
             MovementPhase.BOTTOM -> {
-                if (metric < topThreshold - 10f) {
+                if (metric <= finishThreshold && reachedBottom) {
+                    val peakRom = repRomPeak
+                    val durSec = computeRepDurationSec(timestampMs)
+                    repCount++
+                    recordRom(peakRom)
+                    phase = MovementPhase.READY
+                    reachedBottom = false
+                    repRomPeak = 0
+                    repStartTsMs = 0L
+                    currentRepFault = null
+                    return CycleResult(true, peakRom, durSec)
+                } else if (metric < topThreshold - 10f) {
                     phase = MovementPhase.ECCENTRIC
                 }
             }

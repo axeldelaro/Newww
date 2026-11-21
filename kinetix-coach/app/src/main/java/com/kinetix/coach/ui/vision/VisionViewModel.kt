@@ -1,19 +1,30 @@
 package com.kinetix.coach.ui.vision
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.kinetix.coach.KinetixApp
+import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.WorkoutSession
 import com.kinetix.coach.vision.AutoExerciseDetector
 import com.kinetix.coach.vision.BiomechanicsEngine
 import com.kinetix.coach.vision.BiomechanicsFrame
 import com.kinetix.coach.vision.CalorieEngine
+import com.kinetix.coach.vision.ChallengeConfig
+import com.kinetix.coach.vision.ChallengeController
+import com.kinetix.coach.vision.ChallengeOutput
+import com.kinetix.coach.vision.ChallengeResult
+import com.kinetix.coach.vision.ChallengeSnapshot
+import com.kinetix.coach.vision.ChallengeType
+import com.kinetix.coach.vision.DetectionStrictness
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PosePoint
 import com.kinetix.coach.vision.ViewpointInfo
 import com.kinetix.coach.vision.VoiceCoach
+import com.kinetix.coach.vision.WorkoutAudioEngine
+import com.kinetix.coach.vision.WorkoutMusicTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,6 +44,7 @@ data class ExerciseBreakdownItem(
 
 data class VisionUiState(
     val selectedExercise: ExerciseType = ExerciseType.SQUAT,
+    val detectionStrictness: DetectionStrictness = DetectionStrictness.ADAPTIVE,
     val isAutoDetectEnabled: Boolean = true,
     val autoDetectConfidence: Float = 0f,
     val autoDetectStatusFr: String = "En attente de mouvement…",
@@ -58,23 +70,60 @@ data class VisionUiState(
     val restFinishedEvent: Int = 0,
     val completedSummary: WorkoutSession? = null,
     val completedBreakdown: List<ExerciseBreakdownItem> = emptyList(),
+    // Challenges & Music state
+    val activeChallenge: ChallengeSnapshot? = null,
+    val completedChallengeResult: ChallengeResult? = null,
+    val selectedMusicTrack: WorkoutMusicTrack = WorkoutMusicTrack.TECHNO_PULSE,
+    val customMusicUri: String? = null,
+    val customMusicName: String? = null,
+    val isMusicMuted: Boolean = false,
+    val musicVolume: Float = 0.72f,
     val errorMessage: String? = null
 )
 
 class VisionViewModel(application: Application) : AndroidViewModel(application) {
 
+    companion object {
+        private const val PREF_STRICTNESS = "detection_strictness"
+        private const val PREF_CUSTOM_MUSIC_URI = "custom_music_uri"
+        private const val PREF_CUSTOM_MUSIC_NAME = "custom_music_name"
+        private const val PREF_MUSIC_TRACK = "preferred_music_track"
+    }
+
     private val app = application as KinetixApp
-    private val engine = BiomechanicsEngine(ExerciseType.SQUAT)
+    private val initialStrictness: DetectionStrictness = runCatching {
+        DetectionStrictness.valueOf(app.userDb.getPref(PREF_STRICTNESS, DetectionStrictness.ADAPTIVE.name))
+    }.getOrDefault(DetectionStrictness.ADAPTIVE)
+
+    private val engine = BiomechanicsEngine(
+        initialExercise = ExerciseType.SQUAT,
+        initialStrictness = initialStrictness
+    )
     private val autoDetector = AutoExerciseDetector()
     private val voiceCoach = VoiceCoach(application)
+    private val audioEngine = WorkoutAudioEngine(application)
+    private val challengeController = ChallengeController()
+
+    val challengeRecords: StateFlow<List<ChallengeRecord>> = app.userDb.challengeRecords
 
     private val _uiState = MutableStateFlow(
-        VisionUiState(frame = engine.emptyFrame())
+        VisionUiState(
+            detectionStrictness = initialStrictness,
+            frame = engine.emptyFrame(),
+            selectedMusicTrack = WorkoutMusicTrack.fromId(
+                app.userDb.getPref(PREF_MUSIC_TRACK, WorkoutMusicTrack.TECHNO_PULSE.id)
+            ),
+            customMusicUri = app.userDb.getPref(PREF_CUSTOM_MUSIC_URI, "").ifBlank { null },
+            customMusicName = app.userDb.getPref(PREF_CUSTOM_MUSIC_NAME, "").ifBlank { null }
+        )
     )
     val uiState: StateFlow<VisionUiState> = _uiState.asStateFlow()
 
     private var lastRepSpoken = 0
     private var restTimerJob: Job? = null
+    private var challengeTickerJob: Job? = null
+    private var musicStartedForChallenge = false
+    private var lastActiveChallengeConfig: ChallengeConfig? = null
 
     // Multi-set & multi-exercise session accumulators for accurate summary averaging
     private var formScoreWeightedSum = 0L
@@ -83,7 +132,25 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private val sessionFaults = linkedSetOf<String>()
     private val exerciseBreakdownMap = linkedMapOf<ExerciseType, ExerciseBreakdownItem>()
 
+    fun setDetectionStrictness(mode: DetectionStrictness) {
+        engine.setStrictness(mode)
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_STRICTNESS, mode.name)
+        }
+        _uiState.update { it.copy(detectionStrictness = mode) }
+    }
+
+    fun toggleDetectionStrictness() {
+        val next = if (_uiState.value.detectionStrictness == DetectionStrictness.ADAPTIVE) {
+            DetectionStrictness.STRICT
+        } else {
+            DetectionStrictness.ADAPTIVE
+        }
+        setDetectionStrictness(next)
+    }
+
     fun toggleAutoDetect() {
+        if (challengeController.isActive) return
         val next = !_uiState.value.isAutoDetectEnabled
         if (next) {
             autoDetector.reset(initialLocked = null)
@@ -100,6 +167,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     /** Manual exercise selection from picker locks into FIXE mode and resets the session cleanly. */
     fun selectExercise(exercise: ExerciseType) {
         cancelRestTimer()
+        if (challengeController.isActive) {
+            stopChallengeSilently()
+        }
         engine.setExercise(exercise)
         autoDetector.reset(initialLocked = exercise)
         lastRepSpoken = 0
@@ -124,6 +194,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 isResting = false,
                 completedSummary = null,
                 completedBreakdown = emptyList(),
+                activeChallenge = null,
+                completedChallengeResult = null,
                 errorMessage = null
             )
         }
@@ -146,6 +218,319 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     fun reportError(message: String) {
         _uiState.update { it.copy(errorMessage = message) }
     }
+
+    // -------------------------------------------------------------------------
+    // Offline Music & Custom Local Audio Controls
+    // -------------------------------------------------------------------------
+
+    fun selectMusicTrack(track: WorkoutMusicTrack) {
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_MUSIC_TRACK, track.id)
+        }
+        _uiState.update { it.copy(selectedMusicTrack = track, isMusicMuted = false) }
+        audioEngine.setMuted(false)
+        if (challengeController.isActive) {
+            val active = challengeController.activeConfig()
+            if (active != null) {
+                lastActiveChallengeConfig = active.copy(musicTrack = track)
+            }
+            if (track == WorkoutMusicTrack.NONE) {
+                audioEngine.stopMusic()
+                musicStartedForChallenge = false
+            } else {
+                startTrackPlayback(track)
+                musicStartedForChallenge = true
+            }
+        }
+    }
+
+    fun setCustomMusicUri(uriString: String, displayName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_CUSTOM_MUSIC_URI, uriString)
+            app.userDb.setPref(PREF_CUSTOM_MUSIC_NAME, displayName)
+            app.userDb.setPref(PREF_MUSIC_TRACK, WorkoutMusicTrack.CUSTOM_LOCAL.id)
+        }
+        _uiState.update {
+            it.copy(
+                customMusicUri = uriString,
+                customMusicName = displayName,
+                selectedMusicTrack = WorkoutMusicTrack.CUSTOM_LOCAL,
+                isMusicMuted = false
+            )
+        }
+        audioEngine.setMuted(false)
+        if (challengeController.isActive) {
+            startTrackPlayback(WorkoutMusicTrack.CUSTOM_LOCAL)
+            musicStartedForChallenge = true
+        }
+    }
+
+    fun toggleMusicMute() {
+        val next = !_uiState.value.isMusicMuted
+        audioEngine.setMuted(next)
+        _uiState.update { it.copy(isMusicMuted = next) }
+    }
+
+    fun cycleQuickMusicTrack() {
+        val state = _uiState.value
+        val playable = buildList {
+            add(WorkoutMusicTrack.NONE)
+            add(WorkoutMusicTrack.TECHNO_PULSE)
+            add(WorkoutMusicTrack.FOCUS_SYNTH)
+            add(WorkoutMusicTrack.HIIT_DRIVE)
+            add(WorkoutMusicTrack.ZEN_BREATH)
+            if (!state.customMusicUri.isNullOrBlank()) {
+                add(WorkoutMusicTrack.CUSTOM_LOCAL)
+            }
+        }
+        val idx = playable.indexOf(state.selectedMusicTrack)
+        val next = playable[(idx + 1) % playable.size]
+        selectMusicTrack(next)
+    }
+
+    fun setMusicVolume(vol: Float) {
+        val clamped = vol.coerceIn(0f, 1f)
+        audioEngine.musicVolume = clamped
+        _uiState.update { it.copy(musicVolume = clamped) }
+    }
+
+    private fun startTrackPlayback(track: WorkoutMusicTrack) {
+        val uri = _uiState.value.customMusicUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        audioEngine.startMusic(track, customUri = uri) { err ->
+            reportError(err)
+        }
+    }
+
+    fun pauseBackgroundAudio() {
+        audioEngine.stopMusic()
+        musicStartedForChallenge = false
+    }
+
+    // -------------------------------------------------------------------------
+    // Camera-Verified Challenges Lifecycle
+    // -------------------------------------------------------------------------
+
+    fun startChallenge(config: ChallengeConfig) {
+        cancelRestTimer()
+        cancelChallengeTicker()
+        audioEngine.stopMusic()
+        musicStartedForChallenge = false
+
+        val targetExercise = config.effectiveExercise()
+        val resolvedTrack = if (config.musicTrack == WorkoutMusicTrack.CUSTOM_LOCAL && _uiState.value.customMusicUri.isNullOrBlank()) {
+            WorkoutMusicTrack.TECHNO_PULSE
+        } else {
+            config.musicTrack
+        }
+        val finalConfig = config.copy(exercise = targetExercise, musicTrack = resolvedTrack)
+        lastActiveChallengeConfig = finalConfig
+
+        engine.setExercise(targetExercise)
+        autoDetector.reset(initialLocked = targetExercise)
+        lastRepSpoken = 0
+        resetMultiSetAccumulators()
+
+        val now = System.currentTimeMillis()
+        val startOutput = challengeController.start(finalConfig, now)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_MUSIC_TRACK, resolvedTrack.id)
+        }
+
+        _uiState.update {
+            it.copy(
+                selectedExercise = targetExercise,
+                isAutoDetectEnabled = false,
+                autoDetectConfidence = 1f,
+                autoDetectStatusFr = "Défi · ${finalConfig.type.shortTitleFr}",
+                sessionStartMs = now,
+                isSessionActive = true,
+                frame = engine.emptyFrame(),
+                currentSetNumber = 1,
+                completedSetsCount = 0,
+                sessionTotalReps = 0,
+                sessionTotalHoldSec = 0,
+                currentSetCaloriesKcal = 0.0,
+                sessionTotalCaloriesKcal = 0.0,
+                multiExerciseBreakdown = emptyList(),
+                isResting = false,
+                restRemainingSec = 0,
+                completedSummary = null,
+                completedBreakdown = emptyList(),
+                selectedMusicTrack = resolvedTrack,
+                isMusicMuted = false,
+                activeChallenge = startOutput.snapshot,
+                completedChallengeResult = null,
+                errorMessage = null
+            )
+        }
+
+        audioEngine.setMuted(false)
+        applyChallengeOutputEffects(startOutput)
+        launchChallengeTicker()
+    }
+
+    fun replayLastChallenge() {
+        val cfg = lastActiveChallengeConfig ?: return
+        startChallenge(cfg)
+    }
+
+    fun stopActiveChallenge() {
+        val now = System.currentTimeMillis()
+        val kcal = _uiState.value.sessionTotalCaloriesKcal + _uiState.value.currentSetCaloriesKcal
+        val out = challengeController.finishEarly(now, kcal)
+        cancelChallengeTicker()
+        audioEngine.stopMusic()
+        musicStartedForChallenge = false
+        if (out != null) {
+            applyChallengeOutputEffects(out)
+        } else {
+            _uiState.update { it.copy(activeChallenge = null) }
+        }
+    }
+
+    fun dismissChallengeResult() {
+        audioEngine.stopMusic()
+        musicStartedForChallenge = false
+        _uiState.update {
+            it.copy(
+                activeChallenge = null,
+                completedChallengeResult = null,
+                isSessionActive = true
+            )
+        }
+        resetSession()
+    }
+
+    fun bestRecordFor(type: ChallengeType, exercise: ExerciseType): ChallengeRecord? =
+        app.userDb.bestRecordFor(type.id, exercise.id, lowerIsBetter = type.lowerIsBetter)
+
+    private fun stopChallengeSilently() {
+        cancelChallengeTicker()
+        challengeController.stopAndReset()
+        audioEngine.stopMusic()
+        musicStartedForChallenge = false
+    }
+
+    private fun launchChallengeTicker() {
+        cancelChallengeTicker()
+        challengeTickerJob = viewModelScope.launch {
+            while (challengeController.isActive) {
+                delay(150L)
+                if (!challengeController.isActive) break
+                val state = _uiState.value
+                val kcal = state.sessionTotalCaloriesKcal + state.currentSetCaloriesKcal
+                val frameArg = if (state.frame.poseDetected) state.frame.copy(repCompletedNow = false) else null
+                val out = synchronized(challengeController) {
+                    challengeController.onFrame(frameArg, System.currentTimeMillis(), kcal)
+                }
+                if (out != null) {
+                    applyChallengeOutputEffects(out)
+                }
+            }
+        }
+    }
+
+    private fun cancelChallengeTicker() {
+        challengeTickerJob?.cancel()
+        challengeTickerJob = null
+    }
+
+    private fun applyChallengeOutputEffects(output: ChallengeOutput) {
+        output.beepsToPlay.forEach { beep -> audioEngine.playBeep(beep) }
+        output.voiceAnnouncementFr?.let { cue ->
+            voiceCoach.speak(cue, isRepCounter = true, force = true)
+        }
+
+        val track = _uiState.value.selectedMusicTrack
+        if (output.completedResult != null) {
+            cancelChallengeTicker()
+            audioEngine.stopMusic()
+            musicStartedForChallenge = false
+            handleChallengeCompleted(output.completedResult)
+            return
+        }
+
+        if (track != WorkoutMusicTrack.NONE) {
+            if (output.musicShouldPlay) {
+                if (!musicStartedForChallenge) {
+                    startTrackPlayback(track)
+                    musicStartedForChallenge = true
+                }
+                audioEngine.setMusicPaused(false)
+                audioEngine.setDucked(output.musicDucked)
+                audioEngine.setFinalSprint(output.musicFinalSprint)
+            } else if (musicStartedForChallenge) {
+                audioEngine.setMusicPaused(true)
+            }
+        }
+
+        _uiState.update { it.copy(activeChallenge = output.snapshot) }
+    }
+
+    private fun handleChallengeCompleted(rawResult: ChallengeResult) {
+        val cfg = rawResult.config
+        val ex = cfg.effectiveExercise()
+        val prevBest = app.userDb.bestRecordFor(cfg.type.id, ex.id, lowerIsBetter = cfg.type.lowerIsBetter)
+
+        val eligibleForPr = when (cfg.type) {
+            ChallengeType.TARGET_REPS_RACE -> rawResult.completedGoal && rawResult.scoreValue > 0.0
+            else -> rawResult.scoreValue > 0.0
+        }
+        val beatsPrevious = eligibleForPr && (
+            prevBest == null ||
+                if (cfg.type.lowerIsBetter) rawResult.scoreValue < prevBest.scoreValue
+                else rawResult.scoreValue > prevBest.scoreValue
+            )
+
+        val enriched = rawResult.copy(
+            isNewRecord = beatsPrevious,
+            previousRecordLabel = prevBest?.scoreLabel
+        )
+
+        viewModelScope.launch(Dispatchers.IO) {
+            if (eligibleForPr) {
+                app.userDb.insertChallengeRecord(
+                    ChallengeRecord(
+                        timestampMs = System.currentTimeMillis(),
+                        challengeId = cfg.type.id,
+                        exerciseId = ex.id,
+                        scoreValue = enriched.scoreValue,
+                        scoreLabel = enriched.scoreLabel,
+                        durationSec = enriched.durationSec,
+                        caloriesKcal = enriched.caloriesKcal
+                    )
+                )
+            }
+            if (enriched.totalReps > 0 || (ex.isIsometric && enriched.durationSec >= 3)) {
+                app.userDb.insertSession(
+                    WorkoutSession(
+                        timestampMs = System.currentTimeMillis(),
+                        exerciseType = ex,
+                        reps = enriched.totalReps,
+                        durationSec = enriched.durationSec,
+                        avgFormScore = enriched.avgFormScore,
+                        avgRomPct = _uiState.value.frame.avgRomPct.coerceAtLeast(if (ex.isIsometric) 100 else 75),
+                        topFaults = _uiState.value.frame.topFaults,
+                        notes = "Défi · ${cfg.type.shortTitleFr} (${enriched.scoreLabel})",
+                        caloriesKcal = enriched.caloriesKcal
+                    )
+                )
+            }
+        }
+
+        _uiState.update {
+            it.copy(
+                activeChallenge = null,
+                isSessionActive = false,
+                completedChallengeResult = enriched
+            )
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rest Timer & Standard Multi-Set Flow
+    // -------------------------------------------------------------------------
 
     fun setRestDuration(seconds: Int) {
         val clamped = seconds.coerceIn(15, 300)
@@ -251,14 +636,15 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         var bankedKcalDelta = 0.0
         var currentSetKcal = state.currentSetCaloriesKcal
 
-        // 1. Real-time automatic exercise detection from 3D movement (paused during rest)
-        if (state.isAutoDetectEnabled && !state.isResting && screenPoints.size >= 29) {
+        val inChallenge = challengeController.isActive
+
+        // 1. Real-time automatic exercise detection from 3D movement (paused during rest or active challenge)
+        if (!inChallenge && state.isAutoDetectEnabled && !state.isResting && screenPoints.size >= 29) {
             val detect = autoDetector.processFrame(screenPoints, worldPoints, timestampMs)
             autoConf = detect.confidence
             autoStatus = detect.statusFr
             val detected = detect.detectedExercise
             if (detected != null && detected != engine.currentExercise) {
-                // Smoothly preserve prior exercise reps/hold/calories in session accumulators before switching
                 val prevFrame = state.frame
                 val prevEx = engine.currentExercise
                 bankActiveExerciseWork(prevEx, prevFrame, currentSetKcal)
@@ -297,8 +683,16 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // 4. Trigger French TTS voice coach on new rep or precision angle correction (muted during rest)
-        if (frame.poseDetected && !state.isResting) {
+        // 4. Advance active camera-verified Challenge OR trigger normal Voice Coach
+        if (inChallenge) {
+            val totalKcal = state.sessionTotalCaloriesKcal + bankedKcalDelta + currentSetKcal
+            val out = synchronized(challengeController) {
+                challengeController.onFrame(frame, System.currentTimeMillis(), totalKcal)
+            }
+            if (out != null) {
+                applyChallengeOutputEffects(out)
+            }
+        } else if (frame.poseDetected && !state.isResting) {
             if (!frame.exercise.isIsometric && frame.repCount > lastRepSpoken) {
                 lastRepSpoken = frame.repCount
                 voiceCoach.speak(frame.voiceCueFr ?: "${frame.repCount}", isRepCounter = true)
@@ -335,6 +729,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resetSession() {
         cancelRestTimer()
+        if (challengeController.isActive) {
+            stopChallengeSilently()
+        }
         engine.resetSession()
         if (_uiState.value.isAutoDetectEnabled) {
             autoDetector.reset(initialLocked = null)
@@ -356,17 +753,23 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 isResting = false,
                 restRemainingSec = 0,
                 completedSummary = null,
-                completedBreakdown = emptyList()
+                completedBreakdown = emptyList(),
+                activeChallenge = null,
+                completedChallengeResult = null
             )
         }
     }
 
     fun finishSession() {
+        if (challengeController.isActive) {
+            stopActiveChallenge()
+            return
+        }
         cancelRestTimer()
+        audioEngine.stopMusic()
         val state = _uiState.value
         val frame = state.frame
 
-        // Build snapshot breakdown including any unbanked work from the active set
         val breakdownSnapshot = LinkedHashMap(exerciseBreakdownMap)
         val curReps = if (state.selectedExercise.isIsometric) 0 else frame.repCount
         val curHold = if (state.selectedExercise.isIsometric) frame.isometricHoldSec.toInt() else 0
@@ -403,7 +806,6 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         val combinedFaults = (sessionFaults + frame.topFaults).distinct().take(3)
         val totalSetsDone = state.completedSetsCount + if (frame.repCount > 0 || frame.isometricHoldSec >= 3f) 1 else 0
 
-        // Primary exercise = highest volume / calories exercise if multi-exercise workout
         val primaryExercise = breakdownSnapshot.values
             .maxByOrNull { it.caloriesKcal + it.reps * 0.5 + it.holdSec * 0.2 }
             ?.exercise ?: state.selectedExercise
@@ -530,6 +932,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         super.onCleared()
         cancelRestTimer()
+        cancelChallengeTicker()
+        audioEngine.release()
         voiceCoach.shutdown()
     }
 }

@@ -14,7 +14,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
 
     companion object {
         private const val DB_NAME = "kinetix_user.db"
-        private const val DB_VERSION = 2
+        private const val DB_VERSION = 3
     }
 
     private val _sessions = MutableStateFlow<List<WorkoutSession>>(emptyList())
@@ -25,6 +25,9 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
 
     private val _profile = MutableStateFlow(AthleteProfile())
     val profile: StateFlow<AthleteProfile> = _profile.asStateFlow()
+
+    private val _challengeRecords = MutableStateFlow<List<ChallengeRecord>>(emptyList())
+    val challengeRecords: StateFlow<List<ChallengeRecord>> = _challengeRecords.asStateFlow()
 
     init {
         refreshAll()
@@ -84,11 +87,41 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
             )
             """.trimIndent()
         )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS challenge_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms INTEGER NOT NULL,
+                challenge_id TEXT NOT NULL,
+                exercise_id TEXT NOT NULL,
+                score_value REAL NOT NULL,
+                score_label TEXT NOT NULL,
+                duration_sec INTEGER NOT NULL,
+                calories_kcal REAL NOT NULL
+            )
+            """.trimIndent()
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) {
             db.execSQL("ALTER TABLE workout_sessions ADD COLUMN calories_kcal REAL NOT NULL DEFAULT 0.0")
+        }
+        if (oldVersion < 3) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS challenge_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ms INTEGER NOT NULL,
+                    challenge_id TEXT NOT NULL,
+                    exercise_id TEXT NOT NULL,
+                    score_value REAL NOT NULL,
+                    score_label TEXT NOT NULL,
+                    duration_sec INTEGER NOT NULL,
+                    calories_kcal REAL NOT NULL
+                )
+                """.trimIndent()
+            )
         }
     }
 
@@ -96,6 +129,7 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
         _sessions.value = loadSessions()
         _messages.value = loadMessages()
         _profile.value = loadProfile()
+        _challengeRecords.value = loadChallengeRecords()
     }
 
     fun insertSession(session: WorkoutSession): Long {
@@ -257,6 +291,82 @@ class UserDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, 
             }
         }
         return AthleteProfile()
+    }
+
+    fun insertChallengeRecord(record: ChallengeRecord): Long {
+        val cv = ContentValues().apply {
+            put("timestamp_ms", record.timestampMs)
+            put("challenge_id", record.challengeId)
+            put("exercise_id", record.exerciseId)
+            put("score_value", record.scoreValue)
+            put("score_label", record.scoreLabel)
+            put("duration_sec", record.durationSec)
+            put("calories_kcal", record.caloriesKcal)
+        }
+        val id = writableDatabase.insert("challenge_records", null, cv)
+        _challengeRecords.value = loadChallengeRecords()
+        return id
+    }
+
+    fun bestRecordFor(
+        challengeId: String,
+        exerciseId: String,
+        lowerIsBetter: Boolean = challengeId == "TARGET_REPS_RACE"
+    ): ChallengeRecord? {
+        val order = if (lowerIsBetter) "ASC" else "DESC"
+        readableDatabase.rawQuery(
+            """
+            SELECT id, timestamp_ms, challenge_id, exercise_id, score_value, score_label, duration_sec, calories_kcal
+            FROM challenge_records
+            WHERE challenge_id = ? AND exercise_id = ?
+            ORDER BY score_value $order, timestamp_ms DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(challengeId, exerciseId)
+        ).use { c ->
+            if (c.moveToFirst()) {
+                return ChallengeRecord(
+                    id = c.getLong(0),
+                    timestampMs = c.getLong(1),
+                    challengeId = c.getString(2),
+                    exerciseId = c.getString(3),
+                    scoreValue = c.getDouble(4),
+                    scoreLabel = c.getString(5),
+                    durationSec = c.getInt(6),
+                    caloriesKcal = c.getDouble(7)
+                )
+            }
+        }
+        return null
+    }
+
+    private fun loadChallengeRecords(): List<ChallengeRecord> {
+        val list = mutableListOf<ChallengeRecord>()
+        readableDatabase.rawQuery(
+            """
+            SELECT id, timestamp_ms, challenge_id, exercise_id, score_value, score_label, duration_sec, calories_kcal
+            FROM challenge_records
+            ORDER BY timestamp_ms DESC
+            LIMIT 150
+            """.trimIndent(),
+            null
+        ).use { c ->
+            while (c.moveToNext()) {
+                list.add(
+                    ChallengeRecord(
+                        id = c.getLong(0),
+                        timestampMs = c.getLong(1),
+                        challengeId = c.getString(2),
+                        exerciseId = c.getString(3),
+                        scoreValue = c.getDouble(4),
+                        scoreLabel = c.getString(5),
+                        durationSec = c.getInt(6),
+                        caloriesKcal = c.getDouble(7)
+                    )
+                )
+            }
+        }
+        return list
     }
 
     fun getPref(key: String, defaultValue: String): String {
