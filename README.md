@@ -4,16 +4,19 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 1. KINETIX Coach (`kinetix-coach/` — v2.2.0)
-**Vision Biomécanique 3D Pro 60 FPS + VBT Vitesse & Estimation Rep Max + Variantes sur 16 Exos + Coaching Anti-Spam + Coach IA Local**
+## 1. KINETIX Coach (`kinetix-coach/` — v2.2.1)
+**Vision Biomécanique 3D Pro 60 FPS + Protection Installation Zéro Fausse Rep + VBT Vitesse & Estimation Rep Max + Variantes sur 16 Exos + Coaching Anti-Spam + Coach IA Local**
 
 - **Package** : `com.kinetix.coach` (Android 10+ / `arm64-v8a`, 100 % hors-ligne, zéro requête réseau)
+- **Zéro Fausse Rep pendant l'Installation & le Repos (`BiomechanicsEngine`, `PoseSanityFilter`, `VisionViewModel`)** :
+  - **Chrono d'installation mains-libres (`0s / 5s / 8s / 10s`, défaut `5s`)** avec aperçu squelette 60 FPS live + boutons `+5s` / `Prêt !` : comptage, VBT, auto-détection et alertes totalement en pause pendant que vous posez le téléphone et pendant les temps de repos.
+  - **Verrou automatique position neutre (`requiresNeutralStart`) + stabilisation `450 ms` post-transition + contrôle poignets 2D X+Y** : même avec le chrono à `0s`, s'accroupir pour poser le téléphone puis se relever, ou descendre ajuster ses mains/pieds au sol pour les pompes ne compte plus jamais de fausse rep.
 - **Pompes Blindées & Audit Complet des 16 Exercices** (`BiomechanicsEngine`, `AutoExerciseDetector`, `PoseSanityFilter`, `PoseLandmarkerHelper`) :
   - Correction complète des pompes sous tous les angles (face posée au sol inclinée, 3/4, profil pur avec côté éloigné occlus, dos), suppression du blocage `adaptivePushupTopHeight` / `adaptiveDipTopHeight` (fenêtre glissante auto-calibrante + compression 3D bras + cross-check coudes 2D/3D + touch-and-go explosif + soft-lockout), `PoseSanityFilter` immunisé contre le raccourcissement en perspective, double-buffer zéro-GC `rowStride` Snapdragon + alignement CameraX 4:3, réveil rapide `Planche → Pompes` et **9 variantes pompes** (*Classique, Large, Serrée, Diamant, Genoux, Piquée, Archer, Inclinée, Déclinée*).
   - **Détection automatique de chaque variante sur les 16 exercices** (`ExerciseVariantDetector`) avec adaptation biomécanique réelle : *Sumo / Serré / ATG / Pistol / Sauté* (Squat, sans confusion Fentes), *Quadriceps / Fessiers* (Bulgare jambe avant au sol), *Conventionnel / Sumo / RDL / Unilatéral* (Soulevé de terre), *Strict / Alterné / Unilatéral / Push Press / Assis* (Développé militaire), *Triceps / Pectoraux / Banc* (Dips), *Haute / Avant-bras / Latérale / Genoux / 3 Appuis* (Planche), *Prise large / Serrée / Archer / L-Sit* (Tractions), *Pendlay / Yates / Unilatéral* (Rowing), *Unilatéral* (Pont fessier), *Suspendu / Alterné / Genoux fléchis* (Relevé de jambes), *Alterné / Oiseau / Frontale* (Élévations latérales).
 - **Coaching Postural Anti-Spam Pro (`PostureFeedbackCoach` + `VoiceCoach`)** : persistance temporelle avant affichage (`≥ 360 ms` faute / `≥ 560 ms` vigilance), maintien anti-clignotement (`950 ms`), **zéro harcèlement en cours de descente**, priorité visuelle unique, cooldowns vocaux stricts (`≥ 9,5 s` global, `≥ 20 s` & `≥ 2 reps` même défaut, max `3/min`, silence après annonce de rep).
 - **Système VBT — Vitesse d'Exécution Progressive & Estimation Rep Max (`VelocityEstimator`)** : mesure la vitesse concentrique moyenne et pic (`m/s`) par répétition (insensible aux pauses entre reps), calcule la perte de vitesse (`VL%`), la fraîcheur inter-séries, la zone de fatigue, le **RIR / RPE** et le **Rep Max estimé (`MAX ~X`)** avec sparkline live dans le HUD, bilan post-séance multi-séries, persistance SQLite v4 et débriefing Coach IA.
-- **Écosystème complet** : **7 Défis caméra** (*Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM*) + 4 musiques PCM + **import MP3 local**, calories personnalisées, **42 vidéos MP4 H.264**, **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5** (**60/60 tests unitaires**).
+- **Écosystème complet** : **7 Défis caméra** (*Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM*) + 4 musiques PCM + **import MP3 local**, calories personnalisées, **42 vidéos MP4 H.264**, **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5** (**61/61 tests unitaires**).
 
 ---
 

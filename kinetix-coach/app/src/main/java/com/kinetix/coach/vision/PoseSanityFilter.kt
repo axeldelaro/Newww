@@ -47,10 +47,10 @@ class PoseSanityFilter(
         // Best-side torso visibility (never penalizes occluded far side in profile or hips behind chest in front push-ups!)
         private const val CORE_VIS_MIN = 0.38f
         private const val COHERENT_WALK_SPEED_THRESHOLD = 0.42f
-        private const val SHOULDER_ZOOM_RATE_THRESHOLD = 1.35f
-        private const val LENS_FILL_SHOULDER_WIDTH = 0.84f
+        private const val SHOULDER_ZOOM_RATE_THRESHOLD = 0.85f
+        private const val LENS_FILL_SHOULDER_WIDTH = 0.72f
         private const val SUSTAINED_WALK_FRAMES = 3
-        private const val SUSTAINED_ZOOM_FRAMES = 4
+        private const val SUSTAINED_ZOOM_FRAMES = 5
         private const val STABILIZATION_COOLDOWN_MS = 480L
     }
 
