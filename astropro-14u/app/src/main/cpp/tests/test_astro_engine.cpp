@@ -1,6 +1,7 @@
 #include "../astro_types.h"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -460,6 +461,113 @@ void testTiff16AndFits32Export() {
     std::printf("[Test 7] TIFF 16-bit, FITS 32-bit (2880B aligned), and .astro32 round-trip: PASS\n");
 }
 
+// =========================================================================
+// Test 8: Real-Time Focus Peaking (Lunar Limb, Craters & Pinpoint Stars)
+// =========================================================================
+void testFocusPeakingPoints() {
+    const int w = 640, h = 480;
+    std::vector<uint8_t> flat(w * h, 14);
+    std::vector<uint8_t> sharp(w * h, 10);
+    std::vector<uint8_t> blurred(w * h, 10);
+
+    // Build sharp lunar disc + high-contrast crater rims + 5 bright pinpoint stars
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float dx = x - 320.0f;
+            const float dy = y - 240.0f;
+            const float r = std::hypot(dx, dy);
+            float v = 10.0f;
+            if (r <= 110.0f) {
+                v = 195.0f;
+                // Add sharp crater rims inside lunar disc
+                const float c1 = std::hypot(x - 285.0f, y - 215.0f);
+                const float c2 = std::hypot(x - 355.0f, y - 265.0f);
+                if (std::abs(c1 - 24.0f) < 3.5f) v = 250.0f;
+                else if (c1 < 20.5f) v = 65.0f;
+                if (std::abs(c2 - 18.0f) < 3.0f) v = 245.0f;
+                else if (c2 < 15.0f) v = 70.0f;
+            }
+            sharp[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
+        }
+    }
+    // Add crisp pinpoint stars far from the Moon
+    const int stars[4][2] = {{70, 80}, {560, 90}, {90, 400}, {550, 390}};
+    for (const auto& s : stars) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int val = (dx == 0 && dy == 0) ? 255 : 190;
+                sharp[static_cast<size_t>(s[1] + dy) * w + (s[0] + dx)] = static_cast<uint8_t>(val);
+            }
+        }
+    }
+
+    // Create heavily defocused version (17x17 box blur)
+    std::vector<float> tmpBlur(w * h, 0.0f);
+    constexpr int kRad = 12;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            int cnt = 0;
+            for (int dx = -kRad; dx <= kRad; ++dx) {
+                const int sx = std::clamp(x + dx, 0, w - 1);
+                acc += sharp[static_cast<size_t>(y) * w + sx];
+                cnt++;
+            }
+            tmpBlur[static_cast<size_t>(y) * w + x] = acc / static_cast<float>(cnt);
+        }
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            int cnt = 0;
+            for (int dy = -kRad; dy <= kRad; ++dy) {
+                const int sy = std::clamp(y + dy, 0, h - 1);
+                acc += tmpBlur[static_cast<size_t>(sy) * w + x];
+                cnt++;
+            }
+            blurred[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(std::clamp(acc / static_cast<float>(cnt), 0.0f, 255.0f));
+        }
+    }
+
+    constexpr int kMaxPts = 800;
+    std::vector<float> pts(kMaxPts * 2, 0.0f);
+
+    const int flatCount = computeFocusPeakingPoints(flat.data(), w, 1, w, h, 0.14f, kMaxPts, pts.data());
+    assert(flatCount == 0);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int sharpCount = computeFocusPeakingPoints(sharp.data(), w, 1, w, h, 0.14f, kMaxPts, pts.data());
+    const auto t1 = std::chrono::steady_clock::now();
+    const double elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    for (int i = 0; i < sharpCount; ++i) {
+        const float nx = pts[i * 2 + 0];
+        const float ny = pts[i * 2 + 1];
+        assert(nx >= 0.0f && nx <= 1.0f);
+        assert(ny >= 0.0f && ny <= 1.0f);
+    }
+
+    // Verify at least one star corner was picked up by peaking
+    bool foundCornerStar = false;
+    for (int i = 0; i < sharpCount; ++i) {
+        if (pts[i * 2 + 0] < 0.20f && pts[i * 2 + 1] < 0.25f) {
+            foundCornerStar = true;
+            break;
+        }
+    }
+
+    std::vector<float> blurPts(kMaxPts * 2, 0.0f);
+    const int blurCount = computeFocusPeakingPoints(blurred.data(), w, 1, w, h, 0.14f, kMaxPts, blurPts.data());
+
+    std::printf("[Test 8] Focus Peaking: flat=%d sharp=%d blurred=%d starDetected=%d time=%.3f ms\n",
+                flatCount, sharpCount, blurCount, foundCornerStar ? 1 : 0, elapsedMs);
+
+    assert(sharpCount > 60);
+    assert(foundCornerStar);
+    assert(sharpCount > blurCount * 2);
+    assert(elapsedMs < 1.5);
+}
+
 } // namespace
 
 int main() {
@@ -471,6 +579,7 @@ int main() {
     testQuadraticGradientExtraction();
     testWaveletSharpening();
     testTiff16AndFits32Export();
-    std::printf("=== ALL 7 C++20 ASTRO ENGINE TESTS PASSED ===\n");
+    testFocusPeakingPoints();
+    std::printf("=== ALL 8 C++20 ASTRO ENGINE TESTS PASSED ===\n");
     return 0;
 }

@@ -25,14 +25,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Cameraswitch
+import androidx.compose.material.icons.automirrored.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.RemoveRedEye
 import androidx.compose.material.icons.outlined.Timer
-import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.ZoomIn
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -63,9 +62,11 @@ import com.astropro.xiaomi14u.camera.ModeOptions
 import com.astropro.xiaomi14u.camera.NpfCalculator
 import com.astropro.xiaomi14u.camera.ProDialType
 import com.astropro.xiaomi14u.camera.StarTrailStyle
+import com.astropro.xiaomi14u.ui.components.FocusPeakingOverlay
 import com.astropro.xiaomi14u.ui.components.GridAndBubbleLevelOverlay
 import com.astropro.xiaomi14u.ui.components.LiveCaptureHudOverlay
 import com.astropro.xiaomi14u.ui.components.LiveRgbHistogram
+import com.astropro.xiaomi14u.ui.components.ModeGuideSheet
 import com.astropro.xiaomi14u.ui.components.StarFocusLoupeOverlay
 import com.astropro.xiaomi14u.ui.components.XiaomiLensSelectorPill
 import com.astropro.xiaomi14u.ui.components.XiaomiProShutterButton
@@ -79,8 +80,8 @@ import kotlin.math.abs
 /**
  * Main Camera Viewfinder faithfully modeled after Xiaomi HyperOS Leica Camera Pro:
  *   1. 48dp Pure OLED Black Top Icon Bar
- *   2. 4:3 Viewfinder (telemetry, live RGB histogram, 2-axis bubble level, 10x FWHM focus loupe, floating lens pill)
- *   3. Mode-specific compact options pill
+ *   2. 4:3 Viewfinder (telemetry, live RGB histogram, 2-axis bubble level, focus peaking, 10x FWHM focus loupe, floating lens pill)
+ *   3. Mode-specific compact options strip + 1-tap Mode Guide button
  *   4. Slide-up Xiaomi Horizontal Precision Tick-Wheel Dial
  *   5. 6 Pro Manual Tiles (WB · F · S · ISO · f/ · EV)
  *   6. Bottom Shutter Deck (Mode strip with gold underline + [Labo Thumb] [Shutter] [Éphémérides])
@@ -97,7 +98,11 @@ fun CameraScreen(
     onSnapNpf: () -> Unit,
     onToggleGridLevel: () -> Unit,
     onToggleHistogram: () -> Unit,
+    onToggleFocusPeaking: () -> Unit,
     onToggleTopMenu: () -> Unit,
+    onOpenModeGuide: () -> Unit,
+    onDismissModeGuide: () -> Unit,
+    onApplyModeGuidePreset: (CaptureMode) -> Unit,
     onToggleDimDuringStack: () -> Unit,
     onToggleFrontRear: () -> Unit,
     onSelectLens: (LensInfo) -> Unit,
@@ -293,6 +298,16 @@ fun CameraScreen(
                         GridAndBubbleLevelOverlay(orientation = orientation)
                     }
 
+                    // Real-Time Focus Peaking Overlay (Lunar craters, horizon, pinpoint stars)
+                    if (state.focusPeakingEnabled && !state.captureProgress.active && state.focusPeaking.pointCount > 0) {
+                        FocusPeakingOverlay(
+                            pointsXY = state.focusPeaking.pointsXY,
+                            pointCount = state.focusPeaking.pointCount,
+                            sensorOrientation = lens?.sensorOrientation ?: 90,
+                            isFront = state.usingFront
+                        )
+                    }
+
                     // Top-Left Xiaomi Telemetry Line
                     if (lens != null) {
                         val npfLim = lens.npfSeconds(manual.aperture)
@@ -409,14 +424,17 @@ fun CameraScreen(
             }
 
             // =================================================================
-            // 3. MODE-SPECIFIC COMPACT OPTIONS PILL (clean Xiaomi styling)
+            // 3. MODE-SPECIFIC COMPACT OPTIONS STRIP + 1-TAP GUIDE BUTTON
             // =================================================================
-            if (state.captureMode != CaptureMode.ASTRO_PRO && state.activeDial == null) {
+            if (state.activeDial == null) {
                 ModeOptionsBar(
                     mode = state.captureMode,
                     options = state.modeOptions,
                     hasDark = state.activeDarkId != null,
                     hasFlat = state.activeFlatId != null,
+                    focusPeakingEnabled = state.focusPeakingEnabled,
+                    onToggleFocusPeaking = onToggleFocusPeaking,
+                    onOpenGuide = onOpenModeGuide,
                     onUpdate = onUpdateModeOptions
                 )
             }
@@ -430,6 +448,8 @@ fun CameraScreen(
                     dialType = openDial,
                     lens = lens,
                     manual = manual,
+                    focusPeakingEnabled = state.focusPeakingEnabled,
+                    onToggleFocusPeaking = onToggleFocusPeaking,
                     onUpdateManual = onUpdateManual,
                     onSnapNpf = onSnapNpf,
                     onDismiss = onDismissDial
@@ -584,13 +604,17 @@ fun CameraScreen(
                         }
                     }
 
-                    // Center: Iconic Xiaomi Pro Shutter Button
-                    val progFrac = if (state.captureProgress.active && state.captureProgress.framesTarget > 1) {
-                        state.captureProgress.framesCaptured.toFloat() / state.captureProgress.framesTarget.toFloat()
-                    } else 0f
+                    // Center: Iconic Xiaomi Pro Shutter Button (with live long-exposure countdown ring & seconds badge)
+                    val progFrac = when {
+                        !state.captureProgress.active -> 0f
+                        state.captureProgress.framesTarget > 1 ->
+                            state.captureProgress.framesCaptured.toFloat() / state.captureProgress.framesTarget.toFloat()
+                        else -> state.captureProgress.exposureProgress
+                    }
                     XiaomiProShutterButton(
                         isCapturing = state.captureProgress.active,
                         progressFraction = progFrac,
+                        countdownSeconds = state.captureProgress.remainingExposureSec,
                         onClick = onShutterPressed
                     )
 
@@ -624,7 +648,7 @@ fun CameraScreen(
                     .align(Alignment.TopCenter)
                     .padding(top = 48.dp)
                     .fillMaxWidth()
-                    .background(Color(0xEE0D0D0D))
+                    .background(if (colors.isNightVision) Color(0xF00D0202) else Color(0xEE0D0D0D))
                     .border(0.75.dp, colors.borderSubtle)
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -633,6 +657,44 @@ fun CameraScreen(
                     text = "ASTROPRO 14U · OUTILS & PARAMÈTRES",
                     style = tabularStyle(size = 10.5.sp, weight = FontWeight.SemiBold, color = colors.accent)
                 )
+
+                // Dedicated 1-tap Mode Guide & Sample Photos entry
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(colors.surface)
+                        .border(0.75.dp, colors.accent.copy(alpha = 0.65f), RoundedCornerShape(5.dp))
+                        .clickable { onOpenModeGuide() }
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Outlined.HelpOutline,
+                            contentDescription = "Guide des modes",
+                            tint = colors.accent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Guide & Exemples par mode",
+                                style = tabularStyle(size = 11.5.sp, weight = FontWeight.SemiBold, color = colors.textPrimary)
+                            )
+                            Text(
+                                text = "6 modes · Photos de référence & réglages 1-tap Xiaomi 14U",
+                                style = tabularStyle(size = 9.5.sp, color = colors.textSecondary)
+                            )
+                        }
+                    }
+                    Text(
+                        text = "OUVRIR",
+                        style = tabularStyle(size = 10.sp, weight = FontWeight.Bold, color = colors.accent)
+                    )
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -664,13 +726,19 @@ fun CameraScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     MenuToggleChip(
-                        label = "Histogramme RGB",
+                        label = "PEAK",
+                        active = state.focusPeakingEnabled,
+                        onClick = onToggleFocusPeaking,
+                        modifier = Modifier.weight(0.75f)
+                    )
+                    MenuToggleChip(
+                        label = "Histogramme",
                         active = state.showHistogram,
                         onClick = onToggleHistogram,
                         modifier = Modifier.weight(1f)
                     )
                     MenuToggleChip(
-                        label = "Écran tamisé stack",
+                        label = "Écran tamisé",
                         active = state.dimScreenDuringStack,
                         onClick = onToggleDimDuringStack,
                         modifier = Modifier.weight(1f)
@@ -707,6 +775,17 @@ fun CameraScreen(
                 )
             }
         }
+
+        // =================================================================
+        // XIAOMI HYPEROS MODE GUIDE & SAMPLE PHOTOS SHEET
+        // =================================================================
+        if (state.showModeGuide) {
+            ModeGuideSheet(
+                initialMode = state.captureMode,
+                onApplyModePreset = onApplyModeGuidePreset,
+                onDismiss = onDismissModeGuide
+            )
+        }
     }
 }
 
@@ -715,6 +794,8 @@ private fun ActiveProDialSection(
     dialType: ProDialType,
     lens: LensInfo,
     manual: ManualSettings,
+    focusPeakingEnabled: Boolean,
+    onToggleFocusPeaking: () -> Unit,
     onUpdateManual: ((ManualSettings) -> ManualSettings) -> Unit,
     onSnapNpf: () -> Unit,
     onDismiss: () -> Unit
@@ -762,6 +843,9 @@ private fun ActiveProDialSection(
                 onQuickAction = { onUpdateManual { it.copy(focusAuto = !it.focusAuto) } },
                 secondaryActionLabel = "∞",
                 onSecondaryAction = { onUpdateManual { it.copy(focusAuto = false, focusDistance = 0.0f) } },
+                tertiaryActionLabel = "PEAK",
+                tertiaryActionActive = focusPeakingEnabled,
+                onTertiaryAction = onToggleFocusPeaking,
                 onDismiss = onDismiss
             )
         }
@@ -850,6 +934,9 @@ private fun ModeOptionsBar(
     options: ModeOptions,
     hasDark: Boolean,
     hasFlat: Boolean,
+    focusPeakingEnabled: Boolean,
+    onToggleFocusPeaking: () -> Unit,
+    onOpenGuide: () -> Unit,
     onUpdate: ((ModeOptions) -> ModeOptions) -> Unit
 ) {
     val colors = LocalAstroColors.current
@@ -857,105 +944,147 @@ private fun ModeOptionsBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(colors.background)
-            .horizontalScroll(rememberScrollState())
             .padding(horizontal = 10.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        when (mode) {
-            CaptureMode.DEEP_SKY -> {
-                val counts = listOf(10, 20, 40, 60, 120)
-                val nextCount = counts[(counts.indexOf(options.deepSkyFrames) + 1) % counts.size]
-                ModeOptionChip("Poses: ${options.deepSkyFrames}", true) {
-                    onUpdate { it.copy(deepSkyFrames = nextCount) }
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            when (mode) {
+                CaptureMode.ASTRO_PRO -> {
+                    ModeOptionChip(
+                        label = "PEAK ${if (focusPeakingEnabled) "ON" else "OFF"}",
+                        highlighted = focusPeakingEnabled,
+                        onClick = onToggleFocusPeaking
+                    )
+                    Text(
+                        text = "Pose unique RAW 16-bit linéaire · DNG + .astro32",
+                        style = tabularStyle(size = 10.sp, color = colors.textSecondary),
+                        maxLines = 1
+                    )
                 }
-                ModeOptionChip(
-                    "Dark ${if (hasDark && options.useAutoDark) "✓" else "OFF"}",
-                    hasDark && options.useAutoDark
-                ) { onUpdate { it.copy(useAutoDark = !it.useAutoDark) } }
-                ModeOptionChip(
-                    "Flat ${if (hasFlat && options.useAutoFlat) "✓" else "OFF"}",
-                    hasFlat && options.useAutoFlat
-                ) { onUpdate { it.copy(useAutoFlat = !it.useAutoFlat) } }
-                val sigmas = listOf(2.0f, 2.5f, 3.0f)
-                val nextSig = sigmas[(sigmas.indexOfFirst { abs(it - options.deepSkySigmaKappa) < 0.1f } + 1) % sigmas.size]
-                ModeOptionChip(String.format(Locale.US, "Sigma %.1fσ", options.deepSkySigmaKappa), true) {
-                    onUpdate { it.copy(deepSkySigmaKappa = nextSig) }
-                }
-            }
 
-            CaptureMode.LUNAR_PLANETARY -> {
-                val bursts = listOf(30, 60, 100)
-                val nextBurst = bursts[(bursts.indexOf(options.planetaryFrames) + 1) % bursts.size]
-                ModeOptionChip("Rafale: ${options.planetaryFrames}", true) {
-                    onUpdate { it.copy(planetaryFrames = nextBurst) }
-                }
-                val pcts = listOf(0.15f, 0.25f, 0.40f)
-                val nextPct = pcts[(pcts.indexOfFirst { abs(it - options.planetaryKeepPercent) < 0.02f } + 1) % pcts.size]
-                ModeOptionChip("Top Netteté: ${(options.planetaryKeepPercent * 100).toInt()}%", true) {
-                    onUpdate { it.copy(planetaryKeepPercent = nextPct) }
-                }
-                ModeOptionChip(
-                    "Ondelettes Auto: ${if (options.planetaryAutoWavelets) "ON" else "OFF"}",
-                    options.planetaryAutoWavelets
-                ) { onUpdate { it.copy(planetaryAutoWavelets = !it.planetaryAutoWavelets) } }
-            }
-
-            CaptureMode.STAR_TRAILS -> {
-                ModeOptionChip("Mode: ${options.starTrailStyle.label}", true) {
-                    val next = if (options.starTrailStyle == StarTrailStyle.STANDARD) StarTrailStyle.COMET else StarTrailStyle.STANDARD
-                    onUpdate { it.copy(starTrailStyle = next) }
-                }
-                if (options.starTrailStyle == StarTrailStyle.COMET) {
-                    val lengths = CometTailLength.entries
-                    val nextLen = lengths[(lengths.indexOf(options.cometTailLength) + 1) % lengths.size]
-                    ModeOptionChip("Traînée: ${options.cometTailLength.label}", true) {
-                        onUpdate { it.copy(cometTailLength = nextLen) }
+                CaptureMode.DEEP_SKY -> {
+                    val counts = listOf(10, 20, 40, 60, 120)
+                    val nextCount = counts[(counts.indexOf(options.deepSkyFrames) + 1) % counts.size]
+                    ModeOptionChip("Poses: ${options.deepSkyFrames}", true) {
+                        onUpdate { it.copy(deepSkyFrames = nextCount) }
+                    }
+                    ModeOptionChip(
+                        "Dark ${if (hasDark && options.useAutoDark) "✓" else "OFF"}",
+                        hasDark && options.useAutoDark
+                    ) { onUpdate { it.copy(useAutoDark = !it.useAutoDark) } }
+                    ModeOptionChip(
+                        "Flat ${if (hasFlat && options.useAutoFlat) "✓" else "OFF"}",
+                        hasFlat && options.useAutoFlat
+                    ) { onUpdate { it.copy(useAutoFlat = !it.useAutoFlat) } }
+                    val sigmas = listOf(2.0f, 2.5f, 3.0f)
+                    val nextSig = sigmas[(sigmas.indexOfFirst { abs(it - options.deepSkySigmaKappa) < 0.1f } + 1) % sigmas.size]
+                    ModeOptionChip(String.format(Locale.US, "Sigma %.1fσ", options.deepSkySigmaKappa), true) {
+                        onUpdate { it.copy(deepSkySigmaKappa = nextSig) }
                     }
                 }
-            }
 
-            CaptureMode.TIMELAPSE -> {
-                val ivals = listOf(2, 5, 10, 30)
-                val nextIv = ivals[(ivals.indexOf(options.timelapseIntervalSec) + 1) % ivals.size]
-                ModeOptionChip("Intervalle: ${options.timelapseIntervalSec}s", true) {
-                    onUpdate { it.copy(timelapseIntervalSec = nextIv) }
+                CaptureMode.LUNAR_PLANETARY -> {
+                    val bursts = listOf(30, 60, 100)
+                    val nextBurst = bursts[(bursts.indexOf(options.planetaryFrames) + 1) % bursts.size]
+                    ModeOptionChip("Rafale: ${options.planetaryFrames}", true) {
+                        onUpdate { it.copy(planetaryFrames = nextBurst) }
+                    }
+                    val pcts = listOf(0.15f, 0.20f, 0.25f, 0.40f)
+                    val curIdx = pcts.indexOfFirst { abs(it - options.planetaryKeepPercent) < 0.02f }
+                    val nextPct = pcts[(curIdx + 1) % pcts.size]
+                    ModeOptionChip("Top Netteté: ${(options.planetaryKeepPercent * 100).toInt()}%", true) {
+                        onUpdate { it.copy(planetaryKeepPercent = nextPct) }
+                    }
+                    ModeOptionChip(
+                        "Ondelettes Auto: ${if (options.planetaryAutoWavelets) "ON" else "OFF"}",
+                        options.planetaryAutoWavelets
+                    ) { onUpdate { it.copy(planetaryAutoWavelets = !it.planetaryAutoWavelets) } }
                 }
-                val cnts = listOf(60, 120, 300, 0)
-                val nextCnt = cnts[(cnts.indexOf(options.timelapseCount) + 1) % cnts.size]
-                ModeOptionChip("Vues: ${if (options.timelapseCount == 0) "∞" else options.timelapseCount}", true) {
-                    onUpdate { it.copy(timelapseCount = nextCnt) }
+
+                CaptureMode.STAR_TRAILS -> {
+                    ModeOptionChip("Mode: ${options.starTrailStyle.label}", true) {
+                        val next = if (options.starTrailStyle == StarTrailStyle.STANDARD) StarTrailStyle.COMET else StarTrailStyle.STANDARD
+                        onUpdate { it.copy(starTrailStyle = next) }
+                    }
+                    if (options.starTrailStyle == StarTrailStyle.COMET) {
+                        val lengths = CometTailLength.entries
+                        val nextLen = lengths[(lengths.indexOf(options.cometTailLength) + 1) % lengths.size]
+                        ModeOptionChip("Traînée: ${options.cometTailLength.label}", true) {
+                            onUpdate { it.copy(cometTailLength = nextLen) }
+                        }
+                    }
                 }
-                ModeOptionChip("${options.timelapseFps} fps", true) {
-                    onUpdate { it.copy(timelapseFps = if (it.timelapseFps == 24) 30 else 24) }
+
+                CaptureMode.TIMELAPSE -> {
+                    val ivals = listOf(2, 5, 10, 30)
+                    val nextIv = ivals[(ivals.indexOf(options.timelapseIntervalSec) + 1) % ivals.size]
+                    ModeOptionChip("Intervalle: ${options.timelapseIntervalSec}s", true) {
+                        onUpdate { it.copy(timelapseIntervalSec = nextIv) }
+                    }
+                    val cnts = listOf(60, 120, 180, 300, 0)
+                    val nextCnt = cnts[(cnts.indexOf(options.timelapseCount) + 1) % cnts.size]
+                    ModeOptionChip("Vues: ${if (options.timelapseCount == 0) "∞" else options.timelapseCount}", true) {
+                        onUpdate { it.copy(timelapseCount = nextCnt) }
+                    }
+                    ModeOptionChip("${options.timelapseFps} fps", true) {
+                        onUpdate { it.copy(timelapseFps = if (it.timelapseFps == 24) 30 else 24) }
+                    }
+                    ModeOptionChip("Archive RAW: ${if (options.timelapseArchiveRaw) "ON" else "OFF"}", options.timelapseArchiveRaw) {
+                        onUpdate { it.copy(timelapseArchiveRaw = !it.timelapseArchiveRaw) }
+                    }
                 }
-                ModeOptionChip("Archive RAW: ${if (options.timelapseArchiveRaw) "ON" else "OFF"}", options.timelapseArchiveRaw) {
-                    onUpdate { it.copy(timelapseArchiveRaw = !it.timelapseArchiveRaw) }
+
+                CaptureMode.CALIBRATION -> {
+                    val kinds = CalibrationKind.entries
+                    val nextKind = kinds[(kinds.indexOf(options.calibrationKind) + 1) % kinds.size]
+                    ModeOptionChip("Type: ${options.calibrationKind.label}", true) {
+                        onUpdate { it.copy(calibrationKind = nextKind) }
+                    }
+                    val counts = listOf(10, 15, 20)
+                    val nextC = counts[(counts.indexOf(options.calibrationFrames) + 1) % counts.size]
+                    ModeOptionChip("Poses: ${options.calibrationFrames}", true) {
+                        onUpdate { it.copy(calibrationFrames = nextC) }
+                    }
+                    Text(
+                        text = when (options.calibrationKind) {
+                            CalibrationKind.DARK -> "Couvrir l'objectif (même ISO/pose)"
+                            CalibrationKind.FLAT -> "Pointer une surface blanche uniforme"
+                            CalibrationKind.BIAS -> "Couvrir l'objectif (pose minimale)"
+                        },
+                        style = tabularStyle(size = 10.sp, color = colors.textSecondary)
+                    )
                 }
             }
+        }
 
-            CaptureMode.CALIBRATION -> {
-                val kinds = CalibrationKind.entries
-                val nextKind = kinds[(kinds.indexOf(options.calibrationKind) + 1) % kinds.size]
-                ModeOptionChip("Type: ${options.calibrationKind.label}", true) {
-                    onUpdate { it.copy(calibrationKind = nextKind) }
-                }
-                val counts = listOf(10, 15, 20)
-                val nextC = counts[(counts.indexOf(options.calibrationFrames) + 1) % counts.size]
-                ModeOptionChip("Poses: ${options.calibrationFrames}", true) {
-                    onUpdate { it.copy(calibrationFrames = nextC) }
-                }
-                Text(
-                    text = when (options.calibrationKind) {
-                        CalibrationKind.DARK -> "Couvrir l'objectif (même ISO/pose)"
-                        CalibrationKind.FLAT -> "Pointer une surface blanche uniforme"
-                        CalibrationKind.BIAS -> "Couvrir l'objectif (pose minimale)"
-                    },
-                    style = tabularStyle(size = 10.sp, color = colors.textSecondary)
-                )
-            }
-
-            CaptureMode.ASTRO_PRO -> Unit
+        // Always-accessible 1-tap `? Guide` button pinned to the right of the Mode Options strip
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(colors.surface)
+                .border(0.75.dp, colors.accent.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+                .clickable(onClick = onOpenGuide)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.HelpOutline,
+                contentDescription = "Guide du mode",
+                tint = colors.accent,
+                modifier = Modifier.size(13.dp)
+            )
+            Text(
+                text = "Guide",
+                style = tabularStyle(size = 10.5.sp, weight = FontWeight.SemiBold, color = colors.accent)
+            )
         }
     }
 }

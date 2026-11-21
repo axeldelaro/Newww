@@ -260,9 +260,9 @@ class AstroCameraController(
             }
 
             // Still capture readers: RAW_SENSOR (when supported & not zoom-fallback) + YUV_420_888
-            val rawDim = lens.rawSize
-            val useRawStream = lens.supportsRaw && rawDim != null && !isZoomFallback
-            if (useRawStream && rawDim != null) {
+            val rawDim = lens.rawSize?.takeIf { lens.supportsRaw && !isZoomFallback }
+            val useRawStream = rawDim != null
+            if (rawDim != null) {
                 stillRawReader = ImageReader.newInstance(
                     rawDim.width, rawDim.height, ImageFormat.RAW_SENSOR, 2
                 ).apply {

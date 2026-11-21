@@ -411,12 +411,14 @@ void processAstroLab(
         }
         float mad = 0.002f;
         const float med = computeChannelMedianAndMad(luma, mad);
-        bp = std::clamp(med - 2.8f * mad, 0.0f, 0.9f);
+        const float darkBias = std::clamp(params.blackPoint, 0.0f, 0.25f);
+        const float sigmaMul = std::max(0.8f, 2.8f - darkBias * 16.0f);
+        bp = std::clamp(med - sigmaMul * mad, 0.0f, 0.9f);
         wp = 1.0f;
         const float normMed = std::clamp((med - bp) / std::max(0.01f, wp - bp), 0.0005f, 0.99f);
-        constexpr float kTargetBg = 0.18f;
-        // Exact PixInsight STF midtone balance: solve MTF(m, normMed) == kTargetBg
-        mid = std::clamp(mtf(kTargetBg, normMed), 0.002f, 0.995f);
+        const float targetBg = std::clamp(0.18f - darkBias * 0.65f, 0.09f, 0.18f);
+        // Exact PixInsight STF midtone balance: solve MTF(m, normMed) == targetBg
+        mid = std::clamp(mtf(targetBg, normMed), 0.002f, 0.995f);
     }
 
     const float invSpan = 1.0f / std::max(1e-4f, wp - bp);

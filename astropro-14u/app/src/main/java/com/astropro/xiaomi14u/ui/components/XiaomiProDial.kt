@@ -57,6 +57,9 @@ fun XiaomiProTickDial(
     onQuickAction: (() -> Unit)? = null,
     secondaryActionLabel: String? = null,
     onSecondaryAction: (() -> Unit)? = null,
+    tertiaryActionLabel: String? = null,
+    tertiaryActionActive: Boolean = false,
+    onTertiaryAction: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -84,7 +87,7 @@ fun XiaomiProTickDial(
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 if (quickActionLabel != null && onQuickAction != null) {
                     DialQuickPill(
@@ -103,6 +106,16 @@ fun XiaomiProTickDial(
                         onClick = {
                             view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                             onSecondaryAction()
+                        }
+                    )
+                }
+                if (tertiaryActionLabel != null && onTertiaryAction != null) {
+                    DialQuickPill(
+                        label = tertiaryActionLabel,
+                        active = tertiaryActionActive,
+                        onClick = {
+                            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            onTertiaryAction()
                         }
                     )
                 }

@@ -26,7 +26,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.Compare
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material.icons.outlined.Share
@@ -57,6 +56,7 @@ import androidx.compose.ui.unit.sp
 import com.astropro.xiaomi14u.camera.AstroSessionItem
 import com.astropro.xiaomi14u.camera.HistogramData
 import com.astropro.xiaomi14u.nativeengine.LabParameters
+import com.astropro.xiaomi14u.nativeengine.LabPreset
 import com.astropro.xiaomi14u.ui.components.LiveRgbHistogram
 import com.astropro.xiaomi14u.ui.components.nightVisionColorFilter
 import com.astropro.xiaomi14u.ui.theme.LocalAstroColors
@@ -67,7 +67,7 @@ import java.util.Locale
 /**
  * Real-Time 16-Bit Astro Development Lab & Session Gallery.
  *
- * Non-destructive float32 pipeline: Auto-STF (PixInsight MTF), Lupton Arcsinh,
+ * Non-destructive float32 pipeline: 1-Tap Astro Presets, Auto-STF (PixInsight MTF), Lupton Arcsinh,
  * 2D Quadratic Polynomial Background Gradient Removal, Background Neutralization,
  * SCNR Anti-Green, 3-Scale À Trous Wavelets, Bilateral Denoise, and 1-tap TIFF 16b / FITS 32b / JPEG HD export.
  */
@@ -78,11 +78,13 @@ fun AstroLabScreen(
     previewBitmap: Bitmap?,
     histogram: HistogramData,
     params: LabParameters,
+    activePreset: LabPreset?,
     showOriginal: Boolean,
     isBusy: Boolean,
     statusBanner: String?,
     onSelectSession: (AstroSessionItem) -> Unit,
     onDeleteSession: (AstroSessionItem) -> Unit,
+    onApplyPreset: (LabPreset) -> Unit,
     onUpdateParams: ((LabParameters) -> LabParameters) -> Unit,
     onToggleOriginal: (Boolean) -> Unit,
     onExportTiff16: (Boolean) -> Unit,
@@ -325,9 +327,69 @@ fun AstroLabScreen(
             }
         }
 
-        // Tool tabs
+        // 1-Tap Astro Development Presets + Tool tabs
         if (activeSession != null) {
             HorizontalDivider(color = colors.borderSubtle, thickness = 0.75.dp)
+
+            // Single-row horizontal preset strip: Auto-STF · Voie Lactée · Nébuleuse · Lune Ciselée · Ciel Urbain · Réinitialiser
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(colors.background)
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                LabPreset.entries.forEach { preset ->
+                    val selected = activePreset == preset
+                    val isReset = preset == LabPreset.RESET
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(
+                                when {
+                                    selected -> colors.accent.copy(alpha = 0.16f)
+                                    else -> colors.surface
+                                }
+                            )
+                            .border(
+                                width = 0.75.dp,
+                                color = when {
+                                    selected -> colors.accent
+                                    isReset -> colors.borderSubtle
+                                    else -> colors.borderSubtle
+                                },
+                                shape = RoundedCornerShape(4.dp)
+                            )
+                            .clickable {
+                                if (isReset) {
+                                    zoom = 1f
+                                    pan = Offset.Zero
+                                }
+                                onApplyPreset(preset)
+                            }
+                            .padding(horizontal = 9.dp, vertical = 5.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = preset.label,
+                            style = tabularStyle(
+                                size = 10.sp,
+                                weight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                color = when {
+                                    selected -> colors.accent
+                                    isReset -> colors.textSecondary
+                                    else -> colors.textPrimary
+                                }
+                            )
+                        )
+                    }
+                }
+            }
+
+            HorizontalDivider(color = colors.borderSubtle, thickness = 0.5.dp)
+
             val tabs = listOf("AUTO-STF", "ÉTIREMENT", "CIEL & COULEUR", "DÉTAILS")
             Row(
                 modifier = Modifier
@@ -367,7 +429,7 @@ fun AstroLabScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(176.dp)
+                    .height(172.dp)
                     .background(colors.surface)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 14.dp, vertical = 8.dp),
@@ -410,7 +472,7 @@ fun AstroLabScreen(
                         LabSliderRow(
                             label = "Lupton Arcsinh β (Couleurs Étoiles)",
                             value = params.asinhBeta,
-                            range = 0f..80f,
+                            range = 0f..140f,
                             fmt = { String.format(Locale.US, "%.0f", it) }
                         ) { v -> onUpdateParams { it.copy(asinhBeta = v) } }
                         LabSliderRow(

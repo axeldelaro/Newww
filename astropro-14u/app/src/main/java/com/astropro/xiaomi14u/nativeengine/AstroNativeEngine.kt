@@ -61,6 +61,101 @@ data class LabParameters(
     )
 }
 
+enum class LabPreset(val label: String, val params: LabParameters) {
+    AUTO_STF(
+        label = "Auto-STF",
+        params = LabParameters(
+            autoStf = true,
+            bgNeutralize = true
+        )
+    ),
+    MILKY_WAY(
+        label = "Voie Lactée",
+        params = LabParameters(
+            autoStf = true,
+            asinhBeta = 65f,
+            bgRemovalStrength = 0.45f,
+            bgNeutralize = true,
+            scnrStrength = 0.25f,
+            waveletFine = 0.15f,
+            denoiseStrength = 0.20f,
+            saturation = 1.25f,
+            temperature = 0.08f,
+            tint = 0.0f
+        )
+    ),
+    NEBULA(
+        label = "Nébuleuse",
+        params = LabParameters(
+            autoStf = true,
+            asinhBeta = 110f,
+            bgRemovalStrength = 0.60f,
+            bgNeutralize = true,
+            scnrStrength = 0.75f,
+            waveletMedium = 0.25f,
+            denoiseStrength = 0.30f,
+            saturation = 1.35f,
+            temperature = 0.0f,
+            tint = 0.05f
+        )
+    ),
+    CRISP_MOON(
+        label = "Lune Ciselée",
+        params = LabParameters(
+            autoStf = false,
+            blackPoint = 0.04f,
+            midtones = 0.44f,
+            whitePoint = 0.96f,
+            asinhBeta = 0f,
+            bgRemovalStrength = 0f,
+            bgNeutralize = false,
+            scnrStrength = 0f,
+            waveletFine = 0.65f,
+            waveletMedium = 0.40f,
+            waveletCoarse = 0.10f,
+            denoiseStrength = 0.08f,
+            saturation = 1.05f,
+            temperature = 0f,
+            tint = 0f
+        )
+    ),
+    URBAN_SKY(
+        label = "Ciel Urbain",
+        params = LabParameters(
+            autoStf = true,
+            blackPoint = 0.08f,
+            asinhBeta = 45f,
+            bgRemovalStrength = 0.92f,
+            bgNeutralize = true,
+            scnrStrength = 0.85f,
+            denoiseStrength = 0.28f,
+            saturation = 1.15f,
+            temperature = -0.05f,
+            tint = 0f
+        )
+    ),
+    RESET(
+        label = "Réinitialiser",
+        params = LabParameters(
+            autoStf = false,
+            blackPoint = 0f,
+            midtones = 0.5f,
+            whitePoint = 1.0f,
+            asinhBeta = 0f,
+            bgRemovalStrength = 0f,
+            bgNeutralize = false,
+            scnrStrength = 0f,
+            waveletFine = 0f,
+            waveletMedium = 0f,
+            waveletCoarse = 0f,
+            denoiseStrength = 0f,
+            saturation = 1.0f,
+            temperature = 0f,
+            tint = 0f
+        )
+    )
+}
+
 class AstroNativeEngine : AutoCloseable {
 
     companion object {
@@ -120,6 +215,19 @@ class AstroNativeEngine : AutoCloseable {
             bgStd = outMetrics[5],
             tenengrad = outMetrics[6],
             starFound = outMetrics[7] > 0.5f
+        )
+    }
+
+    fun computeFocusPeakingPoints(
+        yBuf: ByteBuffer, yRowStride: Int, yPixelStride: Int,
+        width: Int, height: Int,
+        threshold: Float = 0.14f,
+        outPointsXY: FloatArray
+    ): Int {
+        val h = handle
+        if (h == 0L) return 0
+        return nativeComputeFocusPeakingPoints(
+            h, yBuf, yRowStride, yPixelStride, width, height, threshold, outPointsXY
         )
     }
 
@@ -288,6 +396,14 @@ class AstroNativeEngine : AutoCloseable {
         computeLoupe: Boolean, loupeNormX: Float, loupeNormY: Float,
         loupeBitmap: Bitmap?, outMetrics: FloatArray
     )
+
+    private external fun nativeComputeFocusPeakingPoints(
+        handle: Long,
+        yBuf: ByteBuffer, yRowStride: Int, yPixelStride: Int,
+        width: Int, height: Int,
+        threshold: Float,
+        outPointsXY: FloatArray
+    ): Int
 
     private external fun nativeStartStackSession(handle: Long, mode: Int, p1: Float, p2: Float, p3: Float)
 

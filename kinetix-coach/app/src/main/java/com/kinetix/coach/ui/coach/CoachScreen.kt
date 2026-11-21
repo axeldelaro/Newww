@@ -78,6 +78,8 @@ import com.kinetix.coach.data.KnowledgeEntry
 import com.kinetix.coach.data.ModelPrepareState
 import com.kinetix.coach.data.RagSourceRef
 import com.kinetix.coach.llm.EngineStatus
+import com.kinetix.coach.ui.components.ExerciseVideoPlayer
+import com.kinetix.coach.ui.components.FormattedCoachText
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
 import com.kinetix.coach.ui.components.SectionLabel
@@ -94,6 +96,7 @@ import com.kinetix.coach.ui.theme.FormGood
 import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
 import com.kinetix.coach.ui.theme.SteelGray
+import com.kinetix.coach.vision.ExerciseVideoMapper
 import kotlin.math.roundToInt
 
 private val QUICK_COACH_PROMPTS = listOf(
@@ -547,11 +550,15 @@ private fun ChatBubbleItem(
                     }
                 }
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = CrispWhite
-                )
+                if (message.isUser) {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = CrispWhite
+                    )
+                } else {
+                    FormattedCoachText(text = message.text)
+                }
 
                 if (message.isStreaming) {
                     Spacer(Modifier.height(8.dp))
@@ -900,6 +907,10 @@ private fun SourceArticleSheet(
     onClose: () -> Unit
 ) {
     val accent = categoryColor(entry.category)
+    val isExercise = entry.category.equals("exercice", ignoreCase = true)
+    val videoGuide = remember(entry.id) {
+        if (isExercise) ExerciseVideoMapper.forKnowledgeEntry(entry) else null
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -913,7 +924,10 @@ private fun SourceArticleSheet(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
                 Box(
                     modifier = Modifier
                         .size(width = 4.dp, height = 18.dp)
@@ -924,7 +938,9 @@ private fun SourceArticleSheet(
                     text = "${categoryLabelFr(entry.category)} · ${entry.subcategory.uppercase()}",
                     style = MaterialTheme.typography.labelMedium,
                     color = accent,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             IconButton(onClick = onClose, modifier = Modifier.size(30.dp)) {
@@ -936,6 +952,12 @@ private fun SourceArticleSheet(
             style = MaterialTheme.typography.headlineMedium,
             color = CrispWhite
         )
+        if (videoGuide != null) {
+            ExerciseVideoPlayer(
+                guide = videoGuide,
+                showPhasesAndChecklist = true
+            )
+        }
         if (entry.summary.isNotBlank()) {
             IndustrialCard(containerColor = ObsidianBg, borderColor = accent.copy(alpha = 0.4f)) {
                 Text(

@@ -453,4 +453,117 @@ void analyzePreviewYuv(
     }
 }
 
+int computeFocusPeakingPoints(
+    const uint8_t* yPlane, int yRowStride, int yPixelStride,
+    int width, int height,
+    float threshold,
+    int maxPoints,
+    float* outNormXY
+) {
+    if (!yPlane || !outNormXY || width < 8 || height < 8 || maxPoints <= 0) {
+        return 0;
+    }
+
+    constexpr int kGridW = 96;
+    constexpr int kGridH = 72;
+    const int gw = std::min(kGridW, width);
+    const int gh = std::min(kGridH, height);
+    if (gw < 4 || gh < 4) return 0;
+
+    const int pStride = std::max(1, yPixelStride);
+    const int rStride = yRowStride > 0 ? yRowStride : (width * pStride);
+
+    // Track peak true 1-pixel-step Sobel gradient magnitude squared inside each 96x72 cell.
+    // Measuring 1-pixel spatial derivatives guarantees genuine focus selectivity:
+    // razor-sharp lunar craters and pinpoint stars score high, while defocused edges drop near zero.
+    int cellBestMagSq[kGridW * kGridH];
+    std::memset(cellBestMagSq, 0, sizeof(cellBestMagSq));
+
+    const int stepX = std::max(1, width / (gw * 2));
+    const int stepY = std::max(1, height / (gh * 2));
+
+    for (int y = 1; y < height - 1; y += stepY) {
+        const uint8_t* rPrev = yPlane + static_cast<size_t>(y - 1) * rStride;
+        const uint8_t* rCurr = yPlane + static_cast<size_t>(y) * rStride;
+        const uint8_t* rNext = yPlane + static_cast<size_t>(y + 1) * rStride;
+        const int gy = std::min(gh - 1, (y * gh) / height);
+        int* cellRow = cellBestMagSq + gy * gw;
+
+        for (int x = 1; x < width - 1; x += stepX) {
+            const int xm = (x - 1) * pStride;
+            const int xc = x * pStride;
+            const int xp = (x + 1) * pStride;
+
+            const int p00 = rPrev[xm];
+            const int p01 = rPrev[xc];
+            const int p02 = rPrev[xp];
+            const int p10 = rCurr[xm];
+            const int p12 = rCurr[xp];
+            const int p20 = rNext[xm];
+            const int p21 = rNext[xc];
+            const int p22 = rNext[xp];
+
+            const int sx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
+            const int sy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
+            const int magSq = sx * sx + sy * sy;
+
+            const int gx = std::min(gw - 1, (x * gw) / width);
+            if (magSq > cellRow[gx]) {
+                cellRow[gx] = magSq;
+            }
+        }
+    }
+
+    // A full 0..255 step edge gives Sobel magnitude = 4 * 255 = 1020
+    const float thresh = std::clamp(threshold, 0.03f, 0.95f);
+    const float threshRaw = thresh * 1020.0f;
+    const int threshSq = static_cast<int>(threshRaw * threshRaw);
+
+    struct EdgeCandidate {
+        float x;
+        float y;
+        int strengthSq;
+    };
+    std::vector<EdgeCandidate> candidates;
+    candidates.reserve(static_cast<size_t>(std::min(maxPoints * 2, gw * gh / 4)));
+
+    const float invGw = 1.0f / static_cast<float>(gw);
+    const float invGh = 1.0f / static_cast<float>(gh);
+
+    for (int gy = 0; gy < gh; ++gy) {
+        const int* cellRow = cellBestMagSq + gy * gw;
+        for (int gx = 0; gx < gw; ++gx) {
+            const int sSq = cellRow[gx];
+            if (sSq >= threshSq) {
+                candidates.push_back({
+                    (static_cast<float>(gx) + 0.5f) * invGw,
+                    (static_cast<float>(gy) + 0.5f) * invGh,
+                    sSq
+                });
+            }
+        }
+    }
+
+    if (candidates.empty()) return 0;
+
+    int outCount = static_cast<int>(candidates.size());
+    if (outCount > maxPoints) {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + maxPoints,
+            candidates.end(),
+            [](const EdgeCandidate& a, const EdgeCandidate& b) {
+                return a.strengthSq > b.strengthSq;
+            }
+        );
+        outCount = maxPoints;
+    }
+
+    for (int i = 0; i < outCount; ++i) {
+        outNormXY[i * 2 + 0] = candidates[i].x;
+        outNormXY[i * 2 + 1] = candidates[i].y;
+    }
+    return outCount;
+}
+
 } // namespace astro

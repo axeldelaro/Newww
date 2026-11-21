@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.kinetix.coach.KinetixApp
 import com.kinetix.coach.data.KnowledgeCategory
 import com.kinetix.coach.data.KnowledgeEntry
+import com.kinetix.coach.vision.ExerciseMuscleFilter
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,6 +18,7 @@ import kotlinx.coroutines.launch
 data class EncyclopediaUiState(
     val query: String = "",
     val selectedCategory: KnowledgeCategory = KnowledgeCategory.ALL,
+    val selectedMuscleFilter: ExerciseMuscleFilter = ExerciseMuscleFilter.ALL,
     val entries: List<KnowledgeEntry> = emptyList(),
     val categoryCounts: Map<String, Int> = emptyMap(),
     val isLoading: Boolean = true,
@@ -56,7 +58,22 @@ class EncyclopediaViewModel(application: Application) : AndroidViewModel(applica
 
     fun onCategorySelected(category: KnowledgeCategory) {
         if (_uiState.value.selectedCategory == category) return
-        _uiState.update { it.copy(selectedCategory = category) }
+        _uiState.update {
+            it.copy(
+                selectedCategory = category,
+                selectedMuscleFilter = if (category == KnowledgeCategory.EXERCICE) {
+                    it.selectedMuscleFilter
+                } else {
+                    ExerciseMuscleFilter.ALL
+                }
+            )
+        }
+        triggerSearch(debounceMs = 0L)
+    }
+
+    fun onMuscleFilterSelected(filter: ExerciseMuscleFilter) {
+        if (_uiState.value.selectedMuscleFilter == filter) return
+        _uiState.update { it.copy(selectedMuscleFilter = filter) }
         triggerSearch(debounceMs = 0L)
     }
 
@@ -77,22 +94,34 @@ class EncyclopediaViewModel(application: Application) : AndroidViewModel(applica
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             if (debounceMs > 0L) delay(debounceMs)
-            val currentQuery = _uiState.value.query.trim()
-            val catKey = _uiState.value.selectedCategory.dbKey.takeUnless { it == "all" }
+            val state = _uiState.value
+            val currentQuery = state.query.trim()
+            val catKey = state.selectedCategory.dbKey.takeUnless { it == "all" }
+            val muscleFilter = if (state.selectedCategory == KnowledgeCategory.EXERCICE) {
+                state.selectedMuscleFilter
+            } else {
+                ExerciseMuscleFilter.ALL
+            }
+            val fetchLimit = if (muscleFilter != ExerciseMuscleFilter.ALL) 950 else 120
             val startNs = System.nanoTime()
-            val results = runCatching {
+            val rawResults = runCatching {
                 app.ragEngine.searchEncyclopedia(
                     query = currentQuery,
                     categoryFilter = catKey,
-                    limit = 80
+                    limit = fetchLimit
                 )
             }.getOrDefault(emptyList())
+            val results = if (muscleFilter == ExerciseMuscleFilter.ALL) {
+                rawResults
+            } else {
+                rawResults.filter { muscleFilter.matchesSubcategory(it.subcategory) }
+            }
             val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
             _uiState.update {
                 it.copy(
                     entries = results,
                     isLoading = false,
-                    lastSearchMs = if (currentQuery.isNotBlank()) elapsedMs else 0L
+                    lastSearchMs = if (currentQuery.isNotBlank() || muscleFilter != ExerciseMuscleFilter.ALL) elapsedMs else 0L
                 )
             }
         }

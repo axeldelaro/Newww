@@ -282,6 +282,36 @@ Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeAnalyzePreviewY
     }
 }
 
+JNIEXPORT jint JNICALL
+Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeComputeFocusPeakingPoints(
+    JNIEnv* env, jobject, jlong /*handle*/,
+    jobject yBuf, jint yRowStride, jint yPixelStride,
+    jint width, jint height,
+    jfloat threshold,
+    jfloatArray outPointsXY
+) {
+    if (!yBuf || !outPointsXY) return 0;
+    auto* yPtr = static_cast<const uint8_t*>(env->GetDirectBufferAddress(yBuf));
+    if (!yPtr) return 0;
+
+    const jsize arrLen = env->GetArrayLength(outPointsXY);
+    const int maxPoints = static_cast<int>(arrLen / 2);
+    if (maxPoints <= 0) return 0;
+
+    std::vector<float> tmp(static_cast<size_t>(maxPoints) * 2);
+    const int count = computeFocusPeakingPoints(
+        yPtr, yRowStride, yPixelStride,
+        width, height,
+        threshold,
+        maxPoints,
+        tmp.data()
+    );
+    if (count > 0) {
+        env->SetFloatArrayRegion(outPointsXY, 0, count * 2, tmp.data());
+    }
+    return count;
+}
+
 JNIEXPORT void JNICALL
 Java_com_astropro_xiaomi14u_nativeengine_AstroNativeEngine_nativeStartStackSession(
     JNIEnv*, jobject, jlong handle,

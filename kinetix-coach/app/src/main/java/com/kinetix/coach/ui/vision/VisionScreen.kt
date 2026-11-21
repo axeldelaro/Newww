@@ -34,7 +34,10 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -57,8 +60,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -68,6 +72,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.WorkoutSession
+import com.kinetix.coach.ui.components.ExerciseDemoSheetContent
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
 import com.kinetix.coach.ui.components.MetricCell
@@ -82,11 +87,15 @@ import com.kinetix.coach.ui.theme.FormFault
 import com.kinetix.coach.ui.theme.FormGood
 import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
+import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
+import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PoseLandmarkerHelper
 import com.kinetix.coach.vision.SkeletonOverlay
 import java.util.concurrent.Executors
+
+private val REST_PRESETS_SEC = listOf(45, 60, 90, 120)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -95,6 +104,7 @@ fun VisionScreen(
     onAnalyzeWithCoach: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
     var hasCameraPermission by remember {
@@ -111,6 +121,14 @@ fun VisionScreen(
     }
 
     var showExercisePicker by remember { mutableStateOf(false) }
+    var demoPreviewExercise by remember { mutableStateOf<ExerciseType?>(null) }
+
+    // Haptic pulse when rest timer completes
+    LaunchedEffect(uiState.restFinishedEvent) {
+        if (uiState.restFinishedEvent > 0) {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -157,7 +175,7 @@ fun VisionScreen(
                         border = BorderStroke(1.dp, BorderHairline)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
@@ -172,7 +190,9 @@ fun VisionScreen(
                                 Text(
                                     text = "${uiState.selectedExercise.cameraAngleHint} · ${uiState.delegateLabel}",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = SteelGray
+                                    color = SteelGray,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Icon(
@@ -183,7 +203,38 @@ fun VisionScreen(
                         }
                     }
 
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
+
+                    // Crisp "Démo" Video Pill Button
+                    Surface(
+                        modifier = Modifier
+                            .height(44.dp)
+                            .clickable { demoPreviewExercise = uiState.selectedExercise },
+                        shape = RoundedCornerShape(10.dp),
+                        color = ObsidianBg.copy(alpha = 0.90f),
+                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.85f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PlayArrow,
+                                contentDescription = "Voir la démo vidéo",
+                                tint = SignalOrange,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(3.dp))
+                            Text(
+                                text = "Démo",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.width(6.dp))
 
                     // Voice Toggle
                     HudIconButton(
@@ -193,7 +244,7 @@ fun VisionScreen(
                             imageVector = if (uiState.isVoiceEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                             contentDescription = "Coach vocal",
                             tint = if (uiState.isVoiceEnabled) SignalOrange else SteelGray,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(19.dp)
                         )
                     }
 
@@ -207,7 +258,7 @@ fun VisionScreen(
                             imageVector = Icons.Default.Cameraswitch,
                             contentDescription = "Changer de caméra",
                             tint = CrispWhite,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(19.dp)
                         )
                     }
                 }
@@ -254,19 +305,92 @@ fun VisionScreen(
                         }
                     }
                 }
+
+                // Active Smart Rest Countdown Overlay Pill
+                if (uiState.isResting) {
+                    Spacer(Modifier.height(8.dp))
+                    RestCountdownOverlayPill(
+                        remainingSec = uiState.restRemainingSec,
+                        totalSec = uiState.restDurationSec,
+                        nextSetNumber = uiState.currentSetNumber,
+                        onAdd15s = { viewModel.addRestSeconds(15) },
+                        onSkip = { viewModel.skipRest() }
+                    )
+                }
             }
 
-            // Bottom Telemetry HUD
+            // Bottom Telemetry HUD (with Multi-Set & Rest Timer Controls)
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .padding(12.dp),
                 shape = RoundedCornerShape(12.dp),
-                color = ObsidianBg.copy(alpha = 0.92f),
+                color = ObsidianBg.copy(alpha = 0.93f),
                 border = BorderStroke(1.dp, BorderHairline)
             ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+                Column(modifier = Modifier.padding(13.dp)) {
+                    // Multi-Set Header + Rest Preset Chips
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = SignalOrangeDim,
+                                border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.6f))
+                            ) {
+                                Text(
+                                    text = "SÉRIE ${uiState.currentSetNumber}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SignalOrange,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                )
+                            }
+                            val totalSessionMetric = if (uiState.selectedExercise.isIsometric) {
+                                val totSec = uiState.sessionTotalHoldSec + uiState.frame.isometricHoldSec.toInt()
+                                "Total ${totSec}s"
+                            } else {
+                                val totReps = uiState.sessionTotalReps + uiState.frame.repCount
+                                "Total $totReps reps"
+                            }
+                            Text(
+                                text = totalSessionMetric,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SteelGray
+                            )
+                        }
+
+                        // Configurable Rest Duration Presets (45s / 60s / 90s / 120s)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            REST_PRESETS_SEC.forEach { sec ->
+                                val selected = uiState.restDurationSec == sec
+                                Surface(
+                                    shape = RoundedCornerShape(5.dp),
+                                    color = if (selected) ElevatedSurface else ObsidianBg,
+                                    border = BorderStroke(1.dp, if (selected) SignalOrange else BorderHairline),
+                                    modifier = Modifier.clickable { viewModel.setRestDuration(sec) }
+                                ) {
+                                    Text(
+                                        text = "${sec}s",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (selected) SignalOrange else SteelGray,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -294,7 +418,9 @@ fun VisionScreen(
                         // Phase + ROM + Action Controls
                         Column(
                             horizontalAlignment = Alignment.End,
-                            modifier = Modifier.weight(1f).padding(start = 16.dp)
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 14.dp)
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -319,7 +445,7 @@ fun VisionScreen(
                                 )
                             }
 
-                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(7.dp))
 
                             LinearProgressIndicator(
                                 progress = { uiState.frame.romPct / 100f },
@@ -331,14 +457,14 @@ fun VisionScreen(
                                 trackColor = ElevatedSurface
                             )
 
-                            Spacer(Modifier.height(10.dp))
+                            Spacer(Modifier.height(9.dp))
 
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 OutlinedButton(
                                     onClick = { viewModel.resetSession() },
                                     shape = RoundedCornerShape(8.dp),
                                     border = BorderStroke(1.dp, BorderHairline),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Refresh,
@@ -347,6 +473,21 @@ fun VisionScreen(
                                         modifier = Modifier.size(16.dp)
                                     )
                                 }
+                                OutlinedButton(
+                                    onClick = { viewModel.completeSetAndStartRest() },
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.7f)),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Timer,
+                                        contentDescription = "Fin de série / Repos",
+                                        tint = SignalOrange,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Repos", style = MaterialTheme.typography.labelMedium, color = CrispWhite)
+                                }
                                 Button(
                                     onClick = { viewModel.finishSession() },
                                     shape = RoundedCornerShape(8.dp),
@@ -354,15 +495,15 @@ fun VisionScreen(
                                         containerColor = SignalOrange,
                                         contentColor = CrispWhite
                                     ),
-                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Flag,
                                         contentDescription = null,
-                                        modifier = Modifier.size(16.dp)
+                                        modifier = Modifier.size(15.dp)
                                     )
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("Terminer", style = MaterialTheme.typography.labelLarge)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Fin", style = MaterialTheme.typography.labelMedium)
                                 }
                             }
                         }
@@ -372,7 +513,7 @@ fun VisionScreen(
         }
     }
 
-    // 16-Exercise Selector Sheet
+    // 16-Exercise Selector Sheet (with inline "Voir la vidéo" trigger on every exercise)
     if (showExercisePicker) {
         ModalBottomSheet(
             onDismissRequest = { showExercisePicker = false },
@@ -388,12 +529,12 @@ fun VisionScreen(
             ) {
                 SectionLabel(
                     text = "Sélectionner un exercice",
-                    trailing = "${ExerciseType.entries.size} MOUVEMENTS"
+                    trailing = "${ExerciseType.entries.size} MOUVEMENTS · VIDÉO"
                 )
                 Spacer(Modifier.height(12.dp))
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.height(440.dp)
+                    modifier = Modifier.height(450.dp)
                 ) {
                     items(ExerciseType.entries) { ex ->
                         val selected = ex == uiState.selectedExercise
@@ -411,11 +552,22 @@ fun VisionScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = ex.labelFr,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = CrispWhite
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = ex.labelFr,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = CrispWhite
+                                        )
+                                        if (selected) {
+                                            Spacer(Modifier.width(6.dp))
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = null,
+                                                tint = SignalOrange,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
                                     Spacer(Modifier.height(2.dp))
                                     Text(
                                         text = "${ex.musclesFr} · Caméra : ${ex.cameraAngleHint}",
@@ -429,18 +581,59 @@ fun VisionScreen(
                                         color = SteelGray
                                     )
                                 }
-                                if (selected) {
-                                    Icon(
-                                        imageVector = Icons.Default.Check,
-                                        contentDescription = null,
-                                        tint = SignalOrange
-                                    )
+                                Spacer(Modifier.width(10.dp))
+                                // Direct "Voir la vidéo" Preview Button
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = SignalOrangeDim,
+                                    border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f)),
+                                    modifier = Modifier.clickable {
+                                        showExercisePicker = false
+                                        demoPreviewExercise = ex
+                                    }
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.PlayCircleOutline,
+                                            contentDescription = "Voir la vidéo",
+                                            tint = SignalOrange,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(
+                                            text = "VIDÉO",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = CrispWhite,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Exercise Studio Demo Modal Bottom Sheet (MP4 + 0.5× slow-mo + 4-phase guide + checklist)
+    demoPreviewExercise?.let { exercise ->
+        val guide = remember(exercise) { ExerciseVideoMapper.forVisionExercise(exercise) }
+        ModalBottomSheet(
+            onDismissRequest = { demoPreviewExercise = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = CharcoalSurface,
+            contentColor = CrispWhite
+        ) {
+            ExerciseDemoSheetContent(
+                title = exercise.labelFr,
+                subtitle = "${exercise.musclesFr} · Caméra : ${exercise.cameraAngleHint}",
+                guide = guide,
+                onClose = { demoPreviewExercise = null }
+            )
         }
     }
 
@@ -455,6 +648,98 @@ fun VisionScreen(
                 onAnalyzeWithCoach(prompt)
             }
         )
+    }
+}
+
+@Composable
+private fun RestCountdownOverlayPill(
+    remainingSec: Int,
+    totalSec: Int,
+    nextSetNumber: Int,
+    onAdd15s: () -> Unit,
+    onSkip: () -> Unit
+) {
+    val mins = remainingSec / 60
+    val secs = remainingSec % 60
+    val formattedTime = String.format("%02d:%02d", mins, secs)
+    val progress = if (totalSec > 0) (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f) else 0f
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = ObsidianBg.copy(alpha = 0.94f),
+        border = BorderStroke(1.dp, SignalOrange),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Timer,
+                        contentDescription = null,
+                        tint = SignalOrange,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = "REPOS AVANT SÉRIE $nextSetNumber",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SteelGray,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = formattedTime,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = SignalOrange,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = ElevatedSurface,
+                        border = BorderStroke(1.dp, BorderHairline),
+                        modifier = Modifier.clickable(onClick = onAdd15s)
+                    ) {
+                        Text(
+                            text = "+15s",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CrispWhite,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(7.dp),
+                        color = SignalOrange,
+                        modifier = Modifier.clickable(onClick = onSkip)
+                    ) {
+                        Text(
+                            text = "Passer",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CrispWhite,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp)),
+                color = SignalOrange,
+                trackColor = ElevatedSurface
+            )
+        }
     }
 }
 
@@ -604,7 +889,10 @@ private fun SessionSummarySheet(
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 28.dp)
         ) {
-            SectionLabel(text = "BILAN BIOMÉCANIQUE", trailing = "ENREGISTRÉ")
+            SectionLabel(
+                text = "BILAN BIOMÉCANIQUE",
+                trailing = if (session.notes.isNotBlank()) session.notes.uppercase() else "ENREGISTRÉ"
+            )
             Spacer(Modifier.height(6.dp))
             Text(
                 text = session.exerciseType.labelFr,
@@ -668,7 +956,9 @@ private fun SessionSummarySheet(
                 onClick = onAnalyzeWithCoach,
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = CrispWhite),
-                modifier = Modifier.fillMaxWidth().height(48.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
             ) {
                 Text("Analyser avec le Coach IA", style = MaterialTheme.typography.labelLarge)
             }
@@ -677,7 +967,9 @@ private fun SessionSummarySheet(
                 onClick = onDismiss,
                 shape = RoundedCornerShape(8.dp),
                 border = BorderStroke(1.dp, BorderHairline),
-                modifier = Modifier.fillMaxWidth().height(44.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
             ) {
                 Text("Nouvelle série", color = CrispWhite, style = MaterialTheme.typography.labelLarge)
             }

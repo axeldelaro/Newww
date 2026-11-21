@@ -210,6 +210,19 @@ data class FocusLoupeState(
     val history: List<Float> = emptyList() // recent sharpness/inverse-FWHM sparkline
 )
 
+data class FocusPeakingState(
+    val pointsXY: FloatArray = FloatArray(0),
+    val pointCount: Int = 0
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is FocusPeakingState) return false
+        return pointCount == other.pointCount && pointsXY.contentEquals(other.pointsXY)
+    }
+
+    override fun hashCode(): Int = 31 * pointCount + pointsXY.contentHashCode()
+}
+
 data class CaptureProgressState(
     val active: Boolean = false,
     val mode: CaptureMode = CaptureMode.ASTRO_PRO,
@@ -221,6 +234,9 @@ data class CaptureProgressState(
     val starsDetected: Int = 0,
     val residualPx: Float = 0f,
     val elapsedExposureSec: Double = 0.0,
+    val exposureProgress: Float = 0f,
+    val remainingExposureSec: Double = 0.0,
+    val estimatedRemainingTotalSec: Double = 0.0,
     val statusText: String = "",
     val liveStackPreview: Bitmap? = null,
     val isFinalizing: Boolean = false

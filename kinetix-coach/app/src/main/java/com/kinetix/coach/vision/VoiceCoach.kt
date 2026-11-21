@@ -22,12 +22,14 @@ class VoiceCoach(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
-    fun speak(cue: String?, isRepCounter: Boolean = false) {
+    fun speak(cue: String?, isRepCounter: Boolean = false, force: Boolean = false) {
         if (!enabled || !ready || cue.isNullOrBlank()) return
         val now = System.currentTimeMillis()
-        val minGapMs = if (isRepCounter) 700L else 3600L
-        if (now - lastSpokenMs < minGapMs) return
-        if (!isRepCounter && cue == lastText && now - lastSpokenMs < 6500L) return
+        if (!force) {
+            val minGapMs = if (isRepCounter) 700L else 3600L
+            if (now - lastSpokenMs < minGapMs) return
+            if (!isRepCounter && cue == lastText && now - lastSpokenMs < 6500L) return
+        }
 
         lastSpokenMs = now
         lastText = cue

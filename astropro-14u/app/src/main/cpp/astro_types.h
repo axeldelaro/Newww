@@ -233,6 +233,14 @@ void analyzePreviewYuv(
     FocusMetrics& outMetrics
 );
 
+int computeFocusPeakingPoints(
+    const uint8_t* yPlane, int yRowStride, int yPixelStride,
+    int width, int height,
+    float threshold,
+    int maxPoints,
+    float* outNormXY
+);
+
 // ---------------- star_engine.cpp ----------------
 FocusMetrics measureFocusCrop(const float* luma, int w, int h);
 

@@ -363,7 +363,77 @@ fun XiaomiLensSelectorPill(
 }
 
 /**
- * Minimalist Xiaomi-style Live Capture / Stacking HUD bar during multi-frame sequences.
+ * Real-time C++20 Focus Peaking Overlay highlighting crisp lunar craters, horizon silhouettes,
+ * and pinpoint stars in Xiaomi Pro Gold (#F5B82E) or Vision Nocturne OLED Red (#CC1818).
+ */
+@Composable
+fun FocusPeakingOverlay(
+    pointsXY: FloatArray,
+    pointCount: Int,
+    sensorOrientation: Int,
+    isFront: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val colors = LocalAstroColors.current
+    if (pointCount <= 0 || pointsXY.size < pointCount * 2) return
+
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val peakColor = colors.accent.copy(alpha = 0.88f)
+        val arm = 1.6.dp.toPx()
+        val strokeW = 1.15.dp.toPx()
+        val w = size.width
+        val h = size.height
+
+        for (i in 0 until pointCount) {
+            val nx = pointsXY[i * 2]
+            val ny = pointsXY[i * 2 + 1]
+            var vx: Float
+            var vy: Float
+            when (sensorOrientation) {
+                90 -> {
+                    vx = 1f - ny
+                    vy = nx
+                }
+                270 -> {
+                    vx = ny
+                    vy = 1f - nx
+                }
+                180 -> {
+                    vx = 1f - nx
+                    vy = 1f - ny
+                }
+                else -> {
+                    vx = nx
+                    vy = ny
+                }
+            }
+            if (isFront) {
+                vx = 1f - vx
+            }
+
+            val cx = vx * w
+            val cy = vy * h
+            drawLine(
+                color = peakColor,
+                start = Offset(cx - arm, cy),
+                end = Offset(cx + arm, cy),
+                strokeWidth = strokeW,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = peakColor,
+                start = Offset(cx, cy - arm),
+                end = Offset(cx, cy + arm),
+                strokeWidth = strokeW,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
+/**
+ * Minimalist Xiaomi-style Live Capture / Stacking HUD bar during single long exposure
+ * and multi-frame sequences (with estimated remaining total time).
  */
 @Composable
 fun LiveCaptureHudOverlay(
@@ -406,10 +476,21 @@ fun LiveCaptureHudOverlay(
                 )
             }
 
-            Text(
-                text = NpfCalculator.formatIntegrationTime(progress.elapsedExposureSec),
-                style = tabularStyle(size = 12.sp, weight = FontWeight.Bold, color = colors.accent)
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (progress.estimatedRemainingTotalSec >= 1.0 && progress.framesTarget > 1) {
+                    Text(
+                        text = "~${NpfCalculator.formatIntegrationTime(progress.estimatedRemainingTotalSec)}",
+                        style = tabularStyle(size = 10.5.sp, weight = FontWeight.Medium, color = colors.textSecondary)
+                    )
+                }
+                Text(
+                    text = NpfCalculator.formatIntegrationTime(progress.elapsedExposureSec),
+                    style = tabularStyle(size = 12.sp, weight = FontWeight.Bold, color = colors.accent)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(4.dp))
@@ -427,7 +508,8 @@ fun LiveCaptureHudOverlay(
             }
             Text(
                 text = metricsLine,
-                style = tabularStyle(size = 10.5.sp, color = colors.textSecondary)
+                style = tabularStyle(size = 10.5.sp, color = colors.textSecondary),
+                modifier = Modifier.weight(1f, fill = false)
             )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -459,12 +541,14 @@ fun LiveCaptureHudOverlay(
 /**
  * Iconic Xiaomi HyperOS Camera Pro Shutter Button.
  * Idle: crisp white outer ring + solid white center disc (pure red in Vision Nocturne).
- * Active: animated progress arc + Leica Red/Gold square stop button.
+ * Active: smooth gold/red circular countdown arc + crisp seconds badge during long exposure,
+ * or Leica Red square stop button during multi-frame sequences.
  */
 @Composable
 fun XiaomiProShutterButton(
     isCapturing: Boolean,
     progressFraction: Float,
+    countdownSeconds: Double = 0.0,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -500,7 +584,7 @@ fun XiaomiProShutterButton(
             )
 
             if (isCapturing) {
-                if (progressFraction > 0.01f) {
+                if (progressFraction > 0.005f) {
                     drawArc(
                         color = colors.accent,
                         startAngle = -90f,
@@ -525,12 +609,33 @@ fun XiaomiProShutterButton(
         }
 
         if (isCapturing) {
-            Box(
-                modifier = Modifier
-                    .size(24.dp)
-                    .clip(RoundedCornerShape(5.dp))
-                    .background(colors.leicaRed)
-            )
+            if (countdownSeconds > 0.05) {
+                // Crisp HyperOS long-exposure remaining-seconds badge right inside the shutter ring
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape)
+                        .background(colors.surface)
+                        .border(1.dp, colors.leicaRed.copy(alpha = 0.7f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = String.format(Locale.US, "%.1fs", countdownSeconds),
+                        style = tabularStyle(
+                            size = 13.sp,
+                            weight = FontWeight.Bold,
+                            color = colors.accent
+                        )
+                    )
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(colors.leicaRed)
+                )
+            }
         } else {
             Box(
                 modifier = Modifier

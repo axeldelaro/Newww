@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
@@ -50,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kinetix.coach.data.KnowledgeCategory
 import com.kinetix.coach.data.KnowledgeEntry
+import com.kinetix.coach.ui.components.ExerciseVideoPlayer
 import com.kinetix.coach.ui.components.FilterChipPill
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
@@ -66,7 +68,10 @@ import com.kinetix.coach.ui.theme.FormFaultDim
 import com.kinetix.coach.ui.theme.FormGood
 import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
+import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
+import com.kinetix.coach.vision.ExerciseMuscleFilter
+import com.kinetix.coach.vision.ExerciseVideoMapper
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -106,7 +111,7 @@ fun EncyclopediaScreen(
                     )
                     Text(
                         text = if (totalCount > 0) {
-                            "$totalCount fiches hors-ligne · FTS5 instantané"
+                            "$totalCount fiches hors-ligne · 911 vidéos d'exécution"
                         } else {
                             "Chargement de la base locale…"
                         },
@@ -185,6 +190,31 @@ fun EncyclopediaScreen(
                     )
                 }
             }
+
+            // Muscle-group quick filter chips when Exercices category is active
+            if (uiState.selectedCategory == KnowledgeCategory.EXERCICE) {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(ExerciseMuscleFilter.entries) { filter ->
+                        val selected = uiState.selectedMuscleFilter == filter
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (selected) SignalOrangeDim else ObsidianBg,
+                            border = BorderStroke(1.dp, if (selected) SignalOrange else BorderHairline),
+                            onClick = { viewModel.onMuscleFilterSelected(filter) }
+                        ) {
+                            Text(
+                                text = filter.labelFr,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (selected) SignalOrange else SteelGray,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         HairlineDivider()
@@ -257,34 +287,68 @@ private fun EncyclopediaEntryCard(
     onClick: () -> Unit
 ) {
     val accent = categoryColor(entry.category)
+    val isExercise = entry.category.equals("exercice", ignoreCase = true)
     IndustrialCard(
         modifier = Modifier.fillMaxWidth(),
         onClick = onClick
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Box(
-                modifier = Modifier
-                    .size(width = 3.dp, height = 14.dp)
-                    .background(accent, RoundedCornerShape(2.dp))
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = categoryLabelFr(entry.category),
-                style = MaterialTheme.typography.labelSmall,
-                color = accent,
-                fontWeight = FontWeight.Bold
-            )
-            if (entry.subcategory.isNotBlank()) {
-                Text(
-                    text = " · ${entry.subcategory}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = SteelGray,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(width = 3.dp, height = 14.dp)
+                        .background(accent, RoundedCornerShape(2.dp))
                 )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = categoryLabelFr(entry.category),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = accent,
+                    fontWeight = FontWeight.Bold
+                )
+                if (entry.subcategory.isNotBlank()) {
+                    Text(
+                        text = " · ${entry.subcategory}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SteelGray,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            if (isExercise) {
+                Spacer(Modifier.width(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(5.dp),
+                    color = SignalOrangeDim,
+                    border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.55f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            tint = SignalOrange,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(Modifier.width(2.dp))
+                        Text(
+                            text = "VIDÉO",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SignalOrange,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             }
         }
         Spacer(Modifier.height(6.dp))
@@ -316,6 +380,10 @@ private fun EncyclopediaDetailSheet(
     onClose: () -> Unit
 ) {
     val accent = categoryColor(entry.category)
+    val isExercise = entry.category.equals("exercice", ignoreCase = true)
+    val videoGuide = remember(entry.id) {
+        if (isExercise) ExerciseVideoMapper.forKnowledgeEntry(entry) else null
+    }
     val meta = remember(entry.metadataJson) {
         runCatching { JSONObject(entry.metadataJson) }.getOrNull()
     }
@@ -333,7 +401,10 @@ private fun EncyclopediaDetailSheet(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
                 Box(
                     modifier = Modifier
                         .size(width = 4.dp, height = 18.dp)
@@ -344,7 +415,9 @@ private fun EncyclopediaDetailSheet(
                     text = "${categoryLabelFr(entry.category)} · ${entry.subcategory.uppercase()}",
                     style = MaterialTheme.typography.labelMedium,
                     color = accent,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             IconButton(onClick = onClose, modifier = Modifier.size(30.dp)) {
@@ -357,6 +430,14 @@ private fun EncyclopediaDetailSheet(
             style = MaterialTheme.typography.headlineMedium,
             color = CrispWhite
         )
+
+        // Studio Biomechanical Execution Video Player (100% coverage for all 911 exercises)
+        if (videoGuide != null) {
+            ExerciseVideoPlayer(
+                guide = videoGuide,
+                showPhasesAndChecklist = true
+            )
+        }
 
         // Structured Metadata Panel by Category
         if (meta != null) {
