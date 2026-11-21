@@ -88,7 +88,8 @@ data class BiomechanicsFrame(
     val completedRepRomPct: Int = 0,
     val completedRepDurationSec: Float = 0f,
     val isometricDeltaSec: Float = 0f,
-    val detectedVariantFr: String? = null
+    val detectedVariantFr: String? = null,
+    val isStabilizing: Boolean = false
 )
 
 /**
@@ -122,6 +123,7 @@ class BiomechanicsEngine(
         const val RIGHT_ANKLE = 28
 
         private const val SYMMETRY_THRESHOLD_DEG = 13f
+        private const val MIN_BOTTOM_DWELL_MS = 55L
 
         /** Classic 2D screen-space joint angle in degrees (0..180). */
         fun angleDegrees(a: PosePoint, b: PosePoint, c: PosePoint): Float {
@@ -281,6 +283,8 @@ class BiomechanicsEngine(
     var strictness: DetectionStrictness = initialStrictness
         private set
 
+    private val sanityFilter = PoseSanityFilter()
+    private val viewpointTracker = CameraViewpointTracker()
     private val screenSmoother = PoseOneEuroSmoother()
     private val worldSmoother = PoseOneEuroSmoother()
     private var legacySmoothedScreen: MutableList<PosePoint>? = null
@@ -289,10 +293,13 @@ class BiomechanicsEngine(
     private var repCount: Int = 0
     private var phase: MovementPhase = MovementPhase.READY
     private var reachedBottom: Boolean = false
+    private var bottomEnteredTsMs: Long = 0L
     private var burpeeStage: Int = 0 // 0=stand, 1=down/plank
+    private var burpeeBottomEnteredTsMs: Long = 0L
     private var plankHoldMs: Long = 0L
     private var lastFrameTsMs: Long = 0L
     private var repStartTsMs: Long = 0L
+    private var lastMotionGuard: MotionGuardState = MotionGuardState()
 
     // Adaptive multi-signal vertical drop & variant latch trackers
     private var adaptivePushupTopHeight: Float = 0f
@@ -308,6 +315,17 @@ class BiomechanicsEngine(
     private val faultCounts = linkedMapOf<String, Int>()
     private var currentRepFault: String? = null
 
+    val isMidRep: Boolean
+        get() = phase == MovementPhase.ECCENTRIC ||
+            phase == MovementPhase.BOTTOM ||
+            phase == MovementPhase.CONCENTRIC
+
+    val hasActiveSetReps: Boolean
+        get() = repCount > 0 || (currentExercise.isIsometric && plankHoldMs >= 2000L)
+
+    val currentMotionGuard: MotionGuardState
+        get() = lastMotionGuard
+
     fun setStrictness(mode: DetectionStrictness) {
         strictness = mode
     }
@@ -317,17 +335,43 @@ class BiomechanicsEngine(
         resetSession()
     }
 
-    fun resetSession() {
+    /**
+     * Switches to a new exercise in AUTO mode while preserving One-Euro smoother, sanity filter,
+     * and viewpoint tracker state so the drawn skeleton never jumps or teleports on an auto-switch.
+     */
+    fun switchExerciseSmoothly(exercise: ExerciseType) {
+        currentExercise = exercise
+        resetExerciseCountersOnly()
+    }
+
+    /**
+     * Resets temporal landmark smoothers, sanity gate, and viewpoint tracker without discarding
+     * current set rep counts (used when flipping Front <-> Back camera).
+     */
+    fun resetTrackingFilters() {
+        sanityFilter.reset()
+        viewpointTracker.reset()
         screenSmoother.reset()
         worldSmoother.reset()
         legacySmoothedScreen = null
         legacySmoothedWorld = null
+        lastFrameTsMs = 0L
+        lastMotionGuard = MotionGuardState()
+    }
+
+    fun resetSession() {
+        resetTrackingFilters()
+        resetExerciseCountersOnly()
+    }
+
+    private fun resetExerciseCountersOnly() {
         repCount = 0
         phase = MovementPhase.READY
         reachedBottom = false
+        bottomEnteredTsMs = 0L
         burpeeStage = 0
+        burpeeBottomEnteredTsMs = 0L
         plankHoldMs = 0L
-        lastFrameTsMs = 0L
         repStartTsMs = 0L
         adaptivePushupTopHeight = 0f
         adaptiveDipTopHeight = 0f
@@ -338,6 +382,15 @@ class BiomechanicsEngine(
         romSum = 0L
         romSamples = 0
         faultCounts.clear()
+        currentRepFault = null
+    }
+
+    private fun abortIncompleteRepCycle() {
+        phase = MovementPhase.READY
+        reachedBottom = false
+        bottomEnteredTsMs = 0L
+        repStartTsMs = 0L
+        repRomPeak = 0
         currentRepFault = null
     }
 
@@ -359,7 +412,8 @@ class BiomechanicsEngine(
         poseDetected = false,
         worldLandmarks = emptyList(),
         viewpointInfo = ViewpointInfo(),
-        corrections = emptyList()
+        corrections = emptyList(),
+        isStabilizing = false
     )
 
     /** Backward-compatible 2D-only entry point. */
@@ -377,14 +431,64 @@ class BiomechanicsEngine(
             return emptyFrame()
         }
 
-        val screenPts = smoothLandmarks(rawScreenLandmarks, timestampMs, isWorld = false)
-        val hasWorld = rawWorldLandmarks.size >= 29
-        val worldPts = if (hasWorld) smoothLandmarks(rawWorldLandmarks, timestampMs, isWorld = true) else emptyList()
+        val isDeterministicPassThrough = emaAlpha >= 0.999f && !useOneEuroFilter
+        val preScreen: List<PosePoint>
+        val preWorld: List<PosePoint>
+        val motionGuard: MotionGuardState
+
+        if (useOneEuroFilter) {
+            val sanity = sanityFilter.filter(rawScreenLandmarks, rawWorldLandmarks, timestampMs)
+            preScreen = sanity.screenPoints
+            preWorld = sanity.worldPoints
+            motionGuard = sanity.motionGuard
+        } else {
+            preScreen = rawScreenLandmarks
+            preWorld = rawWorldLandmarks
+            motionGuard = MotionGuardState()
+        }
+        lastMotionGuard = motionGuard
+
+        val screenPts = smoothLandmarks(preScreen, timestampMs, isWorld = false)
+        val hasWorld = preWorld.size >= 29
+        val worldPts = if (hasWorld) smoothLandmarks(preWorld, timestampMs, isWorld = true) else emptyList()
 
         val dtMs = if (lastFrameTsMs > 0L) (timestampMs - lastFrameTsMs).coerceIn(0L, 250L) else 0L
         lastFrameTsMs = timestampMs
 
-        val viewpointInfo = CameraViewpointDetector.detect(screenPts, worldPts)
+        val viewpointInfo = if (isDeterministicPassThrough) {
+            CameraViewpointDetector.detect(screenPts, worldPts)
+        } else {
+            viewpointTracker.update(screenPts, worldPts)
+        }
+
+        // Freeze rep counting & posture fault spam while athlete walks/repositions camera
+        if (motionGuard.isUnstableTransition) {
+            abortIncompleteRepCycle()
+            burpeeStage = 0
+            burpeeBottomEnteredTsMs = 0L
+            return BiomechanicsFrame(
+                exercise = currentExercise,
+                landmarks = screenPts,
+                repCount = repCount,
+                isometricHoldSec = plankHoldMs / 1000f,
+                phase = MovementPhase.READY,
+                romPct = 0,
+                formScore = 100,
+                formQuality = FormQuality.GOOD,
+                feedbackFr = "Stabilisation du cadrage…",
+                voiceCueFr = null,
+                angleBadges = emptyList(),
+                avgFormScore = computeAvgForm(),
+                avgRomPct = computeAvgRom(),
+                topFaults = computeTopFaults(),
+                poseDetected = true,
+                worldLandmarks = worldPts,
+                viewpointInfo = viewpointInfo,
+                corrections = emptyList(),
+                isStabilizing = true
+            )
+        }
+
         val use3D = viewpointInfo.is3DActive && worldPts.size >= 29
         val geomPts = if (use3D) worldPts else screenPts
 
@@ -524,6 +628,67 @@ class BiomechanicsEngine(
                     )
                 )
             }
+        }
+
+        // Physical posture sanity gate: prevent out-of-position phantom reps & fault spam
+        val postureGateFeedback: String? = when (currentExercise) {
+            ExerciseType.PUSHUP -> {
+                val pushupBodyOk = fullBodyTilt >= 28f || torsoTilt >= 32f
+                val wristsNotOverhead = wrS.y > shS.y - 0.04f
+                if (!pushupBodyOk || !wristsNotOverhead) {
+                    "Mettez-vous en position pompes au sol."
+                } else {
+                    null
+                }
+            }
+            ExerciseType.SQUAT,
+            ExerciseType.LUNGE,
+            ExerciseType.BULGARIAN_SQUAT,
+            ExerciseType.DEADLIFT,
+            ExerciseType.OVERHEAD_PRESS,
+            ExerciseType.BICEP_CURL,
+            ExerciseType.LATERAL_RAISE,
+            ExerciseType.JUMPING_JACK -> {
+                if (fullBodyTilt >= 68f && torsoTilt >= 65f) {
+                    "Redressez-vous debout pour cet exercice."
+                } else {
+                    null
+                }
+            }
+            ExerciseType.GLUTE_BRIDGE,
+            ExerciseType.LEG_RAISE -> {
+                if (torsoTilt < 32f) {
+                    "Allongez-vous sur le dos pour cet exercice."
+                } else {
+                    null
+                }
+            }
+            else -> null
+        }
+
+        if (postureGateFeedback != null) {
+            abortIncompleteRepCycle()
+            return BiomechanicsFrame(
+                exercise = currentExercise,
+                landmarks = screenPts,
+                repCount = repCount,
+                isometricHoldSec = plankHoldMs / 1000f,
+                phase = MovementPhase.READY,
+                romPct = 0,
+                formScore = 100,
+                formQuality = FormQuality.GOOD,
+                feedbackFr = postureGateFeedback,
+                voiceCueFr = null,
+                angleBadges = emptyList(),
+                avgFormScore = computeAvgForm(),
+                avgRomPct = computeAvgRom(),
+                topFaults = computeTopFaults(),
+                poseDetected = true,
+                worldLandmarks = worldPts,
+                viewpointInfo = viewpointInfo,
+                corrections = emptyList(),
+                isStabilizing = false
+            )
         }
 
         when (currentExercise) {
@@ -1768,6 +1933,7 @@ class BiomechanicsEngine(
                         if (kneeAngle < 130f && repStartTsMs == 0L) repStartTsMs = timestampMs
                         if (bodyHorizontal) {
                             burpeeStage = 1
+                            burpeeBottomEnteredTsMs = timestampMs
                             phase = MovementPhase.BOTTOM
                             if (repStartTsMs == 0L) repStartTsMs = timestampMs
                         }
@@ -1775,18 +1941,30 @@ class BiomechanicsEngine(
                     1 -> {
                         phase = MovementPhase.BOTTOM
                         romPct = 100
+                        val dwellMs = if (burpeeBottomEnteredTsMs > 0L) timestampMs - burpeeBottomEnteredTsMs else 0L
+                        val repDurMs = if (repStartTsMs > 0L) timestampMs - repStartTsMs else 0L
                         if (standingTall) {
-                            repCount++
-                            recordRom(100)
-                            repCompletedNow = true
-                            completedRepRom = 100
-                            completedRepDurSec = computeRepDurationSec(timestampMs)
+                            if (dwellMs >= MIN_BOTTOM_DWELL_MS && repDurMs >= minRepDurationMs()) {
+                                repCount++
+                                recordRom(100)
+                                repCompletedNow = true
+                                completedRepRom = 100
+                                completedRepDurSec = computeRepDurationSec(timestampMs)
+                                voiceCue = "$repCount"
+                            }
                             repStartTsMs = 0L
+                            burpeeBottomEnteredTsMs = 0L
                             burpeeStage = 0
                             phase = MovementPhase.READY
-                            voiceCue = "$repCount"
                         } else if (!bodyHorizontal && shS.y < hpS.y) {
-                            phase = MovementPhase.CONCENTRIC
+                            if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                                phase = MovementPhase.CONCENTRIC
+                            } else {
+                                burpeeStage = 0
+                                burpeeBottomEnteredTsMs = 0L
+                                repStartTsMs = 0L
+                                phase = MovementPhase.READY
+                            }
                         }
                     }
                 }
@@ -2366,6 +2544,28 @@ class BiomechanicsEngine(
         val durationSec: Float
     )
 
+    private fun minRepDurationMs(): Long = when {
+        emaAlpha >= 0.999f && !useOneEuroFilter -> 180L
+        currentExercise == ExerciseType.JUMPING_JACK -> 240L
+        else -> 360L
+    }
+
+    private fun completeRepOrAbort(timestampMs: Long, checkBottomDwell: Boolean): CycleResult {
+        val dwellOk = !checkBottomDwell ||
+            (bottomEnteredTsMs > 0L && (timestampMs - bottomEnteredTsMs) >= MIN_BOTTOM_DWELL_MS)
+        val durOk = repStartTsMs > 0L && (timestampMs - repStartTsMs) >= minRepDurationMs()
+        if (dwellOk && durOk) {
+            val peakRom = repRomPeak
+            val durSec = computeRepDurationSec(timestampMs)
+            repCount++
+            recordRom(peakRom)
+            abortIncompleteRepCycle()
+            return CycleResult(true, peakRom, durSec)
+        }
+        abortIncompleteRepCycle()
+        return CycleResult(false, 0, 0f)
+    }
+
     /**
      * Multi-signal normalized progress cycle (0.0 = rest/top -> 1.0 = full bottom/peak -> 0.0 = rep completed).
      * Used by fused multi-signal exercises (Push-ups, Dips) to work seamlessly across all variants & camera angles.
@@ -2385,8 +2585,10 @@ class BiomechanicsEngine(
         when (phase) {
             MovementPhase.READY -> {
                 if (progress >= startThreshold) {
-                    phase = if (progress >= peakThreshold) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
-                    reachedBottom = progress >= peakThreshold
+                    val hitPeak = progress >= peakThreshold
+                    phase = if (hitPeak) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
+                    reachedBottom = hitPeak
+                    bottomEnteredTsMs = if (hitPeak) timestampMs else 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
                     currentRepFault = fault
@@ -2396,42 +2598,31 @@ class BiomechanicsEngine(
                 if (progress >= peakThreshold) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    bottomEnteredTsMs = timestampMs
                 } else if (progress < startThreshold * 0.60f) {
-                    phase = MovementPhase.READY
-                    repRomPeak = 0
-                    repStartTsMs = 0L
+                    abortIncompleteRepCycle()
                 }
             }
             MovementPhase.BOTTOM -> {
+                val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (progress <= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
                 } else if (progress < peakThreshold - 0.12f) {
-                    phase = MovementPhase.CONCENTRIC
+                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                        phase = MovementPhase.CONCENTRIC
+                    } else {
+                        reachedBottom = false
+                        bottomEnteredTsMs = 0L
+                        phase = MovementPhase.ECCENTRIC
+                    }
                 }
             }
             MovementPhase.CONCENTRIC -> {
                 if (progress <= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
                 } else if (progress >= peakThreshold) {
                     phase = MovementPhase.BOTTOM
+                    if (bottomEnteredTsMs == 0L) bottomEnteredTsMs = timestampMs
                 }
             }
             else -> phase = MovementPhase.READY
@@ -2456,8 +2647,10 @@ class BiomechanicsEngine(
         when (phase) {
             MovementPhase.READY -> {
                 if (metric < startThreshold) {
-                    phase = if (metric <= bottomThreshold) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
-                    reachedBottom = metric <= bottomThreshold
+                    val hitBottom = metric <= bottomThreshold
+                    phase = if (hitBottom) MovementPhase.BOTTOM else MovementPhase.ECCENTRIC
+                    reachedBottom = hitBottom
+                    bottomEnteredTsMs = if (hitBottom) timestampMs else 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
                     currentRepFault = fault
@@ -2467,40 +2660,28 @@ class BiomechanicsEngine(
                 if (metric <= bottomThreshold) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    bottomEnteredTsMs = timestampMs
                 } else if (metric >= abortThreshold) {
-                    phase = MovementPhase.READY
-                    repRomPeak = 0
-                    repStartTsMs = 0L
+                    abortIncompleteRepCycle()
                 }
             }
             MovementPhase.BOTTOM -> {
+                val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (metric >= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
                 } else if (metric > bottomThreshold + 10f) {
-                    phase = MovementPhase.CONCENTRIC
+                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                        phase = MovementPhase.CONCENTRIC
+                    } else {
+                        reachedBottom = false
+                        bottomEnteredTsMs = 0L
+                        phase = MovementPhase.ECCENTRIC
+                    }
                 }
             }
             MovementPhase.CONCENTRIC -> {
                 if (metric >= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
                 }
             }
             else -> phase = MovementPhase.READY
@@ -2529,6 +2710,7 @@ class BiomechanicsEngine(
                     val hitTop = metric >= topThreshold && extraTopCondition
                     phase = if (hitTop) MovementPhase.BOTTOM else MovementPhase.CONCENTRIC
                     reachedBottom = hitTop
+                    bottomEnteredTsMs = if (hitTop) timestampMs else 0L
                     repRomPeak = currentRom
                     repStartTsMs = timestampMs
                     currentRepFault = fault
@@ -2538,40 +2720,28 @@ class BiomechanicsEngine(
                 if (metric >= topThreshold && extraTopCondition) {
                     phase = MovementPhase.BOTTOM
                     reachedBottom = true
+                    bottomEnteredTsMs = timestampMs
                 } else if (metric <= abortThreshold) {
-                    phase = MovementPhase.READY
-                    repRomPeak = 0
-                    repStartTsMs = 0L
+                    abortIncompleteRepCycle()
                 }
             }
             MovementPhase.BOTTOM -> {
+                val dwellMs = if (bottomEnteredTsMs > 0L) timestampMs - bottomEnteredTsMs else 0L
                 if (metric <= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = true)
                 } else if (metric < topThreshold - 10f) {
-                    phase = MovementPhase.ECCENTRIC
+                    if (dwellMs >= MIN_BOTTOM_DWELL_MS) {
+                        phase = MovementPhase.ECCENTRIC
+                    } else {
+                        reachedBottom = false
+                        bottomEnteredTsMs = 0L
+                        phase = MovementPhase.CONCENTRIC
+                    }
                 }
             }
             MovementPhase.ECCENTRIC -> {
                 if (metric <= finishThreshold && reachedBottom) {
-                    val peakRom = repRomPeak
-                    val durSec = computeRepDurationSec(timestampMs)
-                    repCount++
-                    recordRom(peakRom)
-                    phase = MovementPhase.READY
-                    reachedBottom = false
-                    repRomPeak = 0
-                    repStartTsMs = 0L
-                    currentRepFault = null
-                    return CycleResult(true, peakRom, durSec)
+                    return completeRepOrAbort(timestampMs, checkBottomDwell = false)
                 }
             }
             else -> phase = MovementPhase.READY

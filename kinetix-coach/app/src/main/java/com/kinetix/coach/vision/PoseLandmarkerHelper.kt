@@ -2,7 +2,9 @@ package com.kinetix.coach.vision
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.PixelFormat
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
@@ -13,6 +15,7 @@ import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PoseLandmarkerHelper(
     private val context: Context,
@@ -28,6 +31,7 @@ class PoseLandmarkerHelper(
     companion object {
         private const val TAG = "KinetixPoseHelper"
         private const val MODEL_ASSET_PATH = "models/pose_landmarker_full.task"
+        private const val MIN_CONFIDENCE = 0.55f
     }
 
     @Volatile
@@ -36,6 +40,17 @@ class PoseLandmarkerHelper(
     @Volatile
     var activeDelegateLabel: String = "CPU"
         private set
+
+    @Volatile
+    private var isFrontCameraCurrent: Boolean = true
+
+    private val isInferring = AtomicBoolean(false)
+    private val bitmapLock = Any()
+
+    private var reusableRawBitmap: Bitmap? = null
+    private var reusableOrientedBitmap: Bitmap? = null
+    private var reusableCanvas: Canvas? = null
+    private val rotationMatrix = Matrix()
 
     private var lastTimestampMs: Long = 0L
 
@@ -61,39 +76,46 @@ class PoseLandmarkerHelper(
                 .setBaseOptions(baseOptions)
                 .setRunningMode(RunningMode.LIVE_STREAM)
                 .setNumPoses(1)
-                .setMinPoseDetectionConfidence(0.50f)
-                .setMinPosePresenceConfidence(0.50f)
-                .setMinTrackingConfidence(0.50f)
+                .setMinPoseDetectionConfidence(MIN_CONFIDENCE)
+                .setMinPosePresenceConfidence(MIN_CONFIDENCE)
+                .setMinTrackingConfidence(MIN_CONFIDENCE)
                 .setResultListener { result: PoseLandmarkerResult, input: MPImage ->
-                    val firstScreen = result.landmarks().firstOrNull()
-                    if (firstScreen != null && firstScreen.isNotEmpty()) {
-                        val screenPts = firstScreen.map { lm ->
-                            PosePoint(
-                                x = lm.x(),
-                                y = lm.y(),
-                                z = lm.z(),
-                                visibility = lm.visibility().orElse(1f)
-                            )
-                        }
-                        val firstWorld = result.worldLandmarks().firstOrNull()
-                        val worldPts = if (firstWorld != null && firstWorld.size >= firstScreen.size) {
-                            firstWorld.mapIndexed { idx, wlm ->
+                    val frontCameraForFrame = isFrontCameraCurrent
+                    try {
+                        val firstScreen = result.landmarks().firstOrNull()
+                        if (firstScreen != null && firstScreen.isNotEmpty()) {
+                            // MediaPipe received un-mirrored anatomical pixels: mirror ONLY screen X for front preview alignment
+                            val screenPts = firstScreen.map { lm ->
                                 PosePoint(
-                                    x = wlm.x(),
-                                    y = wlm.y(),
-                                    z = wlm.z(),
-                                    visibility = wlm.visibility().orElse(screenPts[idx].visibility)
+                                    x = if (frontCameraForFrame) (1f - lm.x()) else lm.x(),
+                                    y = lm.y(),
+                                    z = lm.z(),
+                                    visibility = lm.visibility().orElse(1f)
                                 )
                             }
+                            val firstWorld = result.worldLandmarks().firstOrNull()
+                            val worldPts = if (firstWorld != null && firstWorld.size >= firstScreen.size) {
+                                firstWorld.mapIndexed { idx, wlm ->
+                                    PosePoint(
+                                        x = wlm.x(),
+                                        y = wlm.y(),
+                                        z = wlm.z(),
+                                        visibility = wlm.visibility().orElse(screenPts[idx].visibility)
+                                    )
+                                }
+                            } else {
+                                emptyList()
+                            }
+                            onResult(screenPts, worldPts, input.width, input.height, result.timestampMs())
                         } else {
-                            emptyList()
+                            onResult(emptyList(), emptyList(), input.width, input.height, result.timestampMs())
                         }
-                        onResult(screenPts, worldPts, input.width, input.height, result.timestampMs())
-                    } else {
-                        onResult(emptyList(), emptyList(), input.width, input.height, result.timestampMs())
+                    } finally {
+                        isInferring.set(false)
                     }
                 }
                 .setErrorListener { err: RuntimeException ->
+                    isInferring.set(false)
                     Log.e(TAG, "MediaPipe runtime error: ${err.message}")
                     if (delegate == Delegate.GPU) {
                         // Hot-fallback to CPU if GPU throws on first frame
@@ -106,9 +128,11 @@ class PoseLandmarkerHelper(
 
             poseLandmarker = PoseLandmarker.createFromOptions(context, options)
             activeDelegateLabel = if (delegate == Delegate.GPU) "GPU" else "CPU"
+            isInferring.set(false)
             Log.i(TAG, "PoseLandmarker initialized on $activeDelegateLabel")
             true
         } catch (t: Throwable) {
+            isInferring.set(false)
             Log.w(TAG, "Delegate $delegate failed: ${t.message}")
             false
         }
@@ -116,32 +140,15 @@ class PoseLandmarkerHelper(
 
     fun detectLiveStream(imageProxy: ImageProxy, isFrontCamera: Boolean) {
         val landmarker = poseLandmarker
-        if (landmarker == null) {
+        if (landmarker == null || !isInferring.compareAndSet(false, true)) {
             imageProxy.close()
             return
         }
 
+        var dispatched = false
         try {
-            val rawBitmap = imageProxy.toBitmap()
-            val rotation = imageProxy.imageInfo.rotationDegrees.toFloat()
-            val matrix = Matrix().apply {
-                if (rotation != 0f) postRotate(rotation)
-                if (isFrontCamera) {
-                    postScale(-1f, 1f)
-                }
-            }
-            val orientedBitmap = Bitmap.createBitmap(
-                rawBitmap,
-                0,
-                0,
-                rawBitmap.width,
-                rawBitmap.height,
-                matrix,
-                false
-            )
-            if (orientedBitmap !== rawBitmap) {
-                rawBitmap.recycle()
-            }
+            isFrontCameraCurrent = isFrontCamera
+            val orientedBitmap = prepareOrientedBitmap(imageProxy)
 
             val now = SystemClock.uptimeMillis()
             val ts = if (now > lastTimestampMs) now else lastTimestampMs + 1L
@@ -149,18 +156,103 @@ class PoseLandmarkerHelper(
 
             val mpImage = BitmapImageBuilder(orientedBitmap).build()
             landmarker.detectAsync(mpImage, ts)
+            dispatched = true
         } catch (e: Exception) {
             Log.w(TAG, "Frame drop: ${e.message}")
         } finally {
             imageProxy.close()
+            if (!dispatched) {
+                isInferring.set(false)
+            }
+        }
+    }
+
+    /**
+     * Converts and rotates [imageProxy] into a pre-allocated reusable ARGB_8888 [Bitmap]
+     * without horizontal mirroring so MediaPipe retains 100% anatomical Left/Right & 3D fidelity.
+     */
+    private fun prepareOrientedBitmap(imageProxy: ImageProxy): Bitmap = synchronized(bitmapLock) {
+        val srcW = imageProxy.width
+        val srcH = imageProxy.height
+        val rotationDeg = ((imageProxy.imageInfo.rotationDegrees % 360) + 360) % 360
+
+        var tempBitmapToRecycle: Bitmap? = null
+        val srcBitmap: Bitmap = if (
+            imageProxy.format == PixelFormat.RGBA_8888 &&
+            imageProxy.planes.isNotEmpty() &&
+            imageProxy.planes[0].pixelStride == 4 &&
+            imageProxy.planes[0].rowStride == srcW * 4
+        ) {
+            val rawBmp = ensureRawBitmap(srcW, srcH)
+            val buf = imageProxy.planes[0].buffer
+            buf.rewind()
+            rawBmp.copyPixelsFromBuffer(buf)
+            rawBmp
+        } else {
+            imageProxy.toBitmap().also { tempBitmapToRecycle = it }
+        }
+
+        if (rotationDeg == 0) {
+            if (tempBitmapToRecycle == null) {
+                return@synchronized srcBitmap
+            }
+            val dst = ensureOrientedBitmap(srcW, srcH)
+            reusableCanvas?.drawBitmap(srcBitmap, 0f, 0f, null)
+            tempBitmapToRecycle?.recycle()
+            return@synchronized dst
+        }
+
+        val swapDims = rotationDeg == 90 || rotationDeg == 270
+        val dstW = if (swapDims) srcH else srcW
+        val dstH = if (swapDims) srcW else srcH
+        val dstBitmap = ensureOrientedBitmap(dstW, dstH)
+
+        rotationMatrix.reset()
+        rotationMatrix.postTranslate(-srcW * 0.5f, -srcH * 0.5f)
+        rotationMatrix.postRotate(rotationDeg.toFloat())
+        rotationMatrix.postTranslate(dstW * 0.5f, dstH * 0.5f)
+
+        reusableCanvas?.drawBitmap(srcBitmap, rotationMatrix, null)
+        tempBitmapToRecycle?.recycle()
+        return@synchronized dstBitmap
+    }
+
+    private fun ensureRawBitmap(width: Int, height: Int): Bitmap {
+        val existing = reusableRawBitmap
+        if (existing != null && !existing.isRecycled && existing.width == width && existing.height == height) {
+            return existing
+        }
+        existing?.recycle()
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+            reusableRawBitmap = it
+        }
+    }
+
+    private fun ensureOrientedBitmap(width: Int, height: Int): Bitmap {
+        val existing = reusableOrientedBitmap
+        if (existing != null && !existing.isRecycled && existing.width == width && existing.height == height) {
+            return existing
+        }
+        existing?.recycle()
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bmp ->
+            reusableOrientedBitmap = bmp
+            reusableCanvas = Canvas(bmp)
         }
     }
 
     fun close() {
+        isInferring.set(false)
         try {
             poseLandmarker?.close()
         } catch (_: Throwable) {
         }
         poseLandmarker = null
+        synchronized(bitmapLock) {
+            reusableCanvas = null
+            reusableRawBitmap?.recycle()
+            reusableRawBitmap = null
+            reusableOrientedBitmap?.recycle()
+            reusableOrientedBitmap = null
+        }
     }
 }

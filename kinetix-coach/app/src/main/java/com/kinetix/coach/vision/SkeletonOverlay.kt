@@ -42,11 +42,44 @@ private val LEFT_ONLY_INDICES = setOf(11, 13, 15, 23, 25, 27, 31)
 private val RIGHT_ONLY_INDICES = setOf(12, 14, 16, 24, 26, 28, 32)
 private val KEY_JOINTS = setOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
 
+/**
+ * Isolated full-FPS state driving [SkeletonOverlay] without forcing Compose HUD recompositions
+ * on sub-pixel landmark coordinate updates.
+ */
+data class PoseOverlayState(
+    val landmarks: List<PosePoint> = emptyList(),
+    val angleBadges: List<JointAngleBadge> = emptyList(),
+    val corrections: List<AngleCorrection> = emptyList(),
+    val formQuality: FormQuality = FormQuality.GOOD,
+    val imageWidth: Int = 480,
+    val imageHeight: Int = 640,
+    val viewpointInfo: ViewpointInfo = ViewpointInfo()
+)
+
 @Composable
 fun SkeletonOverlay(
     frame: BiomechanicsFrame,
     imageWidth: Int,
     imageHeight: Int,
+    modifier: Modifier = Modifier
+) {
+    SkeletonOverlay(
+        overlayState = PoseOverlayState(
+            landmarks = frame.landmarks,
+            angleBadges = frame.angleBadges,
+            corrections = frame.corrections,
+            formQuality = frame.formQuality,
+            imageWidth = imageWidth,
+            imageHeight = imageHeight,
+            viewpointInfo = frame.viewpointInfo
+        ),
+        modifier = modifier
+    )
+}
+
+@Composable
+fun SkeletonOverlay(
+    overlayState: PoseOverlayState,
     modifier: Modifier = Modifier
 ) {
     val textPaint = remember {
@@ -72,9 +105,13 @@ fun SkeletonOverlay(
     val ghostDashEffect = remember {
         PathEffect.dashPathEffect(floatArrayOf(16f, 10f), 0f)
     }
+    val reusableHeadPath = remember { Path() }
+    val reusablePillRect = remember { RectF() }
 
     Canvas(modifier = modifier.fillMaxSize()) {
-        val pts = frame.landmarks
+        val pts = overlayState.landmarks
+        val imageWidth = overlayState.imageWidth
+        val imageHeight = overlayState.imageHeight
         if (pts.size < 29 || imageWidth <= 0 || imageHeight <= 0) return@Canvas
 
         // Match PreviewView FILL_CENTER scaling so skeleton aligns pixel-perfectly over camera feed
@@ -94,8 +131,8 @@ fun SkeletonOverlay(
             y = offsetY + ny * scaledH
         )
 
-        val vp = frame.viewpointInfo
-        val boneColor = when (frame.formQuality) {
+        val vp = overlayState.viewpointInfo
+        val boneColor = when (overlayState.formQuality) {
             FormQuality.GOOD -> FormGood
             FormQuality.CAUTION -> FormCaution
             FormQuality.FAULT -> FormFault
@@ -131,7 +168,7 @@ fun SkeletonOverlay(
         }
 
         // 2. Draw live angular protractor arcs at active joints
-        for (badge in frame.angleBadges) {
+        for (badge in overlayState.angleBadges) {
             val pIdx = badge.parentIndex
             val jIdx = badge.landmarkIndex
             val cIdx = badge.childIndex
@@ -178,7 +215,7 @@ fun SkeletonOverlay(
         }
 
         // 3. Draw dashed ideal-target ghost limb vectors for active corrections
-        for (corr in frame.corrections) {
+        for (corr in overlayState.corrections) {
             if (corr.ghostAnchorIndex in pts.indices &&
                 corr.ghostTargetX.isFinite() &&
                 corr.ghostTargetY.isFinite()
@@ -216,7 +253,7 @@ fun SkeletonOverlay(
         }
 
         // 4. Draw crisp directional correction arrows anchored at off-target joints
-        for (corr in frame.corrections.take(2)) {
+        for (corr in overlayState.corrections.take(2)) {
             if (corr.jointIndex !in pts.indices) continue
             val dirLen = hypot(corr.arrowDx, corr.arrowDy)
             if (dirLen < 0.1f) continue
@@ -255,18 +292,17 @@ fun SkeletonOverlay(
             val headHalfW = 12f
             val baseX = tip.x - ux * headLen
             val baseY = tip.y - uy * headLen
-            val headPath = Path().apply {
-                moveTo(tip.x, tip.y)
-                lineTo(baseX + perpX * headHalfW, baseY + perpY * headHalfW)
-                lineTo(baseX - perpX * headHalfW, baseY - perpY * headHalfW)
-                close()
-            }
-            drawPath(path = headPath, color = ObsidianBg.copy(alpha = 0.8f), style = Stroke(width = 4f))
-            drawPath(path = headPath, color = arrowColor)
+            reusableHeadPath.reset()
+            reusableHeadPath.moveTo(tip.x, tip.y)
+            reusableHeadPath.lineTo(baseX + perpX * headHalfW, baseY + perpY * headHalfW)
+            reusableHeadPath.lineTo(baseX - perpX * headHalfW, baseY - perpY * headHalfW)
+            reusableHeadPath.close()
+            drawPath(path = reusableHeadPath, color = ObsidianBg.copy(alpha = 0.8f), style = Stroke(width = 4f))
+            drawPath(path = reusableHeadPath, color = arrowColor)
         }
 
-        val highlightedIndices = frame.angleBadges.map { it.landmarkIndex }.toSet()
-        val correctingIndices = frame.corrections.map { it.jointIndex }.toSet()
+        val highlightedIndices = overlayState.angleBadges.map { it.landmarkIndex }.toSet()
+        val correctingIndices = overlayState.corrections.map { it.jointIndex }.toSet()
 
         // 5. Draw precision joint markers
         for (idx in KEY_JOINTS) {
@@ -302,7 +338,7 @@ fun SkeletonOverlay(
 
         // 6. Draw exact degree pills ("114°→95°" when correcting, "86°" when optimal)
         val nativeCanvas = drawContext.canvas.nativeCanvas
-        for (badge in frame.angleBadges) {
+        for (badge in overlayState.angleBadges) {
             val anchor = mapNorm(badge.x, badge.y)
             val label = if (badge.targetDegHint != null) {
                 "${badge.degrees}°→${badge.targetDegHint}°"
@@ -314,11 +350,11 @@ fun SkeletonOverlay(
             val halfW = (textWidth * 0.5f + 16f).coerceAtLeast(38f)
             val bx = (anchor.x + halfW + 18f).coerceIn(halfW + 10f, size.width - halfW - 10f)
             val by = (anchor.y - 34f).coerceIn(42f, size.height - 42f)
-            val rect = RectF(bx - halfW, by - 23f, bx + halfW, by + 15f)
+            reusablePillRect.set(bx - halfW, by - 23f, bx + halfW, by + 15f)
 
             pillBorderPaint.color = badgeColor.toArgb()
-            nativeCanvas.drawRoundRect(rect, 9f, 9f, pillBgPaint)
-            nativeCanvas.drawRoundRect(rect, 9f, 9f, pillBorderPaint)
+            nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBgPaint)
+            nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBorderPaint)
             nativeCanvas.drawText(label, bx, by + 5f, textPaint)
         }
     }

@@ -4,17 +4,16 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 1. KINETIX Coach (`kinetix-coach/` — v1.3.0)
-**Vision Biomécanique 3D Multi-Angles + 7 Défis & Musique + 42 Vidéos + Coach IA Local**
+## 1. KINETIX Coach (`kinetix-coach/` — v2.0.0)
+**Vision Biomécanique 3D Anti-Glitch 60 FPS + 7 Défis & Musique + 42 Vidéos + Coach IA Local**
 
 - **Package** : `com.kinetix.coach` (Android 10+ / `arm64-v8a`, 100 % hors-ligne, zéro requête réseau)
-- **Pompes multi-signaux (6 variantes) & Audit Complet des 16 Exercices** (`BiomechanicsEngine` `Adaptatif` / `Strict`) :
-  - Fusion flexion du bras actif + descente verticale épaules/poitrine vers la ligne des mains pour détecter sans faille les pompes **Classiques, Larges, Diamant, Genoux, Piquées et Archer** + seuils réels optimisés sur les 16 exercices (curls alternés, rowing unilatéral, tractions prise large, planche face/latérale/haute…).
-- **7 Défis Caméra & Moteur Audio/Musique Hors-Ligne** (`ChallengeController`, `WorkoutAudioEngine`) :
-  - **Pompes « Bip & Go »**, **Test Luc Léger** (12 paliers), **Gainage Chrono Musical**, **Défi 25/50/100 Reps**, **AMRAP**, **Tabata 20/10 × 8**, **EMOM** + Records personnels persistés (SQLite v3).
-  - 6 bips de cadence + **4 musiques synthétisées PCM 44,1 kHz** (`Pulse 128`, `Focus 110`, `HIIT 142`, `Respiration 60`) + **import MP3/M4A/WAV/OGG local** depuis le téléphone.
-- **Vision 3D Multi-Angles (`worldLandmarks` + One-Euro)** : détection auto des 16 exercices (`AUTO`/`FIXE`), calories personnalisées (Mifflin-St Jeor + travail mécanique), corrections visuelles/vocales au degré près (ligne fantôme, flèches, rapporteurs).
-- **42 Vidéos Explicatives MP4 H.264** (100 % des 16 exos Vision + **911/911 Encyclopédie**, ralenti `0.5× / 1.0× / 1.5×`) + **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5** (`~2,6 ms`).
+- **Détection Pro Anti-Glitch & Haute Fluidité** (`PoseSanityFilter`, `CameraViewpointTracker`, `AutoExerciseDetector`, `BiomechanicsEngine`) :
+  - Rejet physique des téléportations MediaPipe, maintien sur micro-occlusions (`< 180 ms`), garde de déplacement (*« Stabilisation… »*), hystérésis `±6°` sur l’angle caméra, garde physique de posture, durée minimale de répétition, verrouillage asymétrique anti-faux-switch (*Pompes ↔ Planche*, faux *Burpees* éliminés) + **cadenas 1-tap**.
+  - `ImageAnalysis` `640×480`, `PreviewView` matériel `PERFORMANCE`, tampon Bitmap **zéro GC**, backpressure `isInferring`, miroir caméra frontale anatomiquement exact, `pipelineLock` thread-safe, overlay squelette isolé haute fréquence, `FLAG_KEEP_SCREEN_ON` en Vision.
+- **Pompes multi-signaux (6 variantes) & Audit Complet des 16 Exercices** (`Adaptatif` / `Strict`) : Classiques, Larges, Diamant, Genoux, Piquées et Archer + 15 autres exercices calibrés terrain.
+- **7 Défis Caméra & Moteur Audio/Musique Hors-Ligne** : *Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM* + Records SQLite v3 + 4 musiques PCM 44,1 kHz + **import MP3/M4A/WAV/OGG local**.
+- **Calories personnalisées**, corrections visuelles/vocales au degré près (ligne fantôme, flèches, rapporteurs), **42 Vidéos MP4 H.264** (911/911 exos), **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5**.
 
 ---
 

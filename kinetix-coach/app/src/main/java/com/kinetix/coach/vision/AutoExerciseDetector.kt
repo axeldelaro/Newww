@@ -64,26 +64,51 @@ class AutoExerciseDetector(
     private val buffer = ArrayDeque<FrameSample>(maxBufferFrames + 1)
     private val screenSmoother = PoseOneEuroSmoother(minCutoff = 1.4f, beta = 0.06f)
     private val worldSmoother = PoseOneEuroSmoother(minCutoff = 1.4f, beta = 0.06f)
+    private val viewpointTracker = CameraViewpointTracker()
 
     private var lockedExercise: ExerciseType? = null
     private var lockedConfidence: Float = 0f
     private var pendingCandidate: ExerciseType? = null
     private var pendingStreak: Int = 0
+    private var lastSwitchTsMs: Long = Long.MIN_VALUE
+    private var staticPlankStartMs: Long = Long.MIN_VALUE
+    private var staticPlankAnchorElbow: Float = 0f
+    private var staticPlankAnchorShWr: Float = 0f
+
+    val currentLockedExercise: ExerciseType?
+        get() = lockedExercise
+
+    companion object {
+        private const val ACTIVE_SET_SWITCH_COOLDOWN_MS = 2800L
+        private const val ACTIVE_SET_MIN_CONFIDENCE = 0.74f
+        private const val ACTIVE_SET_MIN_MARGIN = 0.10f
+        private const val ACTIVE_SET_SAME_FAMILY_STREAK = 20
+        private const val ACTIVE_SET_CROSS_POSTURE_STREAK = 14
+        private const val PUSHUP_TO_PLANK_MIN_HOLD_MS = 3200L
+    }
 
     fun reset(initialLocked: ExerciseType? = null) {
         buffer.clear()
         screenSmoother.reset()
         worldSmoother.reset()
+        viewpointTracker.reset()
         lockedExercise = initialLocked
         lockedConfidence = if (initialLocked != null) 0.70f else 0f
         pendingCandidate = null
         pendingStreak = 0
+        lastSwitchTsMs = Long.MIN_VALUE
+        staticPlankStartMs = Long.MIN_VALUE
+        staticPlankAnchorElbow = 0f
+        staticPlankAnchorShWr = 0f
     }
 
     fun processFrame(
         rawScreenPoints: List<PosePoint>,
         rawWorldPoints: List<PosePoint> = emptyList(),
-        timestampMs: Long
+        timestampMs: Long,
+        isMidRep: Boolean = false,
+        hasActiveSetReps: Boolean = false,
+        isTransitioning: Boolean = false
     ): AutoDetectResult {
         if (rawScreenPoints.size < 29) {
             return AutoDetectResult(
@@ -95,14 +120,29 @@ class AutoExerciseDetector(
             )
         }
 
+        if (isTransitioning) {
+            pendingCandidate = null
+            pendingStreak = 0
+            staticPlankStartMs = Long.MIN_VALUE
+            return AutoDetectResult(
+                detectedExercise = lockedExercise,
+                confidence = lockedConfidence,
+                candidateExercise = null,
+                isLocked = lockedExercise != null,
+                statusFr = "Stabilisation…"
+            )
+        }
+
         val screenPts = screenSmoother.smooth(rawScreenPoints, timestampMs)
         val hasWorld = rawWorldPoints.size >= 29
         val worldPts = if (hasWorld) worldSmoother.smooth(rawWorldPoints, timestampMs) else emptyList()
-        val vp = CameraViewpointDetector.detect(screenPts, worldPts)
+        val vp = viewpointTracker.update(screenPts, worldPts)
         val use3D = vp.is3DActive && worldPts.size >= 29
         val g = if (use3D) worldPts else screenPts
 
         val sample = extractSample(screenPts, g, vp, use3D, timestampMs)
+        updateStaticPlankHoldTracker(sample, timestampMs, isMidRep)
+
         buffer.addLast(sample)
         while (buffer.size > maxBufferFrames) {
             buffer.removeFirst()
@@ -130,32 +170,79 @@ class AutoExerciseDetector(
         val topEx = top.key
         val topConf = top.value
 
-        if (topConf >= confirmThreshold && margin >= 0.06f) {
-            if (topEx == lockedExercise) {
-                lockedConfidence = (lockedConfidence * 0.7f + topConf * 0.3f).coerceIn(0f, 1f)
-                pendingCandidate = topEx
-                pendingStreak = confirmConsecutiveFrames
-            } else {
+        val currentLocked = lockedExercise
+        if (isMidRep && currentLocked != null) {
+            // Never switch exercises mid-rep once locked
+            pendingStreak = 0
+            pendingCandidate = currentLocked
+            if (topEx == currentLocked && topConf >= 0.50f) {
+                lockedConfidence = (lockedConfidence * 0.85f + topConf * 0.15f).coerceIn(0f, 1f)
+            }
+        } else if (currentLocked == null) {
+            // Snappy initial lock
+            if (topConf >= confirmThreshold && margin >= 0.06f) {
                 if (pendingCandidate == topEx) {
                     pendingStreak++
                 } else {
                     pendingCandidate = topEx
                     pendingStreak = 1
                 }
-                val isCrossPostureSwitch = lockedExercise != null &&
-                    postureFamily(lockedExercise!!) != postureFamily(topEx) &&
-                    topConf >= 0.72f
-                val requiredStreak = if (isCrossPostureSwitch) fastPostureSwitchFrames else confirmConsecutiveFrames
-                if (pendingStreak >= requiredStreak) {
+                if (pendingStreak >= confirmConsecutiveFrames) {
                     lockedExercise = topEx
                     lockedConfidence = topConf
+                    lastSwitchTsMs = timestampMs
+                    pendingStreak = 0
                 }
+            } else {
+                if (pendingStreak > 0) pendingStreak = (pendingStreak - 1).coerceAtLeast(0)
             }
+        } else if (topEx == currentLocked) {
+            if (topConf >= 0.50f) {
+                lockedConfidence = (lockedConfidence * 0.75f + topConf * 0.25f).coerceIn(0f, 1f)
+            }
+            pendingCandidate = currentLocked
+            pendingStreak = 0
         } else {
-            // Decay pending streak gently on ambiguous transition frames
-            if (pendingStreak > 0) pendingStreak = (pendingStreak - 1).coerceAtLeast(0)
-            if (topEx == lockedExercise && topConf >= 0.50f) {
-                lockedConfidence = (lockedConfidence * 0.85f + topConf * 0.15f).coerceIn(0f, 1f)
+            // Candidate differs from currently locked exercise: apply asymmetric sticky hysteresis
+            val reqConf = if (hasActiveSetReps) ACTIVE_SET_MIN_CONFIDENCE else confirmThreshold
+            val reqMargin = if (hasActiveSetReps) ACTIVE_SET_MIN_MARGIN else 0.06f
+
+            if (topConf >= reqConf && margin >= reqMargin) {
+                if (pendingCandidate == topEx) {
+                    pendingStreak++
+                } else {
+                    pendingCandidate = topEx
+                    pendingStreak = 1
+                }
+
+                val sameFamily = postureFamily(currentLocked) == postureFamily(topEx)
+                val requiredStreak = if (hasActiveSetReps) {
+                    if (sameFamily) ACTIVE_SET_SAME_FAMILY_STREAK else ACTIVE_SET_CROSS_POSTURE_STREAK
+                } else {
+                    val isCrossPostureSwitch = !sameFamily && topConf >= 0.72f
+                    if (isCrossPostureSwitch) fastPostureSwitchFrames else confirmConsecutiveFrames
+                }
+
+                val cooldownOk = !hasActiveSetReps ||
+                    lastSwitchTsMs == Long.MIN_VALUE ||
+                    (timestampMs - lastSwitchTsMs) >= ACTIVE_SET_SWITCH_COOLDOWN_MS
+
+                val continuousPlankHoldMs = if (staticPlankStartMs != Long.MIN_VALUE) {
+                    (timestampMs - staticPlankStartMs).coerceAtLeast(0L)
+                } else {
+                    0L
+                }
+                val pushupToPlankOk = !(hasActiveSetReps && currentLocked == ExerciseType.PUSHUP && topEx == ExerciseType.PLANK) ||
+                    continuousPlankHoldMs >= PUSHUP_TO_PLANK_MIN_HOLD_MS
+
+                if (pendingStreak >= requiredStreak && cooldownOk && pushupToPlankOk) {
+                    lockedExercise = topEx
+                    lockedConfidence = topConf
+                    lastSwitchTsMs = timestampMs
+                    pendingStreak = 0
+                }
+            } else {
+                if (pendingStreak > 0) pendingStreak = (pendingStreak - 1).coerceAtLeast(0)
             }
         }
 
@@ -173,6 +260,26 @@ class AutoExerciseDetector(
             statusFr = statusFr,
             scores = scores
         )
+    }
+
+    private fun updateStaticPlankHoldTracker(sample: FrameSample, timestampMs: Long, isMidRep: Boolean) {
+        if (isMidRep || sample.posture != BodyPosture.PRONE_FLOOR || sample.bodyAlignDeg !in 135f..215f) {
+            staticPlankStartMs = Long.MIN_VALUE
+            return
+        }
+        if (staticPlankStartMs == Long.MIN_VALUE) {
+            staticPlankStartMs = timestampMs
+            staticPlankAnchorElbow = sample.elbowDeg
+            staticPlankAnchorShWr = sample.shAboveWristTl
+        } else if (
+            abs(sample.elbowDeg - staticPlankAnchorElbow) > 12f ||
+            abs(sample.shAboveWristTl - staticPlankAnchorShWr) > 0.08f
+        ) {
+            // Dynamic push-up motion detected: reset static plank hold timer
+            staticPlankStartMs = timestampMs
+            staticPlankAnchorElbow = sample.elbowDeg
+            staticPlankAnchorShWr = sample.shAboveWristTl
+        }
     }
 
     private fun extractSample(
@@ -253,7 +360,6 @@ class AutoExerciseDetector(
         val shAboveWristTl = (midWrist.y - midSh.y) / torsoLen
         val wristAboveHipTl = (midHip.y - midWrist.y) / torsoLen
         val ankleAboveHipTl = (midHip.y - midAnkle.y) / torsoLen
-        val ankleAboveShTl = (midSh.y - midAnkle.y) / torsoLen
         val kneeAboveShTl = (midSh.y - midKnee.y) / torsoLen
 
         val footDistTl = dist(lAnkle, rAnkle) / torsoLen
@@ -293,7 +399,7 @@ class AutoExerciseDetector(
             wristAboveShTl = wristAboveShTl,
             shAboveWristTl = shAboveWristTl,
             wristAboveHipTl = wristAboveHipTl,
-            ankleAboveHipTl = ankleAboveShTl,
+            ankleAboveHipTl = ankleAboveHipTl,
             footDistTl = footDistTl,
             ankleYDiffTl = ankleYDiffTl,
             ankleToShoulderRatio = ankleToShoulderRatio,
@@ -506,13 +612,18 @@ class AutoExerciseDetector(
             rampDown(standingRatio, 0.05f, 0.20f)
         )
 
-        // 7. BURPEE: Dynamic standing <-> prone transition with huge vertical excursion
+        // 7. BURPEE: Requires genuine sustained round-trip STANDING <-> PRONE_FLOOR <-> STANDING
+        // (or PRONE <-> STANDING <-> PRONE); 1-way getting down/up onto floor MUST score 0.0f!
         val hasBothPostures = minOf(standingRatio, proneRatio)
-        scores[ExerciseType.BURPEE] = product(
-            rampUp(hasBothPostures, 0.12f, 0.30f),
-            rampUp(bodyTiltS.range, 34f, 60f),
-            rampUp(shAnkS.range, 0.55f, 1.10f)
-        )
+        scores[ExerciseType.BURPEE] = if (hasBurpeeRoundTrip()) {
+            product(
+                rampUp(hasBothPostures, 0.12f, 0.30f),
+                rampUp(bodyTiltS.range, 34f, 60f),
+                rampUp(shAnkS.range, 0.55f, 1.10f)
+            )
+        } else {
+            0f
+        }
 
         // 8. OVERHEAD_PRESS: Standing upright, dynamic elbows pressing wrists high above shoulders, shoulders static
         scores[ExerciseType.OVERHEAD_PRESS] = product(
@@ -590,23 +701,24 @@ class AutoExerciseDetector(
             rampDown(wrShS.mean, -0.10f, 0.12f)
         )
 
-        // 14. GLUTE_BRIDGE: Supine on floor, knees bent, dynamic hip extension
+        // 14. GLUTE_BRIDGE: Supine on floor, knees bent, dynamic hip extension with feet grounded below hips
         scores[ExerciseType.GLUTE_BRIDGE] = product(
             rampUp(supineRatio, 0.45f, 0.80f),
             band(kneeS.mean, 40f, 65f, 118f, 138f),
             rampUp(hipS.range, 18f, 42f),
             rampUp(hipS.max, 140f, 162f),
-            rampDown(ankHipS.range, 0.28f, 0.52f) // feet stay grounded
+            rampDown(ankHipS.max, 0.14f, 0.36f) // feet stay grounded on floor, never lifting high above hips
         )
 
-        // 15. LEG_RAISE: Supine flat on floor, straight legs lifting dynamically
+        // 15. LEG_RAISE: Supine flat on floor, straight legs lifting ankles high above hips dynamically
         scores[ExerciseType.LEG_RAISE] = product(
             rampUp(supineRatio, 0.45f, 0.80f),
             rampUp(torsoS.mean, 56f, 74f),
             rampUp(kneeS.mean, 120f, 148f),
             rampUp(hipS.range, 24f, 55f),
             rampDown(hipS.min, 115f, 142f),
-            rampUp(ankHipS.range, 0.40f, 0.85f) // ankles rise high
+            rampUp(ankHipS.range, 0.40f, 0.85f),
+            rampUp(ankHipS.max, 0.35f, 0.72f)
         )
 
         // 16. LATERAL_RAISE: Standing upright, arms abduct to ~90° with straight elbows, stationary legs
@@ -624,6 +736,45 @@ class AutoExerciseDetector(
         )
 
         return scores
+    }
+
+    /**
+     * Checks whether the temporal buffer contains a genuine sustained round-trip transition
+     * STANDING -> PRONE_FLOOR -> STANDING or PRONE_FLOOR -> STANDING -> PRONE_FLOOR
+     * (ignoring 1-2 frame boundary blips so getting down for push-ups never triggers BURPEE).
+     */
+    private fun hasBurpeeRoundTrip(): Boolean {
+        val segments = ArrayList<Int>(4) // 1 = standing/suspended, 2 = prone
+        var runType = 0
+        var runLen = 0
+
+        fun flushRun() {
+            if (runType != 0 && runLen >= 3) {
+                if (segments.isEmpty() || segments.last() != runType) {
+                    segments.add(runType)
+                }
+            }
+        }
+
+        for (sample in buffer) {
+            val code = when (sample.posture) {
+                BodyPosture.STANDING, BodyPosture.SUSPENDED -> 1
+                BodyPosture.PRONE_FLOOR -> 2
+                else -> 0
+            }
+            if (code == 0) continue
+            if (code == runType) {
+                runLen++
+            } else {
+                flushRun()
+                runType = code
+                runLen = 1
+            }
+        }
+        flushRun()
+
+        // Must have at least 3 alternating sustained phases (e.g. [1, 2, 1] or [2, 1, 2])
+        return segments.size >= 3
     }
 
     private fun postureFamily(ex: ExerciseType): Int = when (ex) {

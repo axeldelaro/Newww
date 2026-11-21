@@ -5,11 +5,14 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.BorderStroke
@@ -39,6 +42,8 @@ import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.LocalFireDepartment
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
@@ -74,6 +79,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kinetix.coach.data.ExerciseType
@@ -159,9 +166,17 @@ fun VisionScreen(
     var showChallengesSheet by remember { mutableStateOf(false) }
     var demoPreviewExercise by remember { mutableStateOf<ExerciseType?>(null) }
 
-    // Ensure offline music stops cleanly if the user switches away from the Vision tab
-    DisposableEffect(Unit) {
+    // Ensure offline music stops cleanly on ON_PAUSE (lock screen / phone call) or tab switch
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                viewModel.pauseBackgroundAudio()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             viewModel.pauseBackgroundAudio()
         }
     }
@@ -188,11 +203,9 @@ fun VisionScreen(
                 viewModel = viewModel
             )
 
-            // Live Skeleton + Angle Badges Overlay
-            SkeletonOverlay(
-                frame = uiState.frame,
-                imageWidth = uiState.imageWidth,
-                imageHeight = uiState.imageHeight,
+            // Isolated full-FPS Skeleton + Angle Badges Overlay (never recomposes HUD)
+            LiveSkeletonOverlayLayer(
+                viewModel = viewModel,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -457,6 +470,42 @@ fun VisionScreen(
                         }
                     }
 
+                    // 1-Tap Quick Lock / Unlock Exercise Padlock (pins AUTO exercise without losing reps)
+                    if (!challengeActive) {
+                        val isLockedFixed = !uiState.isAutoDetectEnabled
+                        val showCompactLock = uiState.frame.poseDetected && !vp.framingWarningFr.isNullOrBlank()
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (isLockedFixed) SignalOrangeDim else ObsidianBg.copy(alpha = 0.90f),
+                            border = BorderStroke(
+                                1.dp,
+                                if (isLockedFixed) SignalOrange else BorderHairline
+                            ),
+                            modifier = Modifier.clickable { viewModel.lockCurrentAutoExercise() }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (isLockedFixed) Icons.Filled.Lock else Icons.Filled.LockOpen,
+                                    contentDescription = if (isLockedFixed) "Déverrouiller AUTO" else "Verrouiller l'exercice",
+                                    tint = if (isLockedFixed) SignalOrange else CrispWhite,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                if (!showCompactLock) {
+                                    Spacer(Modifier.width(3.dp))
+                                    Text(
+                                        text = if (isLockedFixed) "Figé" else "Figer",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isLockedFixed) SignalOrange else CrispWhite,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     // Framing Alert Chip (only appears if body parts are clipped out of frame)
                     val framingWarn = vp.framingWarningFr
                     if (uiState.frame.poseDetected && !framingWarn.isNullOrBlank()) {
@@ -528,6 +577,7 @@ fun VisionScreen(
             ) {
                 PrecisionCorrectionBanner(
                     poseDetected = uiState.frame.poseDetected,
+                    isStabilizing = uiState.frame.isStabilizing,
                     formScore = uiState.frame.formScore,
                     formQuality = uiState.frame.formQuality,
                     topCorrection = uiState.frame.corrections.firstOrNull(),
@@ -939,8 +989,21 @@ fun VisionScreen(
 }
 
 @Composable
+private fun LiveSkeletonOverlayLayer(
+    viewModel: VisionViewModel,
+    modifier: Modifier = Modifier
+) {
+    val overlayState by viewModel.poseOverlayState.collectAsStateWithLifecycle()
+    SkeletonOverlay(
+        overlayState = overlayState,
+        modifier = modifier
+    )
+}
+
+@Composable
 private fun PrecisionCorrectionBanner(
     poseDetected: Boolean,
+    isStabilizing: Boolean,
     formScore: Int,
     formQuality: FormQuality,
     topCorrection: AngleCorrection?,
@@ -948,6 +1011,7 @@ private fun PrecisionCorrectionBanner(
 ) {
     val accentColor = when {
         !poseDetected -> SteelGray
+        isStabilizing -> FormCaution
         topCorrection != null -> when (topCorrection.severity) {
             FormQuality.FAULT -> FormFault
             FormQuality.CAUTION -> FormCaution
@@ -984,7 +1048,16 @@ private fun PrecisionCorrectionBanner(
             Spacer(Modifier.width(9.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                if (poseDetected && topCorrection != null) {
+                if (poseDetected && isStabilizing) {
+                    Text(
+                        text = fallbackMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = FormCaution,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                } else if (poseDetected && topCorrection != null) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1021,7 +1094,7 @@ private fun PrecisionCorrectionBanner(
                     )
                 } else {
                     Text(
-                        text = if (poseDetected && formQuality == FormQuality.GOOD) {
+                        text = if (poseDetected && formQuality == FormQuality.GOOD && fallbackMessage.startsWith("Posture")) {
                             "Alignement optimal · Angles validés"
                         } else {
                             fallbackMessage
@@ -1043,7 +1116,7 @@ private fun PrecisionCorrectionBanner(
                 border = BorderStroke(1.dp, accentColor)
             ) {
                 Text(
-                    text = "$formScore%",
+                    text = if (isStabilizing) "STAB" else "$formScore%",
                     style = MaterialTheme.typography.labelMedium,
                     color = accentColor,
                     fontWeight = FontWeight.Bold,
@@ -1220,7 +1293,7 @@ private fun CameraPoseViewport(
     val previewView = remember {
         PreviewView(context).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         }
     }
 
@@ -1245,7 +1318,17 @@ private fun CameraPoseViewport(
                 it.surfaceProvider = previewView.surfaceProvider
             }
 
+            val resolutionSelector = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(640, 480),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    )
+                )
+                .build()
+
             val analyzer = ImageAnalysis.Builder()
+                .setResolutionSelector(resolutionSelector)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()

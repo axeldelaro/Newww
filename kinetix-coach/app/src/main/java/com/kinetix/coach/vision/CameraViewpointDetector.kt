@@ -57,6 +57,16 @@ object CameraViewpointDetector {
 
     private const val EDGE_MARGIN = 0.025f
 
+    internal data class RawViewpointMeasurement(
+        val azimuthDeg: Float,
+        val is3DActive: Boolean,
+        val dominantSideLeft: Boolean,
+        val dominantSideScore: Float, // negative => LEFT closer/clearer, positive => RIGHT closer/clearer
+        val leftVis: Float,
+        val rightVis: Float,
+        val framingWarningFr: String?
+    )
+
     fun detect(
         screenPoints: List<PosePoint>,
         worldPoints: List<PosePoint> = emptyList()
@@ -65,13 +75,33 @@ object CameraViewpointDetector {
             return ViewpointInfo()
         }
 
+        val raw = measureRaw(screenPoints, worldPoints)
+        val azimuthInt = raw.azimuthDeg.roundToInt()
+        val viewpoint = classifyViewpoint(azimuthInt, raw.dominantSideLeft)
+        val isPureProfile = viewpoint == CameraViewpoint.PROFILE_LEFT || viewpoint == CameraViewpoint.PROFILE_RIGHT
+        val bothSidesVisible = !isPureProfile && raw.leftVis >= 0.45f && raw.rightVis >= 0.45f
+
+        return ViewpointInfo(
+            viewpoint = viewpoint,
+            azimuthDeg = azimuthInt,
+            is3DActive = raw.is3DActive,
+            dominantSideLeft = raw.dominantSideLeft,
+            bothSidesVisible = bothSidesVisible,
+            framingWarningFr = raw.framingWarningFr
+        )
+    }
+
+    internal fun measureRaw(
+        screenPoints: List<PosePoint>,
+        worldPoints: List<PosePoint> = emptyList()
+    ): RawViewpointMeasurement {
         val framing = analyzeFraming(screenPoints)
         val has3D = worldPoints.size >= 29 && hasValid3DDepth(worldPoints)
 
         return if (has3D) {
-            detect3D(screenPoints, worldPoints, framing.warningFr)
+            measure3D(screenPoints, worldPoints, framing.warningFr)
         } else {
-            detect2DFallback(screenPoints, framing.warningFr)
+            measure2DFallback(screenPoints, framing.warningFr)
         }
     }
 
@@ -85,11 +115,11 @@ object CameraViewpointDetector {
         return shSpan3D > 0.05f || hipSpan3D > 0.05f
     }
 
-    private fun detect3D(
+    private fun measure3D(
         screenPoints: List<PosePoint>,
         worldPoints: List<PosePoint>,
         framingWarning: String?
-    ): ViewpointInfo {
+    ): RawViewpointMeasurement {
         val lSh = worldPoints[LEFT_SHOULDER]
         val rSh = worldPoints[RIGHT_SHOULDER]
         val lHip = worldPoints[LEFT_HIP]
@@ -144,7 +174,7 @@ object CameraViewpointDetector {
             (180f - rawYawDeg).coerceIn(90f, 180f)
         } else {
             rawYawDeg.coerceIn(0f, 90f)
-        }.roundToInt()
+        }
 
         // Dominant side = side physically closer to the camera (more negative Z) + visibility tie-breaker
         val leftZ = (lSh.z + lHip.z) * 0.5f
@@ -152,29 +182,28 @@ object CameraViewpointDetector {
         val leftVis = sideVisibility(screenPoints, left = true)
         val rightVis = sideVisibility(screenPoints, left = false)
 
+        val zDiff = leftZ - rightZ
         val dominantSideLeft = when {
-            abs(leftZ - rightZ) > 0.03f -> leftZ < rightZ
+            abs(zDiff) > 0.03f -> leftZ < rightZ
             else -> leftVis >= rightVis
         }
+        val dominantSideScore = zDiff + (rightVis - leftVis) * 0.12f
 
-        val viewpoint = classifyViewpoint(azimuthDeg, dominantSideLeft)
-        val isPureProfile = viewpoint == CameraViewpoint.PROFILE_LEFT || viewpoint == CameraViewpoint.PROFILE_RIGHT
-        val bothSidesVisible = !isPureProfile && leftVis >= 0.45f && rightVis >= 0.45f
-
-        return ViewpointInfo(
-            viewpoint = viewpoint,
+        return RawViewpointMeasurement(
             azimuthDeg = azimuthDeg,
             is3DActive = true,
             dominantSideLeft = dominantSideLeft,
-            bothSidesVisible = bothSidesVisible,
+            dominantSideScore = dominantSideScore,
+            leftVis = leftVis,
+            rightVis = rightVis,
             framingWarningFr = framingWarning
         )
     }
 
-    private fun detect2DFallback(
+    private fun measure2DFallback(
         screenPoints: List<PosePoint>,
         framingWarning: String?
-    ): ViewpointInfo {
+    ): RawViewpointMeasurement {
         val lSh = screenPoints[LEFT_SHOULDER]
         val rSh = screenPoints[RIGHT_SHOULDER]
         val lHip = screenPoints[LEFT_HIP]
@@ -201,7 +230,7 @@ object CameraViewpointDetector {
             (180f - rawYawDeg).coerceIn(90f, 180f)
         } else {
             rawYawDeg.coerceIn(0f, 90f)
-        }.roundToInt()
+        }
 
         val leftVis = sideVisibility(screenPoints, left = true)
         val rightVis = sideVisibility(screenPoints, left = false)
@@ -212,17 +241,15 @@ object CameraViewpointDetector {
             abs(leftZ - rightZ) > 0.03f -> leftZ < rightZ
             else -> true
         }
+        val dominantSideScore = (rightVis - leftVis) + (leftZ - rightZ) * 0.35f
 
-        val viewpoint = classifyViewpoint(azimuthDeg, dominantSideLeft)
-        val isPureProfile = viewpoint == CameraViewpoint.PROFILE_LEFT || viewpoint == CameraViewpoint.PROFILE_RIGHT
-        val bothSidesVisible = !isPureProfile && leftVis >= 0.45f && rightVis >= 0.45f
-
-        return ViewpointInfo(
-            viewpoint = viewpoint,
+        return RawViewpointMeasurement(
             azimuthDeg = azimuthDeg,
             is3DActive = false,
             dominantSideLeft = dominantSideLeft,
-            bothSidesVisible = bothSidesVisible,
+            dominantSideScore = dominantSideScore,
+            leftVis = leftVis,
+            rightVis = rightVis,
             framingWarningFr = framingWarning
         )
     }
@@ -317,3 +344,139 @@ object CameraViewpointDetector {
     private fun sqrtSumSq(dx: Float, dy: Float, dz: Float): Float =
         kotlin.math.sqrt((dx * dx + dy * dy + dz * dz).toDouble()).toFloat()
 }
+
+/**
+ * Stateful hysteresis-stabilized camera viewpoint tracker built on top of [CameraViewpointDetector].
+ * Applies EMA smoothing on continuous azimuth and dominant side score, ±6° Schmitt-trigger
+ * hysteresis on all four viewpoint transition thresholds (25°, 68°, 112°, 155°), and a 4-frame
+ * debounce on [ViewpointInfo.bothSidesVisible] to eliminate boundary chatter.
+ */
+class CameraViewpointTracker(
+    private val emaAlpha: Float = 0.24f,
+    private val hysteresisDeg: Float = 6f,
+    private val bothSidesDebounceFrames: Int = 4
+) {
+    private enum class AzimuthBand {
+        FRONT,
+        OBLIQUE_FRONT,
+        PROFILE,
+        OBLIQUE_BACK,
+        BACK
+    }
+
+    private var initialized: Boolean = false
+    private var smoothedAzimuthDeg: Float = 0f
+    private var smoothedDominantScore: Float = 0f
+    private var currentBand: AzimuthBand = AzimuthBand.FRONT
+    private var currentDominantLeft: Boolean = true
+    private var stableBothSidesVisible: Boolean = true
+    private var pendingBothSidesStreak: Int = 0
+
+    fun reset() {
+        initialized = false
+        smoothedAzimuthDeg = 0f
+        smoothedDominantScore = 0f
+        currentBand = AzimuthBand.FRONT
+        currentDominantLeft = true
+        stableBothSidesVisible = true
+        pendingBothSidesStreak = 0
+    }
+
+    fun update(
+        screenPoints: List<PosePoint>,
+        worldPoints: List<PosePoint> = emptyList()
+    ): ViewpointInfo {
+        if (screenPoints.size < 29) {
+            return ViewpointInfo()
+        }
+        val raw = CameraViewpointDetector.measureRaw(screenPoints, worldPoints)
+        return updateFromMeasurement(raw)
+    }
+
+    internal fun updateFromMeasurement(raw: CameraViewpointDetector.RawViewpointMeasurement): ViewpointInfo {
+        if (!initialized) {
+            initialized = true
+            smoothedAzimuthDeg = raw.azimuthDeg
+            smoothedDominantScore = raw.dominantSideScore
+            currentBand = nominalBand(raw.azimuthDeg)
+            currentDominantLeft = raw.dominantSideLeft
+            val isPureProfile = currentBand == AzimuthBand.PROFILE
+            stableBothSidesVisible = !isPureProfile && raw.leftVis >= 0.45f && raw.rightVis >= 0.45f
+            pendingBothSidesStreak = 0
+        } else {
+            val inv = 1f - emaAlpha
+            smoothedAzimuthDeg = (emaAlpha * raw.azimuthDeg + inv * smoothedAzimuthDeg).coerceIn(0f, 180f)
+            smoothedDominantScore = emaAlpha * raw.dominantSideScore + inv * smoothedDominantScore
+
+            currentBand = nextBandWithHysteresis(currentBand, smoothedAzimuthDeg)
+
+            // Dominant side hysteresis: negative => LEFT dominant, positive => RIGHT dominant
+            if (currentDominantLeft && smoothedDominantScore > 0.02f) {
+                currentDominantLeft = false
+            } else if (!currentDominantLeft && smoothedDominantScore < -0.02f) {
+                currentDominantLeft = true
+            }
+
+            val isPureProfile = currentBand == AzimuthBand.PROFILE
+            val rawBoth = !isPureProfile && raw.leftVis >= 0.45f && raw.rightVis >= 0.45f
+            if (rawBoth == stableBothSidesVisible) {
+                pendingBothSidesStreak = 0
+            } else {
+                pendingBothSidesStreak++
+                if (pendingBothSidesStreak >= bothSidesDebounceFrames) {
+                    stableBothSidesVisible = rawBoth
+                    pendingBothSidesStreak = 0
+                }
+            }
+        }
+
+        val viewpoint = when (currentBand) {
+            AzimuthBand.FRONT -> CameraViewpoint.FRONT
+            AzimuthBand.BACK -> CameraViewpoint.BACK
+            AzimuthBand.PROFILE -> if (currentDominantLeft) CameraViewpoint.PROFILE_LEFT else CameraViewpoint.PROFILE_RIGHT
+            AzimuthBand.OBLIQUE_FRONT, AzimuthBand.OBLIQUE_BACK ->
+                if (currentDominantLeft) CameraViewpoint.OBLIQUE_LEFT else CameraViewpoint.OBLIQUE_RIGHT
+        }
+
+        return ViewpointInfo(
+            viewpoint = viewpoint,
+            azimuthDeg = smoothedAzimuthDeg.roundToInt(),
+            is3DActive = raw.is3DActive,
+            dominantSideLeft = currentDominantLeft,
+            bothSidesVisible = stableBothSidesVisible,
+            framingWarningFr = raw.framingWarningFr
+        )
+    }
+
+    private fun nominalBand(az: Float): AzimuthBand = when {
+        az <= 25f -> AzimuthBand.FRONT
+        az < 68f -> AzimuthBand.OBLIQUE_FRONT
+        az <= 112f -> AzimuthBand.PROFILE
+        az < 155f -> AzimuthBand.OBLIQUE_BACK
+        else -> AzimuthBand.BACK
+    }
+
+    private fun nextBandWithHysteresis(current: AzimuthBand, az: Float): AzimuthBand {
+        val h = hysteresisDeg
+        return when (current) {
+            AzimuthBand.FRONT -> if (az > 25f + h) nominalBand(az) else AzimuthBand.FRONT
+            AzimuthBand.OBLIQUE_FRONT -> when {
+                az < 25f - h -> AzimuthBand.FRONT
+                az > 68f + h -> nominalBand(az)
+                else -> AzimuthBand.OBLIQUE_FRONT
+            }
+            AzimuthBand.PROFILE -> when {
+                az < 68f - h -> nominalBand(az)
+                az > 112f + h -> nominalBand(az)
+                else -> AzimuthBand.PROFILE
+            }
+            AzimuthBand.OBLIQUE_BACK -> when {
+                az < 112f - h -> nominalBand(az)
+                az > 155f + h -> AzimuthBand.BACK
+                else -> AzimuthBand.OBLIQUE_BACK
+            }
+            AzimuthBand.BACK -> if (az < 155f - h) nominalBand(az) else AzimuthBand.BACK
+        }
+    }
+}
+

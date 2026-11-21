@@ -148,7 +148,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
-          TAG="${TAG:-v2.1.0}"
+          TAG="${TAG:-v2.2.0}"
           APK_K="/tmp/release-apks/Kinetix-Coach-${TAG}-arm64.apk"
           APK_A="/tmp/release-apks/AstroPro-14U-${TAG}-arm64.apk"
           ls -lh /tmp/release-apks/
@@ -157,17 +157,17 @@ jobs:
           cat > /tmp/release-notes.md <<EOF
           ## 2 Applications Android 100 % Hors-Ligne Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
-          ### 1. KINETIX Coach v1.3.0 (\`Kinetix-Coach-${TAG}-arm64.apk\`)
-          - **Pompes multi-signaux (6 variantes auto-détectées) & audit complet des 16 exercices** : fusion de la flexion du bras actif et de la descente verticale épaules/poitrine vers les mains pour compter sans faille les pompes **Classiques, Larges, Diamant, Genoux, Piquées et Archer**, plus seuils assouplis et mode **\`Adaptatif\` / \`Strict (Compétition)\`** sur les 16 exercices (curls alternés, rowing unilatéral, tractions prise large, planche face/latérale/haute, squats parallèles, jumping jacks de profil…).
-          - **7 Défis interactifs validés par la caméra + Records personnels (SQLite v3)** : **Pompes « Bip & Go »** (tempo 2s/3s/4s), **Test Luc Léger** (12 paliers progressifs), **Gainage Chrono Musical**, **Défi 25 / 50 / 100 Reps**, **AMRAP Chrono**, **Tabata 20s/10s × 8 tours** et **EMOM**.
-          - **Moteur Audio & Musique 100 % hors-ligne** : 6 bips de cadence nets + **4 musiques rythmées synthétisées en temps réel** (\`Pulse 128 BPM\`, \`Focus 110 BPM\`, \`HIIT 142 BPM\`, \`Respiration 60 BPM\`) + **import de ta propre musique (MP3 / M4A / WAV / OGG)** depuis le téléphone pour le gainage et les défis.
-          - **Vision 3D Multi-Angles (\`worldLandmarks\` + One-Euro)** : détection auto des 16 exercices (\`AUTO\`/\`FIXE\`), calories personnalisées sur le profil, corrections visuelles/vocales au degré près, **42 vidéos biomécaniques MP4** (100 % des 911 exercices), **LLM local \`Gemma-3 1B Q4_K_M\`** + **2 683 fiches SQLite FTS5**.
+          ### 1. KINETIX Coach v2.0.0 (\`Kinetix-Coach-${TAG}-arm64.apk\`)
+          - **Moteur Anti-Glitch de Détection & Stabilité Pro (45/45 tests)** :
+            - **Filtre physique anti-téléportation & maintien sur occlusion (\`PoseSanityFilter\`)** + garde automatique de déplacement / repositionnement (*« Stabilisation… »*) bloquant les fausses répétitions et faux changements d'exercice quand tu marches ou touches le téléphone.
+            - **Auto-détection d'exercice blindée (\`AutoExerciseDetector\`)** : fin des faux *Burpees* en t'allongeant/te relevant (cycle complet aller-retour exigé), fin du clignotement *Pompes ↔ Planche* pendant une pause en haut (délai \`3,2 s\` immobile requis), verrouillage asymétrique en série active, cooldown \`2,8 s\`, changement fluide sans saut du squelette + **cadenas 1-tap** pour épingler instantanément l'exercice détecté.
+            - **Hystérésis \`±6°\` sur l'angle caméra (\`CameraViewpointTracker\`)**, garde physique de posture (impossible de compter des pompes debout ou des squats allongé), et garde de durée minimale de répétition (\`≥ 360 ms\`).
+          - **Optimisation Pro 60 FPS & Ergonomie** : \`ImageAnalysis\` ciblé \`640×480\`, \`PreviewView\` matériel \`PERFORMANCE\`, tampon Bitmap réutilisable **zéro GC**, garde backpressure, correction du miroir caméra frontale (repères 3D anatomiques vrais), synchronisation thread-safe (\`pipelineLock\`), flux squelette isolé haute fréquence, **\`FLAG_KEEP_SCREEN_ON\`** automatique en Vision et pause audio propre sur \`ON_PAUSE\`.
+          - **Tout l'écosystème inclus** : Pompes 6 variantes + audit 16 exos (\`Adaptatif\`/\`Strict\`), **7 Défis caméra** (*Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM*) + 4 musiques synthétisées + **import MP3 local**, calories personnalisées, **42 vidéos biomécaniques MP4**, **LLM local \`Gemma-3 1B Q4_K_M\`** + **2 683 fiches SQLite FTS5**.
           - **SHA-256** : \`$SHA_K\`
 
           ### 2. AstroPro 14U v2.0.0 (\`AstroPro-14U-${TAG}-arm64.apk\`)
-          - **#1 Auto-Focus Étoiles (Courbe en V) + Infini mémorisé par objectif** (\`12 / 23 / 75 / 120 mm\`).
-          - **#2 AR Sky Overlay sur le viseur (toggle \`AR\`)** : Voie Lactée, Polaris et 12 cibles majeures projetées selon le \`FOV\` réel + flèche de guidage (100 % Vision Nocturne OLED rouge).
-          - **#3 Paysage + Ciel Séparé 100 % Automatique** + **#4 Mode HDR Astro (\`3 EV / 5 EV\`)** + **#6 Super-Résolution Drizzle 2×** + **#9 Déconvolution Richardson-Lucy & Anti-Aberration Chromatique automatiques** + **#11 Garde Anti-Vibration / Coup de Vent** + **Pipeline Post-Capture Zéro Effort** (JPEG HD prêt dans \`DCIM/AstroPro14U\` + master 32-bit \`.astro32\`).
+          - **Auto-Focus Étoiles (Courbe en V)** + infini mémorisé par objectif (\`12 / 23 / 75 / 120 mm\`), **AR Sky Overlay** (toggle \`AR\`), **Paysage + Ciel Séparé 100 % Auto**, **Mode HDR Astro (\`3 EV / 5 EV\`)**, **Drizzle 2×**, **Déconvolution Richardson-Lucy & Anti-Aberration Chromatique automatiques**, **Garde Anti-Vibration / Vent** et **Pipeline Post-Capture Zéro Effort**.
           - **SHA-256** : \`$SHA_A\`
           EOF
           gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
@@ -175,5 +175,5 @@ jobs:
             "$APK_K" \
             "$APK_A" \
             --repo "${{ github.repository }}" \
-            --title "${TAG} — KINETIX Coach v1.3 (Pompes 6 variantes, Audit 16 exos, 7 Défis Bip&Go/Musique) & AstroPro 14U v2.0" \
+            --title "${TAG} — KINETIX Coach v2.0 Pro (Détection Anti-Glitch & 60 FPS) & AstroPro 14U v2.0" \
             --notes-file /tmp/release-notes.md
