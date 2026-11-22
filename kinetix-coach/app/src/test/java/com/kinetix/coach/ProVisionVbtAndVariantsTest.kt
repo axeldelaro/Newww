@@ -1033,4 +1033,191 @@ class ProVisionVbtAndVariantsTest {
             engine.emptyFrame().repCount
         )
     }
+
+    // -------------------------------------------------------------------------
+    // 9. REAL-WORLD PULL-UP LIFECYCLE (GRAB BAR + 3 REPS + DROP & WALK AWAY LOWERING ARMS)
+    //    & CROSS-EXERCISE WALKING / GESTURE FALSE-REP IMMUNITY
+    // -------------------------------------------------------------------------
+
+    private fun buildPullupOrReach3D(
+        wristY: Float,
+        shoulderY: Float,
+        elbowDeg: Float,
+        wristXHalf: Float = 0.28f
+    ): List<PosePoint> {
+        val pts = blank3D()
+        val shW = 0.19f
+        val hipY = shoulderY + 0.50f
+        val kneeY = hipY + 0.42f
+        val ankleY = kneeY + 0.42f
+
+        val lSh = PosePoint(+shW, shoulderY, 0f, 1f)
+        val rSh = PosePoint(-shW, shoulderY, 0f, 1f)
+        val lWr = PosePoint(+wristXHalf, wristY, -0.02f, 1f)
+        val rWr = PosePoint(-wristXHalf, wristY, -0.02f, 1f)
+
+        // Exact triangle placing elbow so angle(shoulder, elbow, wrist) == elbowDeg
+        val rad = (elbowDeg.coerceIn(50f, 178f) * 0.5) * PI / 180.0
+        val dx = lWr.x - lSh.x
+        val dy = lWr.y - lSh.y
+        val chord = sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(0.06f)
+        val perpOut = ((chord * 0.5f) / tan(rad).toFloat()).coerceIn(0.01f, 0.30f)
+
+        val lEl = PosePoint((lSh.x + lWr.x) * 0.5f + perpOut, (lSh.y + lWr.y) * 0.5f + 0.04f, -0.04f, 1f)
+        val rEl = PosePoint((rSh.x + rWr.x) * 0.5f - perpOut, (rSh.y + rWr.y) * 0.5f + 0.04f, -0.04f, 1f)
+
+        pts[BiomechanicsEngine.NOSE] = PosePoint(0f, shoulderY - 0.16f, -0.06f, 1f)
+        pts[BiomechanicsEngine.LEFT_SHOULDER] = lSh
+        pts[BiomechanicsEngine.RIGHT_SHOULDER] = rSh
+        pts[BiomechanicsEngine.LEFT_ELBOW] = lEl
+        pts[BiomechanicsEngine.RIGHT_ELBOW] = rEl
+        pts[BiomechanicsEngine.LEFT_WRIST] = lWr
+        pts[BiomechanicsEngine.RIGHT_WRIST] = rWr
+        pts[BiomechanicsEngine.LEFT_HIP] = PosePoint(+0.13f, hipY, 0f, 1f)
+        pts[BiomechanicsEngine.RIGHT_HIP] = PosePoint(-0.13f, hipY, 0f, 1f)
+        pts[BiomechanicsEngine.LEFT_KNEE] = PosePoint(+0.13f, kneeY, 0.02f, 1f)
+        pts[BiomechanicsEngine.RIGHT_KNEE] = PosePoint(-0.13f, kneeY, 0.02f, 1f)
+        pts[BiomechanicsEngine.LEFT_ANKLE] = PosePoint(+0.13f, ankleY, 0.04f, 1f)
+        pts[BiomechanicsEngine.RIGHT_ANKLE] = PosePoint(-0.13f, ankleY, 0.04f, 1f)
+        return pts
+    }
+
+    @Test
+    fun pullupRealWorldFullLifecycle_blocksGrabBarAndWalkAwayLoweringArms_countsOnlyRealReps() {
+        val engine = BiomechanicsEngine(ExerciseType.PULL_UP)
+        var ts = 1000L
+
+        val standShY = -0.35f
+        val barY = -0.88f
+
+        // PHASE 1: Athlete stands under bar with arms down, reaches UP bending elbows past face (78°),
+        // then straightens arms overhead (166°) to grab the pull-up bar -> MUST count 0 fake reps!
+        for (i in 0 until 32) {
+            ts += 33L
+            val t = i / 31f
+            val wrY = (standShY + 0.45f) + (barY - (standShY + 0.45f)) * t
+            val elbowDeg = 166f - 88f * sin(PI * t).toFloat() // 166° -> 78° mid-reach -> 166° grabbing bar
+            val (s, w) = rotateAndProject(buildPullupOrReach3D(wristY = wrY, shoulderY = standShY, elbowDeg = elbowDeg), yawDeg = 20f)
+            engine.processFrame(s, w, ts)
+        }
+        assertEquals("Reaching up to grab the pull-up bar must NEVER count a fake rep", 0, engine.emptyFrame().repCount)
+
+        // PHASE 2: Settle briefly in dead hang (~0.65s = 20 frames) then perform 3 genuine pull-ups
+        // (wrists FIXED at barY, shoulders physically rising UP 0.34 m toward the bar!)
+        repeat(20) {
+            ts += 33L
+            val (s, w) = rotateAndProject(buildPullupOrReach3D(wristY = barY, shoulderY = standShY, elbowDeg = 164f), yawDeg = 20f)
+            engine.processFrame(s, w, ts)
+        }
+        assertEquals("Hanging still before pulling must still be 0", 0, engine.emptyFrame().repCount)
+
+        repeat(3) {
+            for (i in 0 until 40) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 39.0))).toFloat()
+                val shY = standShY - p * 0.36f // shoulders rise UP toward fixed barY!
+                val elbowDeg = 164f - p * 98f  // 164° -> 66° -> 164°
+                val (s, w) = rotateAndProject(buildPullupOrReach3D(wristY = barY, shoulderY = shY, elbowDeg = elbowDeg), yawDeg = 20f)
+                engine.processFrame(s, w, ts)
+            }
+        }
+        assertEquals("All 3 genuine pull-ups must count cleanly", 3, engine.emptyFrame().repCount)
+
+        // PHASE 3: Athlete drops off bar & lowers arms in place (bending elbows past face 164° -> 76° -> 166° at hips)
+        // -> MUST stay at 3 (ZERO phantom rep from lowering arms!)
+        for (i in 0 until 32) {
+            ts += 33L
+            val t = i / 31f
+            val wrY = barY + ((standShY + 0.48f) - barY) * t
+            val elbowDeg = 164f - 88f * sin(PI * t).toFloat()
+            val (s, w) = rotateAndProject(buildPullupOrReach3D(wristY = wrY, shoulderY = standShY, elbowDeg = elbowDeg), yawDeg = 20f)
+            engine.processFrame(s, w, ts)
+        }
+        assertEquals("Lowering arms after dropping off bar must NEVER count a phantom rep", 3, engine.emptyFrame().repCount)
+
+        // PHASE 4: Athlete walks casually laterally across frame while swinging/lowering arms -> STILL 3!
+        for (i in 0 until 30) {
+            ts += 33L
+            val t = i / 29f
+            val shiftX = t * 0.25f // casual walk across frame
+            val elbowDeg = 162f - 80f * sin(PI * t).toFloat()
+            val (rawS, w) = rotateAndProject(buildPullupOrReach3D(wristY = standShY + 0.32f, shoulderY = standShY, elbowDeg = elbowDeg), yawDeg = 20f)
+            val walkedS = rawS.map { it.copy(x = it.x + shiftX) }
+            engine.processFrame(walkedS, w, ts)
+        }
+        assertEquals("Walking away after pull-ups must NEVER count a phantom rep", 3, engine.emptyFrame().repCount)
+    }
+
+    @Test
+    fun antiFalseRepCrossExerciseWalkingAndGestures_blocksPhantomRepsAcrossUpperAndLowerBody() {
+        val standShY = -0.35f
+
+        // A. BENT_ROW: Standing completely upright (5° tilt) bending/straightening arms (checking phone) -> 0 fake rows!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.BENT_ROW)
+            var ts = 1000L
+            repeat(2) {
+                for (i in 0 until 32) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 31.0))).toFloat()
+                    val (s, w) = rotateAndProject(
+                        buildPullupOrReach3D(wristY = standShY + 0.35f - p * 0.20f, shoulderY = standShY, elbowDeg = 162f - p * 85f),
+                        yawDeg = 35f
+                    )
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("Standing upright bending elbows must count 0 fake Bent Rows", 0, engine.emptyFrame().repCount)
+        }
+
+        // B. TRICEP_DIP: Walking casually across frame while bending arms -> 0 fake dips!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.TRICEP_DIP)
+            var ts = 1000L
+            for (i in 0 until 36) {
+                ts += 33L
+                val t = i / 35f
+                val p = (0.5f - 0.5f * cos(2.0 * PI * t)).toFloat()
+                val (rawS, w) = rotateAndProject(
+                    buildPullupOrReach3D(wristY = standShY + 0.30f - p * 0.14f, shoulderY = standShY, elbowDeg = 164f - p * 78f),
+                    yawDeg = 35f
+                )
+                val walkedS = rawS.map { it.copy(x = it.x + t * 0.24f) }
+                engine.processFrame(walkedS, w, ts)
+            }
+            assertEquals("Walking while bending arms must count 0 fake Tricep Dips", 0, engine.emptyFrame().repCount)
+        }
+
+        // C. BICEP_CURL: Reaching arms overhead to grab a pull-up bar -> 0 fake curls!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.BICEP_CURL)
+            var ts = 1000L
+            for (i in 0 until 36) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val (s, w) = rotateAndProject(
+                    buildPullupOrReach3D(wristY = -0.85f, shoulderY = standShY, elbowDeg = 160f - p * 95f),
+                    yawDeg = 35f
+                )
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Bending arms overhead on a bar must count 0 fake Bicep Curls", 0, engine.emptyFrame().repCount)
+        }
+
+        // D. OVERHEAD_PRESS: Arms dangling low near hips bending/straightening -> 0 fake OHP!
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.OVERHEAD_PRESS)
+            var ts = 1000L
+            for (i in 0 until 36) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val (s, w) = rotateAndProject(
+                    buildPullupOrReach3D(wristY = standShY + 0.44f, shoulderY = standShY, elbowDeg = 90f + p * 75f),
+                    yawDeg = 25f
+                )
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Hands dangling near hips must count 0 fake Overhead Presses", 0, engine.emptyFrame().repCount)
+        }
+    }
 }

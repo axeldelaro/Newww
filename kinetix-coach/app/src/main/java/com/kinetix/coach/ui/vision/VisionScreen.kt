@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
@@ -286,12 +287,17 @@ fun VisionScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // Single Sleek Exercise + Variant Glass Pill
-                    val detectedVariant = if (uiState.frame.poseDetected && !uiState.isSettingUp && !uiState.isResting) {
+                    val detectedVariant = if (uiState.isTrackingStarted &&
+                        uiState.frame.poseDetected &&
+                        !uiState.isSettingUp &&
+                        !uiState.isResting
+                    ) {
                         uiState.frame.detectedVariantFr
                     } else null
                     val statusDotColor = when {
                         uiState.isSettingUp || uiState.frame.isStabilizing -> FormCaution
                         uiState.isResting -> SignalOrange
+                        uiState.isIdlePreview -> if (uiState.frame.poseDetected) FormGood.copy(alpha = 0.85f) else SteelGray
                         uiState.frame.poseDetected -> FormGood
                         else -> SteelGray
                     }
@@ -403,18 +409,19 @@ fun VisionScreen(
                 }
             }
 
-            // 4. Giant Centered Minimalist Setup Countdown (readable from 3 meters, zero bulky panels!)
+            // 4. Giant Centered Minimalist Setup Countdown (ONLY after user taps Démarrer!)
             if (uiState.isSettingUp && !uiState.isResting && uiState.activeChallenge == null) {
                 SetupCenterCountdown(
                     remainingSec = uiState.setupRemainingSec,
                     totalSec = maxOf(uiState.setupDelaySec, uiState.setupRemainingSec),
                     onAdd5s = { viewModel.addSetupSeconds(5) },
                     onStartNow = { viewModel.skipSetupCountdown() },
+                    onCancel = { viewModel.cancelSetupCountdown() },
                     modifier = Modifier.align(Alignment.Center)
                 )
             }
 
-            // 5. Minimalist Floating Bottom Dock (Conditional Toast + Sleek Glass Counter / VBT / Actions)
+            // 5. Minimalist Floating Bottom Dock
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -423,16 +430,21 @@ fun VisionScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Conditional Minimal Coach Toast: COMPLETELY HIDDEN during clean reps!
+                // Conditional Minimal Coach Toast: COMPLETELY HIDDEN in IDLE preview AND during clean reps!
                 val topCorrection = uiState.frame.corrections.firstOrNull()
                 val framingWarn = if (uiState.frame.poseDetected) uiState.viewpointInfo.framingWarningFr else null
-                val postureGateHint = if (uiState.frame.poseDetected &&
+                val postureGateHint = if (uiState.isTrackingStarted &&
+                    uiState.frame.poseDetected &&
                     !uiState.isSettingUp &&
                     !uiState.isResting &&
                     (uiState.frame.feedbackFr.startsWith("Mettez-vous") ||
                         uiState.frame.feedbackFr.startsWith("Allongez-vous") ||
                         uiState.frame.feedbackFr.startsWith("Redressez-vous") ||
                         uiState.frame.feedbackFr.startsWith("Saisissez") ||
+                        uiState.frame.feedbackFr.startsWith("Suspendez-vous") ||
+                        uiState.frame.feedbackFr.startsWith("Placez les mains") ||
+                        uiState.frame.feedbackFr.startsWith("Penchez le buste") ||
+                        uiState.frame.feedbackFr.startsWith("Prenez appui") ||
                         uiState.frame.feedbackFr.startsWith("Position détectée"))
                 ) {
                     uiState.frame.feedbackFr
@@ -440,7 +452,7 @@ fun VisionScreen(
 
                 val toastData: Pair<String, Color>? = when {
                     uiState.errorMessage != null -> uiState.errorMessage!! to FormFault
-                    uiState.isSettingUp || uiState.isResting -> null
+                    uiState.isIdlePreview || uiState.isSettingUp || uiState.isResting -> null
                     uiState.frame.isStabilizing -> "Stabilisation…" to FormCaution
                     topCorrection != null -> {
                         val c = when (topCorrection.severity) {
@@ -466,168 +478,242 @@ fun VisionScreen(
                     }
                 }
 
-                // Optional Tap-to-Expand Live VBT Sparkline Strip (hidden by default to keep HUD ultra-clean!)
-                val vbt = uiState.frame.velocityTelemetry
-                AnimatedVisibility(
-                    visible = showExpandedVbt && !uiState.selectedExercise.isIsometric && vbt.isSupported && !uiState.isSettingUp,
-                    enter = fadeIn(),
-                    exit = fadeOut()
-                ) {
+                if (uiState.isIdlePreview) {
+                    // IDLE PREVIEW DOCK: Calm framing preview + 1-tap delay chip + unmistakable "Démarrer" CTA
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = ObsidianBg.copy(alpha = 0.80f),
-                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.10f))
+                        shape = RoundedCornerShape(22.dp),
+                        color = ObsidianBg.copy(alpha = 0.78f),
+                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.12f))
                     ) {
-                        Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                            VelocityTelemetryStrip(
-                                vbt = vbt,
-                                currentReps = uiState.frame.repCount
-                            )
-                        }
-                    }
-                }
-
-                // Main Compact Floating Glass Dock
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(22.dp),
-                    color = ObsidianBg.copy(alpha = 0.78f),
-                    border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.12f))
-                ) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        // Ultra-thin 3dp ROM progress line seamlessly integrated at the top edge of the dock
-                        LinearProgressIndicator(
-                            progress = { if (uiState.isSettingUp || uiState.isResting) 0f else smoothRom },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(3.dp),
-                            color = if (uiState.frame.romPct >= 80) FormGood else SignalOrange,
-                            trackColor = CrispWhite.copy(alpha = 0.08f)
-                        )
-
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            // LEFT: Giant Crisp Tabular Counter (readable from 2.5m!)
-                            Column {
-                                val primaryValue = if (uiState.selectedExercise.isIsometric) {
-                                    String.format(Locale.US, "%.1fs", uiState.frame.isometricHoldSec)
-                                } else {
-                                    uiState.frame.repCount.toString()
+                            // 1-tap Installation Delay Chip (Off / 5s / 8s / 10s)
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = CrispWhite.copy(alpha = 0.08f),
+                                border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.14f)),
+                                modifier = Modifier.clickable { viewModel.cycleSetupDelay() }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Timer,
+                                        contentDescription = "Délai d'installation",
+                                        tint = if (uiState.setupDelaySec > 0) FormCaution else SteelGray,
+                                        modifier = Modifier.size(17.dp)
+                                    )
+                                    Text(
+                                        text = if (uiState.setupDelaySec == 0) "0s" else "${uiState.setupDelaySec}s",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = CrispWhite,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
                                 }
-                                Text(
-                                    text = primaryValue,
-                                    fontSize = 44.sp,
-                                    lineHeight = 46.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = CrispWhite,
-                                    modifier = Modifier.scale(repScale)
-                                )
-                                val subMetric = if (uiState.currentSetNumber > 1 && !uiState.selectedExercise.isIsometric) {
-                                    "Série ${uiState.currentSetNumber} · ${uiState.sessionTotalReps + uiState.frame.repCount} tot."
-                                } else {
-                                    "Série ${uiState.currentSetNumber}"
-                                }
-                                Text(
-                                    text = subMetric,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = SteelGray
-                                )
                             }
 
-                            // CENTER: Minimalist 2-Line VBT Pill (Speed + Estimated Max Reps; tap to expand graph)
-                            if (!uiState.selectedExercise.isIsometric && vbt.isSupported) {
-                                val zoneColor = fatigueZoneColor(vbt.fatigueZone)
-                                val displaySpeed = if (vbt.lastRepVelocityMps > 0.01f) vbt.lastRepVelocityMps else vbt.currentLiveVelocityMps
-                                val speedStr = if (displaySpeed > 0.01f) {
-                                    String.format(Locale.US, "%.2f m/s", displaySpeed)
-                                } else {
-                                    "— m/s"
+                            // Primary Explicit Start Button ("Démarrer") — NEVER starts on its own!
+                            Surface(
+                                shape = RoundedCornerShape(15.dp),
+                                color = SignalOrange,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { viewModel.startWorkoutSet() }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 13.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = null,
+                                        tint = CrispWhite,
+                                        modifier = Modifier.size(21.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = "Démarrer",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = CrispWhite,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
-                                val maxStr = when {
-                                    vbt.estimatedMaxReps != null -> "MAX ~${vbt.estimatedMaxReps}"
-                                    uiState.frame.repCount > 0 -> "Calib. ${uiState.frame.repCount}/3"
-                                    vbt.estimatedFreshMaxReps != null -> "Réf. ~${vbt.estimatedFreshMaxReps}"
-                                    else -> "Vitesse"
+                            }
+                        }
+                    }
+                } else if (!uiState.isSettingUp) {
+                    // Optional Tap-to-Expand Live VBT Sparkline Strip (hidden by default to keep HUD ultra-clean!)
+                    val vbt = uiState.frame.velocityTelemetry
+                    AnimatedVisibility(
+                        visible = showExpandedVbt && !uiState.selectedExercise.isIsometric && vbt.isSupported,
+                        enter = fadeIn(),
+                        exit = fadeOut()
+                    ) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            color = ObsidianBg.copy(alpha = 0.80f),
+                            border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.10f))
+                        ) {
+                            Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                VelocityTelemetryStrip(
+                                    vbt = vbt,
+                                    currentReps = uiState.frame.repCount
+                                )
+                            }
+                        }
+                    }
+
+                    // Main Compact Floating Glass Active Dock
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(22.dp),
+                        color = ObsidianBg.copy(alpha = 0.78f),
+                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.12f))
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            // Ultra-thin 3dp ROM progress line seamlessly integrated at the top edge of the dock
+                            LinearProgressIndicator(
+                                progress = { if (uiState.isResting) 0f else smoothRom },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(3.dp),
+                                color = if (uiState.frame.romPct >= 80) FormGood else SignalOrange,
+                                trackColor = CrispWhite.copy(alpha = 0.08f)
+                            )
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                // LEFT: Giant Crisp Tabular Counter (readable from 2.5m!)
+                                Column {
+                                    val primaryValue = if (uiState.selectedExercise.isIsometric) {
+                                        String.format(Locale.US, "%.1fs", uiState.frame.isometricHoldSec)
+                                    } else {
+                                        uiState.frame.repCount.toString()
+                                    }
+                                    Text(
+                                        text = primaryValue,
+                                        fontSize = 44.sp,
+                                        lineHeight = 46.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = CrispWhite,
+                                        modifier = Modifier.scale(repScale)
+                                    )
+                                    val subMetric = if (uiState.currentSetNumber > 1 && !uiState.selectedExercise.isIsometric) {
+                                        "Série ${uiState.currentSetNumber} · ${uiState.sessionTotalReps + uiState.frame.repCount} tot."
+                                    } else {
+                                        "Série ${uiState.currentSetNumber}"
+                                    }
+                                    Text(
+                                        text = subMetric,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SteelGray
+                                    )
                                 }
 
-                                Surface(
-                                    shape = RoundedCornerShape(14.dp),
-                                    color = CrispWhite.copy(alpha = 0.06f),
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (vbt.estimatedMaxReps != null) zoneColor.copy(alpha = 0.55f) else CrispWhite.copy(alpha = 0.08f)
-                                    ),
-                                    modifier = Modifier.clickable { showExpandedVbt = !showExpandedVbt }
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
+                                // CENTER: Minimalist 2-Line VBT Pill (Speed + Estimated Max Reps; tap to expand graph)
+                                if (!uiState.selectedExercise.isIsometric && vbt.isSupported) {
+                                    val zoneColor = fatigueZoneColor(vbt.fatigueZone)
+                                    val displaySpeed = if (vbt.lastRepVelocityMps > 0.01f) vbt.lastRepVelocityMps else vbt.currentLiveVelocityMps
+                                    val speedStr = if (displaySpeed > 0.01f) {
+                                        String.format(Locale.US, "%.2f m/s", displaySpeed)
+                                    } else {
+                                        "— m/s"
+                                    }
+                                    val maxStr = when {
+                                        vbt.estimatedMaxReps != null -> "MAX ~${vbt.estimatedMaxReps}"
+                                        uiState.frame.repCount > 0 -> "Calib. ${uiState.frame.repCount}/3"
+                                        vbt.estimatedFreshMaxReps != null -> "Réf. ~${vbt.estimatedFreshMaxReps}"
+                                        else -> "Vitesse"
+                                    }
+
+                                    Surface(
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = CrispWhite.copy(alpha = 0.06f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (vbt.estimatedMaxReps != null) zoneColor.copy(alpha = 0.55f) else CrispWhite.copy(alpha = 0.08f)
+                                        ),
+                                        modifier = Modifier.clickable { showExpandedVbt = !showExpandedVbt }
                                     ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                        Column(
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
                                         ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(7.dp)
-                                                    .clip(CircleShape)
-                                                    .background(zoneColor)
-                                            )
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(7.dp)
+                                                        .clip(CircleShape)
+                                                        .background(zoneColor)
+                                                )
+                                                Text(
+                                                    text = speedStr,
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                    color = CrispWhite,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                            Spacer(Modifier.height(1.dp))
                                             Text(
-                                                text = speedStr,
-                                                style = MaterialTheme.typography.labelLarge,
-                                                color = CrispWhite,
-                                                fontWeight = FontWeight.Bold
+                                                text = maxStr,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (vbt.estimatedMaxReps != null) zoneColor else SteelGray,
+                                                fontWeight = FontWeight.SemiBold
                                             )
                                         }
-                                        Spacer(Modifier.height(1.dp))
-                                        Text(
-                                            text = maxStr,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (vbt.estimatedMaxReps != null) zoneColor else SteelGray,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
                                     }
                                 }
-                            }
 
-                            // RIGHT: Just 2 Crisp Action Pills ("Repos" & "Fin")
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Surface(
-                                    shape = RoundedCornerShape(13.dp),
-                                    color = CrispWhite.copy(alpha = 0.09f),
-                                    border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.16f)),
-                                    modifier = Modifier.clickable { viewModel.completeSetAndStartRest() }
+                                // RIGHT: Just 2 Crisp Action Pills ("Repos" & "Fin")
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        text = "Repos",
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = CrispWhite,
-                                        fontWeight = FontWeight.SemiBold,
-                                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp)
-                                    )
-                                }
-                                Surface(
-                                    shape = RoundedCornerShape(13.dp),
-                                    color = SignalOrange,
-                                    modifier = Modifier.clickable { viewModel.finishSession() }
-                                ) {
-                                    Text(
-                                        text = "Fin",
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = CrispWhite,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)
-                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(13.dp),
+                                        color = CrispWhite.copy(alpha = 0.09f),
+                                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.16f)),
+                                        modifier = Modifier.clickable { viewModel.completeSetAndStartRest() }
+                                    ) {
+                                        Text(
+                                            text = "Repos",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = CrispWhite,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp)
+                                        )
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(13.dp),
+                                        color = SignalOrange,
+                                        modifier = Modifier.clickable { viewModel.finishSession() }
+                                    ) {
+                                        Text(
+                                            text = "Fin",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = CrispWhite,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -798,8 +884,7 @@ fun VisionScreen(
             onSelectSetupDelay = { viewModel.setSetupDelay(it) },
             onTriggerSetupNow = {
                 showSettingsSheet = false
-                val sec = if (uiState.setupDelaySec > 0) uiState.setupDelaySec else 5
-                viewModel.startSetupCountdown(sec, announce = true)
+                viewModel.startWorkoutSet()
             },
             onSelectRestDuration = { viewModel.setRestDuration(it) },
             onSelectStrictness = { viewModel.setDetectionStrictness(it) }
@@ -906,6 +991,7 @@ private fun SetupCenterCountdown(
     totalSec: Int,
     onAdd5s: () -> Unit,
     onStartNow: () -> Unit,
+    onCancel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val targetProgress = if (totalSec > 0) {
@@ -971,8 +1057,22 @@ private fun SetupCenterCountdown(
             )
         }
 
-        // Two minimal action pills: +5s & Start Now
+        // Clean action pills: Annuler, +5s & Commencer
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = ObsidianBg.copy(alpha = 0.76f),
+                border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.16f)),
+                modifier = Modifier.clickable(onClick = onCancel)
+            ) {
+                Text(
+                    text = "Annuler",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SteelGray,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 15.dp, vertical = 9.dp)
+                )
+            }
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = ObsidianBg.copy(alpha = 0.76f),
@@ -984,7 +1084,7 @@ private fun SetupCenterCountdown(
                     style = MaterialTheme.typography.labelLarge,
                     color = CrispWhite,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp)
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp)
                 )
             }
             Surface(
@@ -997,7 +1097,7 @@ private fun SetupCenterCountdown(
                     style = MaterialTheme.typography.labelLarge,
                     color = ObsidianBg,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 9.dp)
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp)
                 )
             }
         }
@@ -2073,7 +2173,7 @@ private fun SessionSummarySheet(
                     .fillMaxWidth()
                     .height(44.dp)
             ) {
-                Text("Nouvelle série", color = CrispWhite, style = MaterialTheme.typography.labelLarge)
+                Text("Retour caméra", color = CrispWhite, style = MaterialTheme.typography.labelLarge)
             }
         }
     }

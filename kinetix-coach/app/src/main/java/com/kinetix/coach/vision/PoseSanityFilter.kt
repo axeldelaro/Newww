@@ -46,13 +46,23 @@ class PoseSanityFilter(
 
         // Best-side torso visibility (never penalizes occluded far side in profile or hips behind chest in front push-ups!)
         private const val CORE_VIS_MIN = 0.38f
-        private const val COHERENT_WALK_SPEED_THRESHOLD = 0.42f
-        private const val SHOULDER_ZOOM_RATE_THRESHOLD = 0.85f
-        private const val LENS_FILL_SHOULDER_WIDTH = 0.72f
+        private const val COHERENT_WALK_SPEED_THRESHOLD = 0.24f
+        private const val CUMULATIVE_WALK_WINDOW_MS = 700L
+        private const val CUMULATIVE_WALK_DRIFT_THRESHOLD = 0.14f
+        private const val CUMULATIVE_ZOOM_RATIO_THRESHOLD = 0.30f
+        private const val SHOULDER_ZOOM_RATE_THRESHOLD = 0.55f
+        private const val LENS_FILL_SHOULDER_WIDTH = 0.62f
         private const val SUSTAINED_WALK_FRAMES = 3
         private const val SUSTAINED_ZOOM_FRAMES = 5
-        private const val STABILIZATION_COOLDOWN_MS = 480L
+        private const val STABILIZATION_COOLDOWN_MS = 520L
     }
+
+    private data class DriftSample(
+        val timestampMs: Long,
+        val midShX: Float,
+        val midHipX: Float,
+        val shoulderWidth: Float
+    )
 
     private var lastValidScreen = arrayOfNulls<PosePoint>(landmarkCount)
     private var lastValidScreenTs = LongArray(landmarkCount) { Long.MIN_VALUE }
@@ -69,6 +79,7 @@ class PoseSanityFilter(
     private var prevZoomSign: Int = 0
     private var horizontalWalkStreak: Int = 0
     private var scaleZoomStreak: Int = 0
+    private val driftWindow = ArrayDeque<DriftSample>(32)
     private var lastUnstableTsMs: Long = Long.MIN_VALUE
     private var lastUnstableReasonFr: String? = null
     private var lastMotionGuard: MotionGuardState = MotionGuardState()
@@ -87,6 +98,7 @@ class PoseSanityFilter(
         prevZoomSign = 0
         horizontalWalkStreak = 0
         scaleZoomStreak = 0
+        driftWindow.clear()
         lastUnstableTsMs = Long.MIN_VALUE
         lastUnstableReasonFr = null
         lastMotionGuard = MotionGuardState()
@@ -187,7 +199,7 @@ class PoseSanityFilter(
             }
 
             // Camera proximity zoom: only track sustained monotonic rapid shoulder-width expansion/contraction
-            if (prevShoulderWidth >= 0.16f && shoulderWidth >= 0.16f) {
+            if (prevShoulderWidth >= 0.14f && shoulderWidth >= 0.14f && upperShouldersVis >= 0.45f) {
                 val signedZoom = (shoulderWidth - prevShoulderWidth) / prevShoulderWidth / dtSec
                 shoulderZoomRate = abs(signedZoom)
                 val zoomSign = if (signedZoom >= 0f) 1 else -1
@@ -212,6 +224,32 @@ class PoseSanityFilter(
             prevZoomSign = 0
         }
 
+        // Cumulative 700ms drift window: catches slow casual walking across or toward/away from camera!
+        driftWindow.addLast(DriftSample(timestampMs, midShX, midHipX, shoulderWidth))
+        while (driftWindow.size > 30 ||
+            (driftWindow.size > 2 && (timestampMs - driftWindow.first().timestampMs) > CUMULATIVE_WALK_WINDOW_MS)
+        ) {
+            driftWindow.removeFirst()
+        }
+        var cumulativeWalkDetected = false
+        var cumulativeZoomDetected = false
+        if (driftWindow.size >= 4) {
+            val oldest = driftWindow.first()
+            val shDriftX = midShX - oldest.midShX
+            val hipDriftX = midHipX - oldest.midHipX
+            if (shDriftX * hipDriftX > 0f &&
+                minOf(abs(shDriftX), abs(hipDriftX)) >= CUMULATIVE_WALK_DRIFT_THRESHOLD
+            ) {
+                cumulativeWalkDetected = true
+            }
+            if (upperShouldersVis >= 0.45f && oldest.shoulderWidth >= 0.14f && shoulderWidth >= 0.14f) {
+                val relScaleChange = abs(shoulderWidth - oldest.shoulderWidth) / oldest.shoulderWidth
+                if (relScaleChange >= CUMULATIVE_ZOOM_RATIO_THRESHOLD) {
+                    cumulativeZoomDetected = true
+                }
+            }
+        }
+
         prevMidShX = midShX
         prevMidHipX = midHipX
         prevShoulderWidth = shoulderWidth
@@ -220,8 +258,8 @@ class PoseSanityFilter(
         val lensBlockedByProximity = shoulderWidth > LENS_FILL_SHOULDER_WIDTH && upperShouldersVis >= 0.45f
         val unstableReason: String? = when {
             effectiveCoreVis < CORE_VIS_MIN -> "Visibilité faible"
-            horizontalWalkStreak >= SUSTAINED_WALK_FRAMES -> "Déplacement latéral"
-            scaleZoomStreak >= SUSTAINED_ZOOM_FRAMES || lensBlockedByProximity -> "Changement de distance"
+            horizontalWalkStreak >= SUSTAINED_WALK_FRAMES || cumulativeWalkDetected -> "Déplacement latéral"
+            scaleZoomStreak >= SUSTAINED_ZOOM_FRAMES || cumulativeZoomDetected || lensBlockedByProximity -> "Changement de distance"
             else -> null
         }
 

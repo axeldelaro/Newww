@@ -57,6 +57,8 @@ data class VisionUiState(
     val isVoiceEnabled: Boolean = true,
     val showDetailedAngles: Boolean = false,
     val isSessionActive: Boolean = true,
+    // Explicit user-controlled tracking state: NEVER auto-starts counting on camera open!
+    val isTrackingStarted: Boolean = false,
     val sessionStartMs: Long = System.currentTimeMillis(),
     val delegateLabel: String = "GPU",
     val imageWidth: Int = 480,
@@ -74,7 +76,7 @@ data class VisionUiState(
     val restRemainingSec: Int = 0,
     val isResting: Boolean = false,
     val restFinishedEvent: Int = 0,
-    // Hands-free setup countdown ("Chrono d'installation") preventing false reps while placing the phone
+    // Hands-free setup countdown ("Chrono d'installation") triggered ONLY after user taps Démarrer
     val setupDelaySec: Int = 5,
     val setupRemainingSec: Int = 0,
     val completedSummary: WorkoutSession? = null,
@@ -92,6 +94,9 @@ data class VisionUiState(
 ) {
     val isSettingUp: Boolean
         get() = setupRemainingSec > 0
+
+    val isIdlePreview: Boolean
+        get() = !isTrackingStarted && !isSettingUp && !isResting && activeChallenge == null
 }
 
 class VisionViewModel(application: Application) : AndroidViewModel(application) {
@@ -139,8 +144,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         VisionUiState(
             detectionStrictness = initialStrictness,
             showDetailedAngles = initialDetailedAngles,
+            isTrackingStarted = false,
             setupDelaySec = initialSetupDelaySec,
-            setupRemainingSec = initialSetupDelaySec,
+            setupRemainingSec = 0,
             frame = engine.emptyFrame(),
             selectedMusicTrack = WorkoutMusicTrack.fromId(
                 app.userDb.getPref(PREF_MUSIC_TRACK, WorkoutMusicTrack.TECHNO_PULSE.id)
@@ -174,9 +180,76 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private val sessionFaults = linkedSetOf<String>()
     private val exerciseBreakdownMap = linkedMapOf<ExerciseType, ExerciseBreakdownItem>()
 
-    init {
-        if (initialSetupDelaySec > 0) {
-            startSetupCountdown(initialSetupDelaySec, announce = false)
+    /**
+     * Explicit user-triggered start ("Démarrer"): clears stale buffers and either runs the configured
+     * hands-free setup countdown (5/8/10s) or arms live tracking immediately (0s).
+     */
+    fun startWorkoutSet() {
+        cancelRestTimer()
+        cancelSetupTimer()
+        val setupSec = _uiState.value.setupDelaySec
+        val emptyFrame: BiomechanicsFrame
+        synchronized(pipelineLock) {
+            if (challengeController.isActive) {
+                stopChallengeSilentlyLocked()
+            }
+            engine.resetSession()
+            voiceCoach.resetCooldowns()
+            recentPoseHistory.clear()
+            if (_uiState.value.isAutoDetectEnabled) {
+                autoDetector.reset(initialLocked = null)
+            } else {
+                autoDetector.reset(initialLocked = engine.currentExercise)
+            }
+            lastRepSpoken = 0
+            lastHudEmitTsMs = 0L
+            resetMultiSetAccumulatorsLocked()
+            emptyFrame = engine.emptyFrame()
+        }
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
+        _uiState.update {
+            it.copy(
+                sessionStartMs = System.currentTimeMillis(),
+                isSessionActive = true,
+                isTrackingStarted = setupSec <= 0,
+                frame = emptyFrame,
+                currentSetNumber = 1,
+                completedSetsCount = 0,
+                sessionTotalReps = 0,
+                sessionTotalHoldSec = 0,
+                currentSetCaloriesKcal = 0.0,
+                sessionTotalCaloriesKcal = 0.0,
+                multiExerciseBreakdown = emptyList(),
+                isResting = false,
+                restRemainingSec = 0,
+                setupRemainingSec = setupSec,
+                completedSummary = null,
+                completedBreakdown = emptyList(),
+                completedVelocityTelemetry = null,
+                activeChallenge = null,
+                completedChallengeResult = null,
+                errorMessage = null
+            )
+        }
+        if (setupSec > 0) {
+            startSetupCountdown(setupSec, announce = true)
+        } else {
+            voiceCoach.speak("C'est parti !", force = true)
+        }
+    }
+
+    /** Cancels an in-progress setup countdown and returns cleanly to IDLE preview mode. */
+    fun cancelSetupCountdown() {
+        cancelSetupTimer()
+        synchronized(pipelineLock) {
+            engine.armAfterSetup()
+            recentPoseHistory.clear()
+        }
+        _uiState.update {
+            it.copy(
+                isTrackingStarted = false,
+                setupRemainingSec = 0
+            )
         }
     }
 
@@ -195,7 +268,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             app.userDb.setPref(PREF_SETUP_DELAY_SEC, clamped.toString())
         }
         _uiState.update { it.copy(setupDelaySec = clamped) }
-        if (clamped == 0) {
+        if (clamped == 0 && _uiState.value.isSettingUp) {
             skipSetupCountdown()
         }
     }
@@ -280,11 +353,10 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /** Manual exercise selection from picker locks into FIXE mode and resets the session cleanly. */
+    /** Manual exercise selection from picker locks into FIXE mode and prepares IDLE preview cleanly. */
     fun selectExercise(exercise: ExerciseType) {
         cancelRestTimer()
         cancelSetupTimer()
-        val setupSec = _uiState.value.setupDelaySec
         val emptyFrame: BiomechanicsFrame
         synchronized(pipelineLock) {
             if (challengeController.isActive) {
@@ -292,6 +364,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             }
             engine.setExercise(exercise)
             autoDetector.reset(initialLocked = exercise)
+            recentPoseHistory.clear()
             lastRepSpoken = 0
             lastHudEmitTsMs = 0L
             resetMultiSetAccumulatorsLocked()
@@ -306,6 +379,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 autoDetectStatusFr = "Mode fixe : ${exercise.labelFr}",
                 sessionStartMs = System.currentTimeMillis(),
                 isSessionActive = true,
+                isTrackingStarted = false,
                 frame = emptyFrame,
                 currentSetNumber = 1,
                 completedSetsCount = 0,
@@ -316,16 +390,14 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 multiExerciseBreakdown = emptyList(),
                 restRemainingSec = 0,
                 isResting = false,
-                setupRemainingSec = setupSec,
+                setupRemainingSec = 0,
                 completedSummary = null,
                 completedBreakdown = emptyList(),
+                completedVelocityTelemetry = null,
                 activeChallenge = null,
                 completedChallengeResult = null,
                 errorMessage = null
             )
-        }
-        if (setupSec > 0) {
-            startSetupCountdown(setupSec, announce = true)
         }
     }
 
@@ -495,6 +567,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 autoDetectStatusFr = "Défi · ${finalConfig.type.shortTitleFr}",
                 sessionStartMs = now,
                 isSessionActive = true,
+                isTrackingStarted = true,
                 frame = emptyFrame,
                 currentSetNumber = 1,
                 completedSetsCount = 0,
@@ -758,7 +831,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             recentPoseHistory.clear()
         }
         _uiState.update {
-            it.copy(isResting = false, restRemainingSec = 0)
+            it.copy(isTrackingStarted = true, isResting = false, restRemainingSec = 0)
         }
     }
 
@@ -774,14 +847,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             app.userDb.setPref(PREF_SETUP_DELAY_SEC, next.toString())
         }
         _uiState.update { it.copy(setupDelaySec = next) }
-        if (next == 0) {
+        if (next == 0 && _uiState.value.isSettingUp) {
             skipSetupCountdown()
-        } else if (!_uiState.value.isResting &&
-            _uiState.value.activeChallenge == null &&
-            _uiState.value.frame.repCount == 0 &&
-            _uiState.value.frame.isometricHoldSec < 1f
-        ) {
-            startSetupCountdown(next, announce = true)
         }
     }
 
@@ -796,10 +863,16 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         if (safeSec <= 0) {
-            _uiState.update { it.copy(setupRemainingSec = 0) }
+            _uiState.update {
+                it.copy(
+                    isTrackingStarted = true,
+                    setupRemainingSec = 0,
+                    sessionStartMs = System.currentTimeMillis()
+                )
+            }
             return
         }
-        _uiState.update { it.copy(setupRemainingSec = safeSec) }
+        _uiState.update { it.copy(isTrackingStarted = false, setupRemainingSec = safeSec) }
         if (announce && safeSec >= 4) {
             voiceCoach.speak("Installez-vous, $safeSec secondes.", force = true)
         }
@@ -816,6 +889,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     _uiState.update {
                         it.copy(
+                            isTrackingStarted = true,
                             setupRemainingSec = 0,
                             sessionStartMs = System.currentTimeMillis()
                         )
@@ -847,6 +921,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         }
         _uiState.update {
             it.copy(
+                isTrackingStarted = true,
                 setupRemainingSec = 0,
                 sessionStartMs = System.currentTimeMillis()
             )
@@ -873,6 +948,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     _uiState.update {
                         it.copy(
+                            isTrackingStarted = true,
                             isResting = false,
                             restRemainingSec = 0,
                             restFinishedEvent = it.restFinishedEvent + 1
@@ -926,14 +1002,15 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             val inChallenge = challengeController.isActive
             engine.athleteHeightMeters = (profile.heightCm / 100f).coerceIn(1.30f, 2.25f)
 
-            // During Setup Countdown or Rest Timer: keep smooth 60 FPS skeleton framing preview
-            // while completely disarming rep counting, VBT, auto-switching, calories, and posture faults!
-            if (!inChallenge && (state.isSettingUp || state.isResting)) {
+            // During IDLE Preview (before user taps Démarrer), Setup Countdown, or Rest Timer:
+            // keep smooth 60 FPS skeleton framing preview while completely disarming rep counting,
+            // VBT, auto-switching, calories, voice, and posture faults!
+            if (!inChallenge && (!state.isTrackingStarted || state.isSettingUp || state.isResting)) {
                 recentPoseHistory.clear()
-                val previewMsg = if (state.isSettingUp) {
-                    "Installation (${state.setupRemainingSec}s) — posez le téléphone et mettez-vous en place"
-                } else {
-                    "Repos (${state.restRemainingSec}s) — comptage en pause"
+                val previewMsg = when {
+                    state.isSettingUp -> "Installation (${state.setupRemainingSec}s) — placez-vous"
+                    state.isResting -> "Repos (${state.restRemainingSec}s) — comptage en pause"
+                    else -> "Prêt — appuyez sur Démarrer"
                 }
                 val previewFrame = engine.previewPoseOnly(screenPoints, worldPoints, timestampMs, previewMsg)
                 overlaySnapshot = PoseOverlayState(
@@ -957,20 +1034,25 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     shouldUpdateHud = true
                 }
             } else {
-                // Record rolling ~2.4s pose buffer for zero-lost-first-rep retroactive AUTO replay
-                if (!inChallenge && state.isAutoDetectEnabled && screenPoints.size >= 29) {
-                    recentPoseHistory.addLast(BufferedPoseFrame(screenPoints, worldPoints, timestampMs))
-                    while (recentPoseHistory.size > REPLAY_HISTORY_MAX_FRAMES ||
-                        (recentPoseHistory.size > 2 && (timestampMs - recentPoseHistory.first().timestampMs) > REPLAY_HISTORY_WINDOW_MS)
-                    ) {
-                        recentPoseHistory.removeFirst()
-                    }
-                }
-
                 // 1. Run 3D multi-angle biomechanics + VBT velocity analysis + physics sanity gate first
                 val rawFrame = engine.processFrame(screenPoints, worldPoints, timestampMs)
                 var effectiveFrame = rawFrame
                 activeExercise = engine.currentExercise
+
+                // Record rolling ~2.4s pose buffer for zero-lost-first-rep retroactive AUTO replay
+                // ONLY during stable frames (never buffer walking/repositioning frames!)
+                if (!inChallenge && state.isAutoDetectEnabled && screenPoints.size >= 29) {
+                    if (rawFrame.isStabilizing) {
+                        recentPoseHistory.clear()
+                    } else {
+                        recentPoseHistory.addLast(BufferedPoseFrame(screenPoints, worldPoints, timestampMs))
+                        while (recentPoseHistory.size > REPLAY_HISTORY_MAX_FRAMES ||
+                            (recentPoseHistory.size > 2 && (timestampMs - recentPoseHistory.first().timestampMs) > REPLAY_HISTORY_WINDOW_MS)
+                        ) {
+                            recentPoseHistory.removeFirst()
+                        }
+                    }
+                }
 
                 // 2. Profile-calibrated real-time calorie expenditure accumulation
                 if (rawFrame.poseDetected && !rawFrame.isStabilizing) {
@@ -1169,7 +1251,6 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     fun resetSession() {
         cancelRestTimer()
         cancelSetupTimer()
-        val setupSec = _uiState.value.setupDelaySec
         val emptyFrame: BiomechanicsFrame
         synchronized(pipelineLock) {
             if (challengeController.isActive) {
@@ -1177,6 +1258,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             }
             engine.resetSession()
             voiceCoach.resetCooldowns()
+            recentPoseHistory.clear()
             if (_uiState.value.isAutoDetectEnabled) {
                 autoDetector.reset(initialLocked = null)
             } else {
@@ -1192,6 +1274,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 sessionStartMs = System.currentTimeMillis(),
                 isSessionActive = true,
+                isTrackingStarted = false,
                 frame = emptyFrame,
                 currentSetNumber = 1,
                 completedSetsCount = 0,
@@ -1202,16 +1285,13 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 multiExerciseBreakdown = emptyList(),
                 isResting = false,
                 restRemainingSec = 0,
-                setupRemainingSec = setupSec,
+                setupRemainingSec = 0,
                 completedSummary = null,
                 completedBreakdown = emptyList(),
                 completedVelocityTelemetry = null,
                 activeChallenge = null,
                 completedChallengeResult = null
             )
-        }
-        if (setupSec > 0) {
-            startSetupCountdown(setupSec, announce = true)
         }
     }
 
@@ -1227,6 +1307,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         val session: WorkoutSession
         val completedBreakdownList: List<ExerciseBreakdownItem>
         val finalVelocityTelemetry: VelocityTelemetry
+        var hadRecordedWork = false
 
         synchronized(pipelineLock) {
             val state = _uiState.value
@@ -1286,6 +1367,11 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
 
+            hadRecordedWork = totalReps > 0 ||
+                (primaryExercise.isIsometric && totalHoldSec >= 2) ||
+                state.completedSetsCount > 0 ||
+                totalCalories >= 0.5
+
             val notesText = buildString {
                 if (breakdownSnapshot.size > 1) {
                     append(breakdownSnapshot.values.joinToString(" + ") { item ->
@@ -1331,6 +1417,12 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             completedBreakdownList = breakdownSnapshot.values.toList()
         }
 
+        // If user stopped before performing any rep/hold, return quietly to IDLE preview without an empty summary
+        if (!hadRecordedWork) {
+            resetSession()
+            return
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
             if (session.reps > 0 || (session.exerciseType.isIsometric && session.durationSec >= 3) || session.caloriesKcal >= 0.5) {
                 app.userDb.insertSession(session)
@@ -1340,6 +1432,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update {
             it.copy(
                 isSessionActive = false,
+                isTrackingStarted = false,
                 isResting = false,
                 restRemainingSec = 0,
                 setupRemainingSec = 0,

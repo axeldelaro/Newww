@@ -4,20 +4,19 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 1. KINETIX Coach (`kinetix-coach/` — v2.3.0)
-**Interface Caméra Studio Minimaliste Pro + Comptage IA Ultra-Fluide Zéro Rep Perdue + VBT Rep Max + Variantes sur 16 Exos + Coach IA Local**
+## 1. KINETIX Coach (`kinetix-coach/` — v2.4.0)
+**Interface Caméra Studio Minimaliste Pro + Démarrage Contrôlé + Comptage IA Anti-Fausses-Reps Blindé (Tractions, Pompes, 16 Exos) + VBT Rep Max + Coach IA Local**
 
 - **Package** : `com.kinetix.coach` (Android 10+ / `arm64-v8a`, 100 % hors-ligne, zéro requête réseau)
+- **Démarrage 100 % Contrôlé — Zéro Auto-Lancement à l'Ouverture (`VisionViewModel`, `VisionScreen`)** :
+  - À l'ouverture de la caméra (et après changement d'exercice ou fermeture d'un bilan), l'app reste en mode **Prévisualisation Prêt (`IDLE`)** : cadrage squelette 60 FPS live, **zéro comptage, zéro décompte, zéro alerte**. La série ne démarre qu'au clic explicite sur **`Démarrer`** (avec choix rapide du délai d'installation `0s / 5s / 8s / 10s` et bouton `Annuler`).
+- **Comptage IA Blindé Anti-Fausses-Reps (`BiomechanicsEngine`, `PoseSanityFilter`, `OneEuroFilter`)** :
+  - **Tractions (`PULL_UP`) par physique réelle de barre** : porte posturale haute **toujours active** (même en cours de rep), **ancrage 2D des poignets sur la barre** (`pullupAnchorWindow`) + **élévation verticale réelle des épaules** (`pullupHangShoulderY`) + fin bras tendus au-dessus de la tête — attraper la barre, lâcher la barre ou marcher en baissant les bras ne compte plus **jamais** de fausse répétition.
+  - **Garde anti-marche & anti-gestes parasites sur les 16 exercices** : détection de marche lente et de dérive cumulée (`0,7 s`) + approche caméra dans `PoseSanityFilter`, gel immédiat des frames hors-posture, ancrage mains `Dips` (`dipWristWindow`), arrêt sur décollement des mains `Pompes`, portes posturales strictes `Rowing` / `Développé militaire` / `Dips` / `Curl` / `Élévations latérales` / `Jumping Jack`.
+  - **Rejeu rétroactif 2,4 s en mode `AUTO` (`switchExerciseWithReplay`)** + **auto-calibration monoculaire 3D des pompes** (`130°–148°` & complétion top-return) + filtre One-Euro réactif (`minCutoff = 1.65`, `beta = 0.12`).
 - **Interface Caméra Pro Ultra-Épurée (`VisionScreen`, `SkeletonOverlay`)** :
-  - **~85 % d'image caméra libre** : une seule ligne en haut (pilule d'exercice/variante + bouton bascule caméra + bouton réglages), un **décompte d'installation géant centré** lisible à 3 mètres, un **squelette épuré** sans rapporteurs ni bulles de degrés par défaut (activables en mode expert dans *Réglages*), un **toast coach conditionnel** totalement invisible quand l'exécution est propre, et un **dock verre compact** (compteur géant animé + retour haptique, pilule VBT 2 lignes `m/s` / `MAX ~X` dépliable au clic, boutons `Repos` & `Fin`). Tous les outils secondaires (*Défis, Démo, Reset, Auto/Fixe, Voix, Délai, Repos, Exigence*) sont rangés proprement dans la feuille *Réglages*.
-- **Comptage Caméra Parfait — Zéro 1re Rep Perdue & Zéro Blocage (`BiomechanicsEngine`, `OneEuroFilter`, `VisionViewModel`)** :
-  - **Rejeu rétroactif 2,4 s en mode `AUTO` (`switchExerciseWithReplay`)** : quand l'IA détecte votre exercice (ex. `Squat → Pompes` ou `Planche → Pompes`), elle rejoue les 2,4 dernières secondes en `< 0,5 ms` pour synchroniser ou créditer immédiatement votre **1re répétition**.
-  - **Auto-calibration monoculaire 3D des pompes + complétion top-return** : calibre dynamiquement votre extension haute réelle (`130°–148°` & ratio bras) pour qu'un téléphone posé au sol de face/oblique ne bloque jamais une répétition en phase concentrique, avec soft-lockout calibré sur Squat / Soulevé / Curl / Dips et filtre One-Euro réactif (`minCutoff = 1.65`, `beta = 0.12`).
-- **Zéro Fausse Rep pendant l'Installation & le Repos (`PoseSanityFilter`, `VisionViewModel`)** :
-  - Chrono d'installation mains-libres (`0 / 5 / 8 / 10 s`, défaut `5 s`) avec prévisualisation squelette 60 FPS (`previewPoseOnly`), verrou position neutre (`requiresNeutralStart`), stabilisation `450 ms` post-transition et contrôle poignets 2D `X + Y`.
-- **16 Exercices, Variantes & Coaching Anti-Spam (`ExerciseVariantDetector`, `PostureFeedbackCoach`, `VelocityEstimator`)** :
-  - **9 variantes pompes** (*Classique, Large, Serrée, Diamant, Genoux, Piquée, Archer, Inclinée, Déclinée*) + détection automatique de toutes les variantes sur les **16 exercices**, coaching postural zéro spam (persistance temporelle + cooldowns vocaux), et **système VBT complet** (vitesse concentrique `m/s`, perte de vitesse `VL%`, fraîcheur inter-séries, RIR/RPE, **Rep Max estimé `MAX ~X`**, sparkline, SQLite v4 et débriefing Coach IA).
-- **Écosystème complet** : **7 Défis caméra** (*Bip & Go*, *Luc Léger*, *Gainage Musical*, *25/50/100 Reps*, *AMRAP*, *Tabata*, *EMOM*) + 4 musiques PCM + **import MP3 local**, calories personnalisées, **42 vidéos MP4 H.264**, **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5** (**63/63 tests unitaires**).
+  - **~85 % d'image caméra libre**, 1 seule ligne en haut (exercice/variante + caméra + réglages), squelette minimaliste sans rapporteurs ni bulles de degrés par défaut (mode expert dans *Réglages*), toast coach invisible sur les reps propres, dock verre compact (compteur géant animé + VBT `m/s` / `MAX ~X` dépliable + `Repos` / `Fin`).
+- **16 Exercices, Variantes, VBT & Écosystème complet** : **9 variantes pompes** + variantes sur les **16 exercices** (`ExerciseVariantDetector`), coaching anti-spam (`PostureFeedbackCoach`), VBT complet (`VelocityEstimator` + SQLite v4), **7 Défis caméra** + 4 musiques PCM + **import MP3 local**, **42 vidéos MP4 H.264**, **LLM local `Gemma-3 1B Q4_K_M`** + **2 683 fiches SQLite FTS5** (**65/65 tests unitaires**).
 
 ---
 

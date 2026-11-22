@@ -358,11 +358,35 @@ class BiomechanicsEngine(
     private var depthStallStartTsMs: Long = Long.MIN_VALUE
     private var earlyReversalHintUntilTsMs: Long = Long.MIN_VALUE
 
+    private data class AnchorWristSample(
+        val timestampMs: Long,
+        val wristX: Float,
+        val wristY: Float,
+        val shoulderY: Float
+    )
+
     // Self-healing sliding-window vertical top references (deadlock-free across all camera angles!)
     private val pushupHeightWindow = ArrayDeque<PushupHeightSample>(128)
     private var adaptivePushupTopHeight: Float = 0f
     private var pushupStraightArmStreak: Int = 0
     private var adaptiveDipTopHeight: Float = 0f
+    private val pullupAnchorWindow = ArrayDeque<AnchorWristSample>(64)
+    private var pullupHangShoulderY: Float = Float.NaN
+    private var pullupPeakShoulderLift: Float = 0f
+    private var pullupBarAnchorStreak: Int = 0
+    private val dipWristWindow = ArrayDeque<AnchorWristSample>(64)
+
+    private fun clearExerciseAnchorWindows() {
+        pushupHeightWindow.clear()
+        adaptivePushupTopHeight = 0f
+        pushupStraightArmStreak = 0
+        adaptiveDipTopHeight = 0f
+        pullupAnchorWindow.clear()
+        pullupHangShoulderY = Float.NaN
+        pullupPeakShoulderLift = 0f
+        pullupBarAnchorStreak = 0
+        dipWristWindow.clear()
+    }
 
     // Session metrics accumulators
     private var formScoreSum: Long = 0L
@@ -460,10 +484,7 @@ class BiomechanicsEngine(
         hadPriorOutOfPostureOrUnstable = false
         postureSettleStartTsMs = Long.MIN_VALUE
         prevPrimaryPosMeters = Float.NaN
-        pushupHeightWindow.clear()
-        adaptivePushupTopHeight = 0f
-        pushupStraightArmStreak = 0
-        adaptiveDipTopHeight = 0f
+        clearExerciseAnchorWindows()
         postureCoach.reset()
     }
 
@@ -513,10 +534,7 @@ class BiomechanicsEngine(
         hadPriorOutOfPostureOrUnstable = false
         postureSettleStartTsMs = Long.MIN_VALUE
         prevPrimaryPosMeters = Float.NaN
-        pushupHeightWindow.clear()
-        adaptivePushupTopHeight = 0f
-        pushupStraightArmStreak = 0
-        adaptiveDipTopHeight = 0f
+        clearExerciseAnchorWindows()
 
         return BiomechanicsFrame(
             exercise = currentExercise,
@@ -592,10 +610,7 @@ class BiomechanicsEngine(
         depthStallAnchorMetric = Float.NaN
         depthStallStartTsMs = Long.MIN_VALUE
         earlyReversalHintUntilTsMs = Long.MIN_VALUE
-        pushupHeightWindow.clear()
-        adaptivePushupTopHeight = 0f
-        pushupStraightArmStreak = 0
-        adaptiveDipTopHeight = 0f
+        clearExerciseAnchorWindows()
         variantDetector.reset()
         postureCoach.reset()
         formScoreSum = 0L
@@ -629,6 +644,7 @@ class BiomechanicsEngine(
         phase2PeakVelMps = 0f
         depthStallAnchorMetric = Float.NaN
         depthStallStartTsMs = Long.MIN_VALUE
+        pullupPeakShoulderLift = 0f
     }
 
     fun emptyFrame(): BiomechanicsFrame = BiomechanicsFrame(
@@ -711,10 +727,7 @@ class BiomechanicsEngine(
             requiresNeutralStart = true
             postureSettleStartTsMs = Long.MIN_VALUE
             prevPrimaryPosMeters = Float.NaN
-            pushupHeightWindow.clear()
-            adaptivePushupTopHeight = 0f
-            pushupStraightArmStreak = 0
-            adaptiveDipTopHeight = 0f
+            clearExerciseAnchorWindows()
             return BiomechanicsFrame(
                 exercise = currentExercise,
                 landmarks = screenPts,
@@ -888,44 +901,42 @@ class BiomechanicsEngine(
 
         if (postureGateFeedback != null) {
             postureGateRejectStreak++
-            // If mid-rep, tolerate brief 1-3 frame MediaPipe jitter before aborting an active rep!
+            // If mid-rep, tolerate brief 1-3 frame MediaPipe jitter before aborting an active rep,
+            // but NEVER let out-of-posture frames advance or complete a phantom rep!
             val shouldRejectNow = !isMidRep || postureGateRejectStreak >= POSTURE_ABORT_GRACE_FRAMES
             if (shouldRejectNow) {
                 abortIncompleteRepCycle()
                 hadPriorOutOfPostureOrUnstable = true
                 requiresNeutralStart = true
                 postureSettleStartTsMs = Long.MIN_VALUE
-                pushupHeightWindow.clear()
-                adaptivePushupTopHeight = 0f
-                pushupStraightArmStreak = 0
-                adaptiveDipTopHeight = 0f
-                return BiomechanicsFrame(
-                    exercise = currentExercise,
-                    landmarks = screenPts,
-                    repCount = repCount,
-                    isometricHoldSec = plankHoldMs / 1000f,
-                    phase = MovementPhase.READY,
-                    romPct = 0,
-                    formScore = 100,
-                    formQuality = FormQuality.GOOD,
-                    feedbackFr = postureGateFeedback,
-                    voiceCueFr = null,
-                    angleBadges = emptyList(),
-                    avgFormScore = computeAvgForm(),
-                    avgRomPct = computeAvgRom(),
-                    topFaults = computeTopFaults(),
-                    poseDetected = true,
-                    worldLandmarks = worldPts,
-                    viewpointInfo = viewpointInfo,
-                    corrections = emptyList(),
-                    isStabilizing = false,
-                    velocityTelemetry = velocityEstimator.currentTelemetry()
-                )
+                clearExerciseAnchorWindows()
             }
+            return BiomechanicsFrame(
+                exercise = currentExercise,
+                landmarks = screenPts,
+                repCount = repCount,
+                isometricHoldSec = plankHoldMs / 1000f,
+                phase = if (shouldRejectNow) MovementPhase.READY else phase,
+                romPct = if (shouldRejectNow) 0 else repRomPeak,
+                formScore = 100,
+                formQuality = FormQuality.GOOD,
+                feedbackFr = postureGateFeedback,
+                voiceCueFr = null,
+                angleBadges = emptyList(),
+                avgFormScore = computeAvgForm(),
+                avgRomPct = computeAvgRom(),
+                topFaults = computeTopFaults(),
+                poseDetected = true,
+                worldLandmarks = worldPts,
+                viewpointInfo = viewpointInfo,
+                corrections = emptyList(),
+                isStabilizing = false,
+                velocityTelemetry = velocityEstimator.currentTelemetry()
+            )
         } else {
             postureGateRejectStreak = 0
             // Automatic 450 ms setup settle after getting into position from out-of-frame / walk / standing:
-            // Prevents kneeling, placing hands, or extending feet into plank from counting a phantom Rep 1!
+            // Prevents kneeling, placing hands, grabbing a pull-up bar, or extending feet from counting a phantom Rep 1!
             if (!isDeterministicPassThrough && hadPriorOutOfPostureOrUnstable) {
                 if (postureSettleStartTsMs == Long.MIN_VALUE) {
                     postureSettleStartTsMs = timestampMs
@@ -933,10 +944,7 @@ class BiomechanicsEngine(
                 if ((timestampMs - postureSettleStartTsMs) < SETUP_POSTURE_SETTLE_MS) {
                     abortIncompleteRepCycle()
                     requiresNeutralStart = true
-                    pushupHeightWindow.clear()
-                    adaptivePushupTopHeight = 0f
-                    pushupStraightArmStreak = 0
-                    adaptiveDipTopHeight = 0f
+                    clearExerciseAnchorWindows()
                     return BiomechanicsFrame(
                         exercise = currentExercise,
                         landmarks = screenPts,
@@ -1657,16 +1665,21 @@ class BiomechanicsEngine(
 
                 romPct = (pushupDepth * 100f).roundToInt().coerceIn(0, 100)
 
-                val cycle = updateProgressCycle(
-                    progress = pushupDepth,
-                    startThreshold = 0.22f,
-                    peakThreshold = peakThresh,
-                    finishThreshold = finishThresh,
-                    currentRom = romPct,
-                    primaryPosMeters = primaryPosMeters,
-                    instantSpeedMps = instantSpeedMps,
-                    timestampMs = timestampMs
-                )
+                val cycle = if (!isDeterministicPassThrough && !handsPlanted) {
+                    if (isMidRep) abortIncompleteRepCycle()
+                    CycleResult(false, 0, 0f)
+                } else {
+                    updateProgressCycle(
+                        progress = pushupDepth,
+                        startThreshold = 0.22f,
+                        peakThreshold = peakThresh,
+                        finishThreshold = finishThresh,
+                        currentRom = romPct,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
+                        timestampMs = timestampMs
+                    )
+                }
                 val activePushupLeft = if (isArcher && bothArmsVis) effLeftElbow <= effRightElbow else null
                 recordCompletedCycle(cycle, activePushupLeft)
 
@@ -2230,16 +2243,23 @@ class BiomechanicsEngine(
                     )
                 }
 
-                val cycle = updateDownUpCycle(
-                    metric = activeCurlElbow,
-                    startThreshold = if (isStrict) 140f else 136f,
-                    bottomThreshold = if (isStrict) 58f else 74f,
-                    finishThreshold = if (isStrict) 148f else 132f,
-                    currentRom = romPct,
-                    primaryPosMeters = primaryPosMeters,
-                    instantSpeedMps = instantSpeedMps,
-                    timestampMs = timestampMs
-                )
+                val curlArmOverhead = !isDeterministicPassThrough && activeCurlShAngle > 72f
+                val cycle = if (curlArmOverhead) {
+                    if (isMidRep) abortIncompleteRepCycle()
+                    requiresNeutralStart = true
+                    CycleResult(false, 0, 0f)
+                } else {
+                    updateDownUpCycle(
+                        metric = activeCurlElbow,
+                        startThreshold = if (isStrict) 140f else 136f,
+                        bottomThreshold = if (isStrict) 58f else 74f,
+                        finishThreshold = if (isStrict) 148f else 132f,
+                        currentRom = romPct,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
+                        timestampMs = timestampMs
+                    )
+                }
                 recordCompletedCycle(cycle, if (isAlternating) activeLeftCurl else null)
 
                 addSymmetryIssueIfNeeded(
@@ -2352,7 +2372,29 @@ class BiomechanicsEngine(
                     }
                 }
 
-                val cycle = if (isStrict) {
+                dipWristWindow.addLast(AnchorWristSample(timestampMs, activeWrSX, activeWrSY, activeShSY))
+                while (dipWristWindow.size > 48 ||
+                    (dipWristWindow.size > 2 && (timestampMs - dipWristWindow.first().timestampMs) > 1200L)
+                ) {
+                    dipWristWindow.removeFirst()
+                }
+                var minDipWrX = activeWrSX
+                var maxDipWrX = activeWrSX
+                var minDipWrY = activeWrSY
+                var maxDipWrY = activeWrSY
+                for (s in dipWristWindow) {
+                    if (s.wristX < minDipWrX) minDipWrX = s.wristX
+                    if (s.wristX > maxDipWrX) maxDipWrX = s.wristX
+                    if (s.wristY < minDipWrY) minDipWrY = s.wristY
+                    if (s.wristY > maxDipWrY) maxDipWrY = s.wristY
+                }
+                val dipHandsAnchored = (maxDipWrX - minDipWrX) <= 0.15f && (maxDipWrY - minDipWrY) <= 0.15f
+
+                val cycle = if (!isDeterministicPassThrough && !dipHandsAnchored) {
+                    if (isMidRep) abortIncompleteRepCycle()
+                    requiresNeutralStart = true
+                    CycleResult(false, 0, 0f)
+                } else if (isStrict) {
                     updateDownUpCycle(
                         metric = elbowAngle,
                         startThreshold = 148f,
@@ -2742,12 +2784,15 @@ class BiomechanicsEngine(
                     )
                 }
                 val requireLegsGate = isStrict && anklesClearlyVisible
+                val bothArmsHigh = isDeterministicPassThrough ||
+                    !(lArmW >= 0.45f && rArmW >= 0.45f) ||
+                    minOf(leftArmFull, rightArmFull) >= 100f
                 val cycle = updateUpDownCycle(
                     metric = armFullAngle,
                     startThreshold = if (isStrict) 45f else 46f,
                     topThreshold = if (isStrict) 138f else 128f,
                     finishThreshold = if (isStrict) 42f else 48f,
-                    extraTopCondition = if (requireLegsGate) legsSpread else true,
+                    extraTopCondition = bothArmsHigh && (!requireLegsGate || legsSpread),
                     currentRom = romPct,
                     primaryPosMeters = primaryPosMeters,
                     instantSpeedMps = instantSpeedMps,
@@ -2782,10 +2827,72 @@ class BiomechanicsEngine(
                 val activeWrIdx = if (activeElIdx == LEFT_ELBOW) LEFT_WRIST else RIGHT_WRIST
                 val activeElS = screenPts[activeElIdx]
 
+                val bothArmsVisPull = lArmW >= 0.40f && rArmW >= 0.40f
+                val midShPullG = if (bothVisible) midpoint(geomPts[LEFT_SHOULDER], geomPts[RIGHT_SHOULDER]) else geomPts[shIdx]
+                val midHpPullG = if (bothVisible) midpoint(geomPts[LEFT_HIP], geomPts[RIGHT_HIP]) else geomPts[hpIdx]
+                val midWrPullG = if (bothArmsVisPull) midpoint(geomPts[LEFT_WRIST], geomPts[RIGHT_WRIST]) else geomPts[wrIdx]
+                val torsoLenPullG = (if (use3D) dist3D(midShPullG, midHpPullG) else dist2D(midShPullG, midHpPullG))
+                    .coerceAtLeast(if (use3D) 0.25f else 0.08f)
+                val wristsAboveShTl = (midShPullG.y - midWrPullG.y) / torsoLenPullG
+
+                // 2D Bar-Anchor & True Upward Shoulder-Lift tracker (live mode):
+                // Guarantees grabbing the bar (wrists moving up) OR letting go & walking away lowering arms
+                // (wrists moving down / shoulders not rising) can NEVER count a phantom pull-up!
+                pullupAnchorWindow.addLast(AnchorWristSample(timestampMs, activeWrSX, activeWrSY, activeShSY))
+                while (pullupAnchorWindow.size > 48 ||
+                    (pullupAnchorWindow.size > 2 && (timestampMs - pullupAnchorWindow.first().timestampMs) > 1000L)
+                ) {
+                    pullupAnchorWindow.removeFirst()
+                }
+                var minBarWrX = activeWrSX
+                var maxBarWrX = activeWrSX
+                var minBarWrY = activeWrSY
+                var maxBarWrY = activeWrSY
+                for (s in pullupAnchorWindow) {
+                    if (s.wristX < minBarWrX) minBarWrX = s.wristX
+                    if (s.wristX > maxBarWrX) maxBarWrX = s.wristX
+                    if (s.wristY < minBarWrY) minBarWrY = s.wristY
+                    if (s.wristY > maxBarWrY) maxBarWrY = s.wristY
+                }
+                val barWristsStable = (maxBarWrX - minBarWrX) <= 0.12f && (maxBarWrY - minBarWrY) <= 0.12f
+                if (barWristsStable && wristsAboveShTl >= -0.12f) {
+                    pullupBarAnchorStreak = (pullupBarAnchorStreak + 1).coerceAtMost(30)
+                } else {
+                    pullupBarAnchorStreak = 0
+                }
+                val handsAnchoredOnBar = isDeterministicPassThrough || (barWristsStable && pullupBarAnchorStreak >= 4)
+
+                // Calibrate dead-hang shoulder height while hanging straight-armed on the bar
+                if (handsAnchoredOnBar && activePullElbow >= 136f && wristsAboveShTl >= 0.26f) {
+                    pullupHangShoulderY = if (pullupHangShoulderY.isNaN()) {
+                        activeShSY
+                    } else {
+                        pullupHangShoulderY * 0.85f + activeShSY * 0.15f
+                    }
+                }
+                val shoulderLiftScreen = if (pullupHangShoulderY.isFinite()) {
+                    (pullupHangShoulderY - activeShSY).coerceAtLeast(0f)
+                } else {
+                    0f
+                }
+                if (isMidRep && handsAnchoredOnBar) {
+                    if (shoulderLiftScreen > pullupPeakShoulderLift) {
+                        pullupPeakShoulderLift = shoulderLiftScreen
+                    }
+                } else if (!isMidRep) {
+                    pullupPeakShoulderLift = 0f
+                }
+                val minRequiredShoulderLift = maxOf(0.032f, torsoVert2DGlobal * 0.16f)
+                val hadRealBodyLift = isDeterministicPassThrough || pullupPeakShoulderLift >= minRequiredShoulderLift
+
                 val noseY = geomPts[NOSE].y
-                val midWristY = (geomPts[LEFT_WRIST].y + geomPts[RIGHT_WRIST].y) * 0.5f
+                val midWristY = midWrPullG.y
                 val chinMargin = if (use3D) 0.06f else 0.035f
-                val chinOverHands = noseY < midWristY + chinMargin
+                val rawChinOverHands = noseY < midWristY + chinMargin
+                // Chin-over-bar ONLY counts when wrists are anchored on the bar & shoulders genuinely rose
+                // (never when wrists simply dropped down past your face!)
+                val chinOverHands = rawChinOverHands && handsAnchoredOnBar &&
+                    (isDeterministicPassThrough || shoulderLiftScreen >= minRequiredShoulderLift * 0.70f)
                 val bottomThresh = if (isStrict) 74f else 92f
                 val finishThresh = if (isStrict) 155f else 142f
                 val startThresh = if (isStrict) 148f else 140f
@@ -2795,21 +2902,44 @@ class BiomechanicsEngine(
                 } else {
                     activePullElbow
                 }
-                romPct = maxOf(
-                    mapRange(activePullElbow, 160f, if (isStrict) 58f else 76f),
-                    if (chinOverHands && activePullElbow < 122f) 96 else 0
-                )
+                romPct = if (!handsAnchoredOnBar) {
+                    0
+                } else {
+                    maxOf(
+                        mapRange(activePullElbow, 160f, if (isStrict) 58f else 76f),
+                        if (chinOverHands && activePullElbow < 122f) 96 else 0
+                    )
+                }
 
-                val cycle = updateDownUpCycle(
-                    metric = effectivePullMetric,
-                    startThreshold = startThresh,
-                    bottomThreshold = bottomThresh,
-                    finishThreshold = finishThresh,
-                    currentRom = romPct,
-                    primaryPosMeters = primaryPosMeters,
-                    instantSpeedMps = instantSpeedMps,
-                    timestampMs = timestampMs
-                )
+                // Never start or complete a pull-up while grabbing the bar, letting go, or without upward body lift!
+                val wristsOverheadForFinish = isDeterministicPassThrough || wristsAboveShTl >= 0.24f
+                val aboutToCompleteWithoutPhysics = !isDeterministicPassThrough &&
+                    reachedBottom &&
+                    effectivePullMetric >= finishThresh &&
+                    (!wristsOverheadForFinish || !hadRealBodyLift)
+
+                val cycle = when {
+                    !handsAnchoredOnBar -> {
+                        if (isMidRep) abortIncompleteRepCycle()
+                        requiresNeutralStart = true
+                        CycleResult(false, 0, 0f)
+                    }
+                    aboutToCompleteWithoutPhysics -> {
+                        abortIncompleteRepCycle()
+                        requiresNeutralStart = true
+                        CycleResult(false, 0, 0f)
+                    }
+                    else -> updateDownUpCycle(
+                        metric = effectivePullMetric,
+                        startThreshold = startThresh,
+                        bottomThreshold = bottomThresh,
+                        finishThreshold = finishThresh,
+                        currentRom = romPct,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
+                        timestampMs = timestampMs
+                    )
+                }
                 recordCompletedCycle(cycle, if (isArcher) activeLeft else null)
 
                 if (reachedBottom && !chinOverHands && activePullElbow < bottomThresh + 12f &&
@@ -2855,7 +2985,11 @@ class BiomechanicsEngine(
                         parentIndex = activeShIdx, childIndex = activeWrIdx, targetRangeText = "≤${bottomThresh.roundToInt()}°"
                     )
                 )
-                baseFeedback = "Tractions ($detectedVariantFr) — coudes vers les hanches."
+                baseFeedback = if (!handsAnchoredOnBar) {
+                    "Suspendez-vous bras tendus, mains fixes sur la barre."
+                } else {
+                    "Tractions ($detectedVariantFr) — coudes vers les hanches."
+                }
             }
 
             ExerciseType.BENT_ROW -> {
@@ -3207,17 +3341,24 @@ class BiomechanicsEngine(
                 }
 
                 val latTopThresh = if (isStrict) 78f else 72f
-                val cycle = updateUpDownCycle(
-                    metric = activeShoulder,
-                    startThreshold = if (isStrict) 28f else 34f,
-                    topThreshold = latTopThresh,
-                    finishThreshold = if (isStrict) 26f else 34f,
-                    extraTopCondition = true,
-                    currentRom = romPct,
-                    primaryPosMeters = primaryPosMeters,
-                    instantSpeedMps = instantSpeedMps,
-                    timestampMs = timestampMs
-                )
+                val latArmExtended = isDeterministicPassThrough || (elbowAngle >= 100f && activeShoulder <= 138f)
+                val cycle = if (!isDeterministicPassThrough && activeShoulder > 142f) {
+                    if (isMidRep) abortIncompleteRepCycle()
+                    requiresNeutralStart = true
+                    CycleResult(false, 0, 0f)
+                } else {
+                    updateUpDownCycle(
+                        metric = activeShoulder,
+                        startThreshold = if (isStrict) 28f else 34f,
+                        topThreshold = latTopThresh,
+                        finishThreshold = if (isStrict) 26f else 34f,
+                        extraTopCondition = latArmExtended,
+                        currentRom = romPct,
+                        primaryPosMeters = primaryPosMeters,
+                        instantSpeedMps = instantSpeedMps,
+                        timestampMs = timestampMs
+                    )
+                }
                 recordCompletedCycle(cycle, if (isUnilateral) activeLeft else null)
 
                 addSymmetryIssueIfNeeded(
@@ -3362,12 +3503,39 @@ class BiomechanicsEngine(
             ExerciseType.LUNGE,
             ExerciseType.BULGARIAN_SQUAT,
             ExerciseType.DEADLIFT,
-            ExerciseType.OVERHEAD_PRESS,
             ExerciseType.BICEP_CURL,
             ExerciseType.LATERAL_RAISE,
             ExerciseType.JUMPING_JACK -> {
                 if (fullBodyTilt >= 68f && torsoTilt >= 65f) {
                     "Redressez-vous debout pour cet exercice."
+                } else null
+            }
+            ExerciseType.OVERHEAD_PRESS -> {
+                if (fullBodyTilt >= 68f && torsoTilt >= 65f) {
+                    "Redressez-vous debout pour cet exercice."
+                } else if (!isDeterministicMode) {
+                    val wristsRelSh = (midShG.y - midWrG.y) / torsoLenG
+                    if ((!isMidRep && wristsRelSh < -0.45f) || (isMidRep && wristsRelSh < -0.68f)) {
+                        "Placez les mains à hauteur d'épaules pour pousser."
+                    } else null
+                } else null
+            }
+            ExerciseType.BENT_ROW -> {
+                if (fullBodyTilt >= 78f && torsoTilt >= 78f) {
+                    null
+                } else if (!isDeterministicMode) {
+                    val hingedForward = torsoTilt >= 18f || (!use3D && (torsoVert2DGlobal / shWidth2DGlobal) < 1.05f)
+                    if (!hingedForward) {
+                        "Penchez le buste en avant pour le rowing."
+                    } else null
+                } else null
+            }
+            ExerciseType.TRICEP_DIP -> {
+                if (!isDeterministicMode) {
+                    val wristsBelowShoulders = (midWrG.y - midShG.y) / torsoLenG >= 0.05f || activeWrSY > activeShSY + 0.02f
+                    if (!wristsBelowShoulders || torsoTilt > 58f) {
+                        "Prenez appui mains sous les épaules pour les dips."
+                    } else null
                 } else null
             }
             ExerciseType.GLUTE_BRIDGE -> {
@@ -3385,13 +3553,29 @@ class BiomechanicsEngine(
                 } else null
             }
             ExerciseType.PULL_UP -> {
-                // Prevent counting fake pull-ups when standing with hands relaxed down at waist
-                val minWrY = minOf(geomPts[LEFT_WRIST].y, geomPts[RIGHT_WRIST].y)
-                val shY = midShG.y
-                val handsNearOrAboveShoulders = (shY - minWrY) / torsoLenG >= -0.22f
-                if (!isMidRep && !handsNearOrAboveShoulders) {
-                    "Saisissez la barre bras au-dessus des épaules."
-                } else null
+                // Strict overhead pull-up bar gate — ALWAYS enforced (even mid-rep!):
+                // Blocks phantom reps when grabbing the bar OR dropping off & walking away lowering arms!
+                val wristsAboveShTl = (midShG.y - midWrG.y) / torsoLenG
+                val lowerWristAboveShTl = if (bothArmsVis) {
+                    (midShG.y - maxOf(geomPts[LEFT_WRIST].y, geomPts[RIGHT_WRIST].y)) / torsoLenG
+                } else {
+                    wristsAboveShTl
+                }
+                if (!isMidRep) {
+                    val readyOnBar = if (isDeterministicMode) {
+                        wristsAboveShTl >= 0.06f
+                    } else {
+                        wristsAboveShTl >= 0.28f && lowerWristAboveShTl >= 0.10f
+                    }
+                    if (!readyOnBar) {
+                        "Saisissez la barre bras tendus au-dessus de la tête."
+                    } else null
+                } else {
+                    // Even at top of a chest-to-bar pull-up, wrists NEVER drop down toward waist/hips!
+                    if (wristsAboveShTl < -0.14f || lowerWristAboveShTl < -0.26f) {
+                        "Saisissez la barre bras tendus au-dessus de la tête."
+                    } else null
+                }
             }
             else -> null
         }
