@@ -12,6 +12,7 @@ import com.kinetix.coach.data.WorkoutSession
 import com.kinetix.coach.vision.AutoExerciseDetector
 import com.kinetix.coach.vision.BiomechanicsEngine
 import com.kinetix.coach.vision.BiomechanicsFrame
+import com.kinetix.coach.vision.BufferedPoseFrame
 import com.kinetix.coach.vision.CalorieEngine
 import com.kinetix.coach.vision.ChallengeConfig
 import com.kinetix.coach.vision.ChallengeController
@@ -54,6 +55,7 @@ data class VisionUiState(
     val autoDetectStatusFr: String = "En attente de mouvement…",
     val isFrontCamera: Boolean = true,
     val isVoiceEnabled: Boolean = true,
+    val showDetailedAngles: Boolean = false,
     val isSessionActive: Boolean = true,
     val sessionStartMs: Long = System.currentTimeMillis(),
     val delegateLabel: String = "GPU",
@@ -97,10 +99,13 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     companion object {
         private const val PREF_STRICTNESS = "detection_strictness"
         private const val PREF_SETUP_DELAY_SEC = "setup_delay_sec"
+        private const val PREF_DETAILED_ANGLES = "show_detailed_angles"
         private const val PREF_CUSTOM_MUSIC_URI = "custom_music_uri"
         private const val PREF_CUSTOM_MUSIC_NAME = "custom_music_name"
         private const val PREF_MUSIC_TRACK = "preferred_music_track"
         private const val HUD_MINOR_UPDATE_INTERVAL_MS = 120L
+        private const val REPLAY_HISTORY_MAX_FRAMES = 75
+        private const val REPLAY_HISTORY_WINDOW_MS = 2400L
         private val SETUP_DELAY_PRESETS = listOf(0, 5, 8, 10)
     }
 
@@ -116,6 +121,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         ?.takeIf { it in SETUP_DELAY_PRESETS }
         ?: 5
 
+    private val initialDetailedAngles: Boolean = app.userDb.getPref(PREF_DETAILED_ANGLES, "false")
+        .equals("true", ignoreCase = true)
+
     private val engine = BiomechanicsEngine(
         initialExercise = ExerciseType.SQUAT,
         initialStrictness = initialStrictness
@@ -130,6 +138,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(
         VisionUiState(
             detectionStrictness = initialStrictness,
+            showDetailedAngles = initialDetailedAngles,
             setupDelaySec = initialSetupDelaySec,
             setupRemainingSec = initialSetupDelaySec,
             frame = engine.emptyFrame(),
@@ -143,7 +152,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     val uiState: StateFlow<VisionUiState> = _uiState.asStateFlow()
 
     // Dedicated full-FPS overlay state isolated from HUD telemetry recompositions
-    private val _poseOverlayState = MutableStateFlow(PoseOverlayState())
+    private val _poseOverlayState = MutableStateFlow(PoseOverlayState(showDetailedAngles = initialDetailedAngles))
     val poseOverlayState: StateFlow<PoseOverlayState> = _poseOverlayState.asStateFlow()
 
     private var lastRepSpoken = 0
@@ -153,6 +162,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private var challengeTickerJob: Job? = null
     private var musicStartedForChallenge = false
     private var lastActiveChallengeConfig: ChallengeConfig? = null
+
+    // Rolling ~2.4s landmark history for zero-lost-first-rep retroactive replay when AUTO switches exercises
+    private val recentPoseHistory = ArrayDeque<BufferedPoseFrame>(REPLAY_HISTORY_MAX_FRAMES + 4)
 
     // Multi-set & multi-exercise session accumulators (always guarded by pipelineLock)
     private var activeSetCaloriesKcal = 0.0
@@ -165,6 +177,26 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     init {
         if (initialSetupDelaySec > 0) {
             startSetupCountdown(initialSetupDelaySec, announce = false)
+        }
+    }
+
+    fun toggleDetailedAngles() {
+        val next = !_uiState.value.showDetailedAngles
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_DETAILED_ANGLES, next.toString())
+        }
+        _poseOverlayState.update { it.copy(showDetailedAngles = next) }
+        _uiState.update { it.copy(showDetailedAngles = next) }
+    }
+
+    fun setSetupDelay(seconds: Int) {
+        val clamped = if (seconds in SETUP_DELAY_PRESETS) seconds else 5
+        viewModelScope.launch(Dispatchers.IO) {
+            app.userDb.setPref(PREF_SETUP_DELAY_SEC, clamped.toString())
+        }
+        _uiState.update { it.copy(setupDelaySec = clamped) }
+        if (clamped == 0) {
+            skipSetupCountdown()
         }
     }
 
@@ -265,7 +297,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             resetMultiSetAccumulatorsLocked()
             emptyFrame = engine.emptyFrame()
         }
-        _poseOverlayState.value = PoseOverlayState()
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
         _uiState.update {
             it.copy(
                 selectedExercise = exercise,
@@ -300,6 +332,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleCamera() {
         synchronized(pipelineLock) {
             engine.resetTrackingFilters()
+            recentPoseHistory.clear()
             val lockTarget = if (_uiState.value.isAutoDetectEnabled) {
                 autoDetector.currentLockedExercise
             } else {
@@ -307,7 +340,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             }
             autoDetector.reset(initialLocked = lockTarget)
         }
-        _poseOverlayState.value = PoseOverlayState()
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
         _uiState.update { it.copy(isFrontCamera = !it.isFrontCamera) }
     }
 
@@ -453,7 +486,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             app.userDb.setPref(PREF_MUSIC_TRACK, resolvedTrack.id)
         }
 
-        _poseOverlayState.value = PoseOverlayState()
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
         _uiState.update {
             it.copy(
                 selectedExercise = targetExercise,
@@ -690,7 +723,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             emptyFrame = engine.emptyFrame()
         }
 
-        _poseOverlayState.value = PoseOverlayState()
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
         _uiState.update {
             it.copy(
                 currentSetNumber = it.currentSetNumber + 1,
@@ -722,6 +755,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         cancelRestTimer()
         synchronized(pipelineLock) {
             engine.armAfterSetup()
+            recentPoseHistory.clear()
         }
         _uiState.update {
             it.copy(isResting = false, restRemainingSec = 0)
@@ -756,6 +790,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         val safeSec = seconds.coerceIn(0, 30)
         synchronized(pipelineLock) {
             engine.armAfterSetup()
+            recentPoseHistory.clear()
             if (_uiState.value.isAutoDetectEnabled) {
                 autoDetector.reset(initialLocked = null)
             }
@@ -777,6 +812,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 if (updated == 0) {
                     synchronized(pipelineLock) {
                         engine.armAfterSetup()
+                        recentPoseHistory.clear()
                     }
                     _uiState.update {
                         it.copy(
@@ -807,6 +843,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         cancelSetupTimer()
         synchronized(pipelineLock) {
             engine.armAfterSetup()
+            recentPoseHistory.clear()
         }
         _uiState.update {
             it.copy(
@@ -832,6 +869,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 if (updated == 0) {
                     synchronized(pipelineLock) {
                         engine.armAfterSetup()
+                        recentPoseHistory.clear()
                     }
                     _uiState.update {
                         it.copy(
@@ -891,6 +929,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             // During Setup Countdown or Rest Timer: keep smooth 60 FPS skeleton framing preview
             // while completely disarming rep counting, VBT, auto-switching, calories, and posture faults!
             if (!inChallenge && (state.isSettingUp || state.isResting)) {
+                recentPoseHistory.clear()
                 val previewMsg = if (state.isSettingUp) {
                     "Installation (${state.setupRemainingSec}s) — posez le téléphone et mettez-vous en place"
                 } else {
@@ -904,7 +943,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     formQuality = FormQuality.GOOD,
                     imageWidth = safeW,
                     imageHeight = safeH,
-                    viewpointInfo = previewFrame.viewpointInfo
+                    viewpointInfo = previewFrame.viewpointInfo,
+                    showDetailedAngles = state.showDetailedAngles
                 )
                 val prevFrame = state.frame
                 if (previewFrame.poseDetected != prevFrame.poseDetected ||
@@ -917,6 +957,16 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     shouldUpdateHud = true
                 }
             } else {
+                // Record rolling ~2.4s pose buffer for zero-lost-first-rep retroactive AUTO replay
+                if (!inChallenge && state.isAutoDetectEnabled && screenPoints.size >= 29) {
+                    recentPoseHistory.addLast(BufferedPoseFrame(screenPoints, worldPoints, timestampMs))
+                    while (recentPoseHistory.size > REPLAY_HISTORY_MAX_FRAMES ||
+                        (recentPoseHistory.size > 2 && (timestampMs - recentPoseHistory.first().timestampMs) > REPLAY_HISTORY_WINDOW_MS)
+                    ) {
+                        recentPoseHistory.removeFirst()
+                    }
+                }
+
                 // 1. Run 3D multi-angle biomechanics + VBT velocity analysis + physics sanity gate first
                 val rawFrame = engine.processFrame(screenPoints, worldPoints, timestampMs)
                 var effectiveFrame = rawFrame
@@ -944,77 +994,105 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 // 3. Real-time anti-glitch automatic exercise detection (paused during active challenge)
                 var switchedExerciseNow = false
                 if (!inChallenge && state.isAutoDetectEnabled && screenPoints.size >= 29) {
-                val detect = autoDetector.processFrame(
-                    rawScreenPoints = screenPoints,
-                    rawWorldPoints = worldPoints,
-                    timestampMs = timestampMs,
-                    isMidRep = engine.isMidRep,
-                    hasActiveSetReps = engine.hasActiveSetReps,
-                    isTransitioning = rawFrame.isStabilizing
-                )
-                autoConf = detect.confidence
-                autoStatus = detect.statusFr
-                val detected = detect.detectedExercise
-                if (detected != null && detected != engine.currentExercise) {
-                    val prevEx = engine.currentExercise
-                    bankActiveExerciseWorkLocked(prevEx, rawFrame, activeSetCaloriesKcal)
-                    bankedRepsDelta = if (prevEx.isIsometric) 0 else rawFrame.repCount
-                    bankedHoldDelta = if (prevEx.isIsometric) rawFrame.isometricHoldSec.toInt() else 0
-                    bankedKcalDelta = activeSetCaloriesKcal
-                    activeSetCaloriesKcal = 0.0
-                    breakdownSnapshot = exerciseBreakdownMap.values.toList()
-
-                    // Smoothly switch without resetting One-Euro filters so skeleton stays fluid
-                    engine.switchExerciseSmoothly(detected)
-                    activeExercise = detected
-                    lastRepSpoken = 0
-                    switchedExerciseNow = true
-                    voiceToSpeak = "Exercice détecté : ${detected.labelFr}" to false
-
-                    effectiveFrame = rawFrame.copy(
-                        exercise = detected,
-                        repCount = 0,
-                        isometricHoldSec = 0f,
-                        phase = MovementPhase.READY,
-                        romPct = 0,
-                        repCompletedNow = false,
-                        completedRepRomPct = 0,
-                        completedRepDurationSec = 0f,
-                        isometricDeltaSec = 0f,
-                        detectedVariantFr = null,
-                        velocityTelemetry = engine.currentVelocityTelemetry()
+                    val detect = autoDetector.processFrame(
+                        rawScreenPoints = screenPoints,
+                        rawWorldPoints = worldPoints,
+                        timestampMs = timestampMs,
+                        isMidRep = engine.isMidRep,
+                        hasActiveSetReps = engine.hasActiveSetReps,
+                        isTransitioning = rawFrame.isStabilizing
                     )
-                }
-            }
+                    autoConf = detect.confidence
+                    autoStatus = detect.statusFr
+                    val detected = detect.detectedExercise
+                    if (detected != null && detected != engine.currentExercise) {
+                        val prevEx = engine.currentExercise
+                        bankActiveExerciseWorkLocked(prevEx, rawFrame, activeSetCaloriesKcal)
+                        bankedRepsDelta = if (prevEx.isIsometric) 0 else rawFrame.repCount
+                        bankedHoldDelta = if (prevEx.isIsometric) rawFrame.isometricHoldSec.toInt() else 0
+                        bankedKcalDelta = activeSetCaloriesKcal
+                        activeSetCaloriesKcal = 0.0
+                        breakdownSnapshot = exerciseBreakdownMap.values.toList()
 
-            currentSetKcalSnapshot = activeSetCaloriesKcal
+                        // Retroactive replay when switching from idle/0-rep or Plank into a dynamic exercise:
+                        // guarantees Rep #1 is synced live (or immediately credited) instead of ever being eaten!
+                        val shouldReplayFirstRep = !detected.isIsometric &&
+                            (rawFrame.repCount == 0 || prevEx == ExerciseType.PLANK) &&
+                            recentPoseHistory.size >= 6
+                        val replayedFrame = if (shouldReplayFirstRep) {
+                            engine.switchExerciseWithReplay(detected, recentPoseHistory.toList())
+                        } else {
+                            engine.switchExerciseSmoothly(detected)
+                            null
+                        }
+                        recentPoseHistory.clear()
+                        activeExercise = detected
+                        switchedExerciseNow = true
 
-            // 4. Advance active camera-verified Challenge OR prepare anti-spam Voice Coach cue
-            if (inChallenge) {
-                val totalKcal = state.sessionTotalCaloriesKcal + bankedKcalDelta + currentSetKcalSnapshot
-                challengeOutput = challengeController.onFrame(effectiveFrame, System.currentTimeMillis(), totalKcal)
-            } else if (!switchedExerciseNow && effectiveFrame.poseDetected && !effectiveFrame.isStabilizing && !state.isResting) {
-                if (!effectiveFrame.exercise.isIsometric && effectiveFrame.repCount > lastRepSpoken) {
-                    lastRepSpoken = effectiveFrame.repCount
-                    voiceToSpeak = (effectiveFrame.voiceCueFr ?: "${effectiveFrame.repCount}") to true
-                } else {
-                    // Strictly honor PostureFeedbackCoach's rate-limited voiceCueFr (never bypass to raw corrections!)
-                    effectiveFrame.voiceCueFr?.let { spokenCue ->
-                        voiceToSpeak = spokenCue to false
+                        if (replayedFrame != null) {
+                            effectiveFrame = replayedFrame
+                            if (replayedFrame.repCount > 0) {
+                                lastRepSpoken = replayedFrame.repCount
+                                activeSetCaloriesKcal += CalorieEngine.estimateIncrementalRepCalories(
+                                    exercise = detected,
+                                    romPct = replayedFrame.avgRomPct.coerceAtLeast(60),
+                                    repDurationSec = 1.6,
+                                    profile = profile
+                                ) * replayedFrame.repCount
+                                voiceToSpeak = "${replayedFrame.repCount}" to true
+                            } else {
+                                lastRepSpoken = 0
+                                voiceToSpeak = detected.labelFr to false
+                            }
+                        } else {
+                            lastRepSpoken = 0
+                            voiceToSpeak = detected.labelFr to false
+                            effectiveFrame = rawFrame.copy(
+                                exercise = detected,
+                                repCount = 0,
+                                isometricHoldSec = 0f,
+                                phase = MovementPhase.READY,
+                                romPct = 0,
+                                repCompletedNow = false,
+                                completedRepRomPct = 0,
+                                completedRepDurationSec = 0f,
+                                isometricDeltaSec = 0f,
+                                detectedVariantFr = null,
+                                velocityTelemetry = engine.currentVelocityTelemetry()
+                            )
+                        }
                     }
                 }
-            }
 
-            // 5. Full-FPS isolated overlay state
-            overlaySnapshot = PoseOverlayState(
-                landmarks = effectiveFrame.landmarks,
-                angleBadges = effectiveFrame.angleBadges,
-                corrections = effectiveFrame.corrections,
-                formQuality = effectiveFrame.formQuality,
-                imageWidth = safeW,
-                imageHeight = safeH,
-                viewpointInfo = effectiveFrame.viewpointInfo
-            )
+                currentSetKcalSnapshot = activeSetCaloriesKcal
+
+                // 4. Advance active camera-verified Challenge OR prepare anti-spam Voice Coach cue
+                if (inChallenge) {
+                    val totalKcal = state.sessionTotalCaloriesKcal + bankedKcalDelta + currentSetKcalSnapshot
+                    challengeOutput = challengeController.onFrame(effectiveFrame, System.currentTimeMillis(), totalKcal)
+                } else if (!switchedExerciseNow && effectiveFrame.poseDetected && !effectiveFrame.isStabilizing && !state.isResting) {
+                    if (!effectiveFrame.exercise.isIsometric && effectiveFrame.repCount > lastRepSpoken) {
+                        lastRepSpoken = effectiveFrame.repCount
+                        voiceToSpeak = (effectiveFrame.voiceCueFr ?: "${effectiveFrame.repCount}") to true
+                    } else {
+                        // Strictly honor PostureFeedbackCoach's rate-limited voiceCueFr (never bypass to raw corrections!)
+                        effectiveFrame.voiceCueFr?.let { spokenCue ->
+                            voiceToSpeak = spokenCue to false
+                        }
+                    }
+                }
+
+                // 5. Full-FPS isolated overlay state
+                overlaySnapshot = PoseOverlayState(
+                    landmarks = effectiveFrame.landmarks,
+                    angleBadges = effectiveFrame.angleBadges,
+                    corrections = effectiveFrame.corrections,
+                    formQuality = effectiveFrame.formQuality,
+                    imageWidth = safeW,
+                    imageHeight = safeH,
+                    viewpointInfo = effectiveFrame.viewpointInfo,
+                    showDetailedAngles = state.showDetailedAngles
+                )
 
             // 6. Deduplicate & throttle HUD updates so Compose UI never churns on sub-pixel noise
             val prevFrame = state.frame
@@ -1109,7 +1187,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             resetMultiSetAccumulatorsLocked()
             emptyFrame = engine.emptyFrame()
         }
-        _poseOverlayState.value = PoseOverlayState()
+        _poseOverlayState.value = PoseOverlayState(showDetailedAngles = _uiState.value.showDetailedAngles)
         _uiState.update {
             it.copy(
                 sessionStartMs = System.currentTimeMillis(),
@@ -1341,6 +1419,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun resetMultiSetAccumulatorsLocked() {
+        recentPoseHistory.clear()
         activeSetCaloriesKcal = 0.0
         formScoreWeightedSum = 0L
         romWeightedSum = 0L

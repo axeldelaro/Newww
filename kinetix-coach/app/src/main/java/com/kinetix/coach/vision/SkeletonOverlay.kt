@@ -53,7 +53,8 @@ data class PoseOverlayState(
     val formQuality: FormQuality = FormQuality.GOOD,
     val imageWidth: Int = 480,
     val imageHeight: Int = 640,
-    val viewpointInfo: ViewpointInfo = ViewpointInfo()
+    val viewpointInfo: ViewpointInfo = ViewpointInfo(),
+    val showDetailedAngles: Boolean = false
 )
 
 @Composable
@@ -61,7 +62,8 @@ fun SkeletonOverlay(
     frame: BiomechanicsFrame,
     imageWidth: Int,
     imageHeight: Int,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    showDetailedAngles: Boolean = false
 ) {
     SkeletonOverlay(
         overlayState = PoseOverlayState(
@@ -71,7 +73,8 @@ fun SkeletonOverlay(
             formQuality = frame.formQuality,
             imageWidth = imageWidth,
             imageHeight = imageHeight,
-            viewpointInfo = frame.viewpointInfo
+            viewpointInfo = frame.viewpointInfo,
+            showDetailedAngles = showDetailedAngles
         ),
         modifier = modifier
     )
@@ -85,7 +88,7 @@ fun SkeletonOverlay(
     val textPaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = CrispWhite.toArgb()
-            textSize = 28f
+            textSize = 26f
             isFakeBoldText = true
             textAlign = Paint.Align.CENTER
         }
@@ -93,17 +96,17 @@ fun SkeletonOverlay(
     val pillBgPaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = ObsidianBg.copy(alpha = 0.90f).toArgb()
+            color = ObsidianBg.copy(alpha = 0.84f).toArgb()
         }
     }
     val pillBorderPaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 2.5f
+            strokeWidth = 2f
         }
     }
     val ghostDashEffect = remember {
-        PathEffect.dashPathEffect(floatArrayOf(16f, 10f), 0f)
+        PathEffect.dashPathEffect(floatArrayOf(14f, 10f), 0f)
     }
     val reusableHeadPath = remember { Path() }
     val reusablePillRect = remember { RectF() }
@@ -132,13 +135,18 @@ fun SkeletonOverlay(
         )
 
         val vp = overlayState.viewpointInfo
+        val detailed = overlayState.showDetailedAngles
         val boneColor = when (overlayState.formQuality) {
             FormQuality.GOOD -> FormGood
             FormQuality.CAUTION -> FormCaution
             FormQuality.FAULT -> FormFault
         }
 
-        // 1. Draw crisp structural bones (subtle dim on occluded far side during pure side profile)
+        // 1. Sleek refined structural bones (clean minimalist studio look; far side gently dimmed in profile)
+        val haloWidth = if (detailed) 8.5f else 6.5f
+        val strokeWidth = if (detailed) 4.4f else 3.4f
+        val baseAlpha = if (detailed) 0.95f else 0.84f
+
         for ((aIdx, bIdx) in POSE_BONES) {
             if (aIdx >= pts.size || bIdx >= pts.size) continue
             val a = pts[aIdx]
@@ -148,74 +156,71 @@ fun SkeletonOverlay(
                 (vp.dominantSideLeft && aIdx in RIGHT_ONLY_INDICES && bIdx in RIGHT_ONLY_INDICES) ||
                     (!vp.dominantSideLeft && aIdx in LEFT_ONLY_INDICES && bIdx in LEFT_ONLY_INDICES)
                 )
-            val alphaMult = if (isFarSide) 0.38f else 1f
+            val alphaMult = if (isFarSide) 0.32f else baseAlpha
             val pA = mapPoint(a)
             val pB = mapPoint(b)
             drawLine(
-                color = Color(0xAA0B0C0E).copy(alpha = 0.68f * alphaMult),
+                color = Color(0xAA0B0C0E).copy(alpha = 0.55f * alphaMult),
                 start = pA,
                 end = pB,
-                strokeWidth = 9.5f,
+                strokeWidth = haloWidth,
                 cap = StrokeCap.Round
             )
             drawLine(
                 color = boneColor.copy(alpha = alphaMult),
                 start = pA,
                 end = pB,
-                strokeWidth = 4.8f,
+                strokeWidth = strokeWidth,
                 cap = StrokeCap.Round
             )
         }
 
-        // 2. Draw live angular protractor arcs at active joints
-        for (badge in overlayState.angleBadges) {
-            val pIdx = badge.parentIndex
-            val jIdx = badge.landmarkIndex
-            val cIdx = badge.childIndex
-            if (pIdx !in pts.indices || jIdx !in pts.indices || cIdx !in pts.indices) continue
-            val pParent = mapPoint(pts[pIdx])
-            val pJoint = mapPoint(pts[jIdx])
-            val pChild = mapPoint(pts[cIdx])
+        // 2. Angular protractor arcs (ONLY in Detailed Biomechanics mode — keeps default view ultra-clean!)
+        if (detailed) {
+            for (badge in overlayState.angleBadges) {
+                val pIdx = badge.parentIndex
+                val jIdx = badge.landmarkIndex
+                val cIdx = badge.childIndex
+                if (pIdx !in pts.indices || jIdx !in pts.indices || cIdx !in pts.indices) continue
+                val pParent = mapPoint(pts[pIdx])
+                val pJoint = mapPoint(pts[jIdx])
+                val pChild = mapPoint(pts[cIdx])
 
-            val startAngleDeg = (atan2((pParent.y - pJoint.y).toDouble(), (pParent.x - pJoint.x).toDouble()) * 180.0 / PI).toFloat()
-            val endAngleDeg = (atan2((pChild.y - pJoint.y).toDouble(), (pChild.x - pJoint.x).toDouble()) * 180.0 / PI).toFloat()
-            var sweepDeg = endAngleDeg - startAngleDeg
-            while (sweepDeg > 180f) sweepDeg -= 360f
-            while (sweepDeg < -180f) sweepDeg += 360f
+                val startAngleDeg = (atan2((pParent.y - pJoint.y).toDouble(), (pParent.x - pJoint.x).toDouble()) * 180.0 / PI).toFloat()
+                val endAngleDeg = (atan2((pChild.y - pJoint.y).toDouble(), (pChild.x - pJoint.x).toDouble()) * 180.0 / PI).toFloat()
+                var sweepDeg = endAngleDeg - startAngleDeg
+                while (sweepDeg > 180f) sweepDeg -= 360f
+                while (sweepDeg < -180f) sweepDeg += 360f
 
-            val arcColor = qualityColor(badge.quality)
-            val radius = 38f
-            val topLeft = Offset(pJoint.x - radius, pJoint.y - radius)
-            val arcSize = Size(radius * 2f, radius * 2f)
+                val arcColor = qualityColor(badge.quality)
+                val radius = 34f
+                val topLeft = Offset(pJoint.x - radius, pJoint.y - radius)
+                val arcSize = Size(radius * 2f, radius * 2f)
 
-            drawArc(
-                color = arcColor.copy(alpha = 0.17f),
-                startAngle = startAngleDeg,
-                sweepAngle = sweepDeg,
-                useCenter = true,
-                topLeft = topLeft,
-                size = arcSize
-            )
-            drawArc(
-                color = arcColor,
-                startAngle = startAngleDeg,
-                sweepAngle = sweepDeg,
-                useCenter = false,
-                topLeft = topLeft,
-                size = arcSize,
-                style = Stroke(width = 3.5f, cap = StrokeCap.Round)
-            )
-            // Precision Swiss radial ticks at arc boundaries
-            for (edgeDeg in floatArrayOf(startAngleDeg, startAngleDeg + sweepDeg)) {
-                val rad = edgeDeg * PI / 180.0
-                val inner = Offset(pJoint.x + (radius - 5f) * cos(rad).toFloat(), pJoint.y + (radius - 5f) * sin(rad).toFloat())
-                val outer = Offset(pJoint.x + (radius + 5f) * cos(rad).toFloat(), pJoint.y + (radius + 5f) * sin(rad).toFloat())
-                drawLine(color = CrispWhite.copy(alpha = 0.85f), start = inner, end = outer, strokeWidth = 2f)
+                drawArc(
+                    color = arcColor.copy(alpha = 0.14f),
+                    startAngle = startAngleDeg,
+                    sweepAngle = sweepDeg,
+                    useCenter = true,
+                    topLeft = topLeft,
+                    size = arcSize
+                )
+                drawArc(
+                    color = arcColor,
+                    startAngle = startAngleDeg,
+                    sweepAngle = sweepDeg,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = 3f, cap = StrokeCap.Round)
+                )
             }
         }
 
-        // 3. Draw dashed ideal-target ghost limb vectors for active corrections
-        for (corr in overlayState.corrections) {
+        // 3. Subtle ideal-target ghost line (ONLY when a real confirmed posture fault is active)
+        val primaryCorr = overlayState.corrections.firstOrNull()
+        val ghostCorrections = if (detailed) overlayState.corrections else listOfNotNull(primaryCorr)
+        for (corr in ghostCorrections) {
             if (corr.ghostAnchorIndex in pts.indices &&
                 corr.ghostTargetX.isFinite() &&
                 corr.ghostTargetY.isFinite()
@@ -223,88 +228,78 @@ fun SkeletonOverlay(
                 val anchor = mapPoint(pts[corr.ghostAnchorIndex])
                 val target = mapNorm(corr.ghostTargetX, corr.ghostTargetY)
                 drawLine(
-                    color = ObsidianBg.copy(alpha = 0.65f),
+                    color = ObsidianBg.copy(alpha = 0.55f),
                     start = anchor,
                     end = target,
-                    strokeWidth = 7.5f,
+                    strokeWidth = 6f,
                     cap = StrokeCap.Round,
                     pathEffect = ghostDashEffect
                 )
                 drawLine(
-                    color = FormGood.copy(alpha = 0.90f),
+                    color = FormGood.copy(alpha = 0.85f),
                     start = anchor,
                     end = target,
-                    strokeWidth = 4f,
+                    strokeWidth = 3.2f,
                     cap = StrokeCap.Round,
                     pathEffect = ghostDashEffect
                 )
                 drawCircle(
-                    color = ObsidianBg.copy(alpha = 0.85f),
-                    radius = 10f,
-                    center = target
-                )
-                drawCircle(
-                    color = FormGood,
-                    radius = 8f,
+                    color = FormGood.copy(alpha = 0.90f),
+                    radius = 6.5f,
                     center = target,
-                    style = Stroke(width = 3f)
+                    style = Stroke(width = 2.5f)
                 )
             }
         }
 
-        // 4. Draw crisp directional correction arrows anchored at off-target joints
-        for (corr in overlayState.corrections.take(2)) {
-            if (corr.jointIndex !in pts.indices) continue
-            val dirLen = hypot(corr.arrowDx, corr.arrowDy)
-            if (dirLen < 0.1f) continue
-            val ux = corr.arrowDx / dirLen
-            val uy = corr.arrowDy / dirLen
+        // 4. Directional correction arrows (ONLY in Detailed mode)
+        if (detailed) {
+            for (corr in overlayState.corrections.take(1)) {
+                if (corr.jointIndex !in pts.indices) continue
+                val dirLen = hypot(corr.arrowDx, corr.arrowDy)
+                if (dirLen < 0.1f) continue
+                val ux = corr.arrowDx / dirLen
+                val uy = corr.arrowDy / dirLen
 
-            val joint = mapPoint(pts[corr.jointIndex])
-            val start = Offset(joint.x + ux * 20f, joint.y + uy * 20f)
-            val tip = Offset(joint.x + ux * 84f, joint.y + uy * 84f)
-            val arrowColor = when (corr.severity) {
-                FormQuality.FAULT -> FormFault
-                FormQuality.CAUTION -> SignalOrange
-                FormQuality.GOOD -> FormGood
+                val joint = mapPoint(pts[corr.jointIndex])
+                val start = Offset(joint.x + ux * 18f, joint.y + uy * 18f)
+                val tip = Offset(joint.x + ux * 74f, joint.y + uy * 74f)
+                val arrowColor = qualityColor(corr.severity)
+
+                drawLine(
+                    color = ObsidianBg.copy(alpha = 0.75f),
+                    start = start,
+                    end = tip,
+                    strokeWidth = 8.5f,
+                    cap = StrokeCap.Round
+                )
+                drawLine(
+                    color = arrowColor,
+                    start = start,
+                    end = tip,
+                    strokeWidth = 4.5f,
+                    cap = StrokeCap.Round
+                )
+
+                val perpX = -uy
+                val perpY = ux
+                val headLen = 17f
+                val headHalfW = 10f
+                val baseX = tip.x - ux * headLen
+                val baseY = tip.y - uy * headLen
+                reusableHeadPath.reset()
+                reusableHeadPath.moveTo(tip.x, tip.y)
+                reusableHeadPath.lineTo(baseX + perpX * headHalfW, baseY + perpY * headHalfW)
+                reusableHeadPath.lineTo(baseX - perpX * headHalfW, baseY - perpY * headHalfW)
+                reusableHeadPath.close()
+                drawPath(path = reusableHeadPath, color = arrowColor)
             }
-
-            // Contrast shaft + signal shaft
-            drawLine(
-                color = ObsidianBg.copy(alpha = 0.85f),
-                start = start,
-                end = tip,
-                strokeWidth = 10f,
-                cap = StrokeCap.Round
-            )
-            drawLine(
-                color = arrowColor,
-                start = start,
-                end = tip,
-                strokeWidth = 5.5f,
-                cap = StrokeCap.Round
-            )
-
-            // Solid precision triangular arrowhead
-            val perpX = -uy
-            val perpY = ux
-            val headLen = 20f
-            val headHalfW = 12f
-            val baseX = tip.x - ux * headLen
-            val baseY = tip.y - uy * headLen
-            reusableHeadPath.reset()
-            reusableHeadPath.moveTo(tip.x, tip.y)
-            reusableHeadPath.lineTo(baseX + perpX * headHalfW, baseY + perpY * headHalfW)
-            reusableHeadPath.lineTo(baseX - perpX * headHalfW, baseY - perpY * headHalfW)
-            reusableHeadPath.close()
-            drawPath(path = reusableHeadPath, color = ObsidianBg.copy(alpha = 0.8f), style = Stroke(width = 4f))
-            drawPath(path = reusableHeadPath, color = arrowColor)
         }
 
-        val highlightedIndices = overlayState.angleBadges.map { it.landmarkIndex }.toSet()
+        val highlightedIndices = if (detailed) overlayState.angleBadges.map { it.landmarkIndex }.toSet() else emptySet()
         val correctingIndices = overlayState.corrections.map { it.jointIndex }.toSet()
 
-        // 5. Draw precision joint markers
+        // 5. Minimalist joint markers
         for (idx in KEY_JOINTS) {
             if (idx >= pts.size) continue
             val p = pts[idx]
@@ -313,11 +308,11 @@ fun SkeletonOverlay(
             val isCorrecting = idx in correctingIndices
             val isHighlighted = idx in highlightedIndices
             drawCircle(
-                color = ObsidianBg,
+                color = ObsidianBg.copy(alpha = 0.80f),
                 radius = when {
-                    isCorrecting -> 12f
-                    isHighlighted -> 10.5f
-                    else -> 7f
+                    isCorrecting -> 10f
+                    isHighlighted -> 8.5f
+                    else -> 5.4f
                 },
                 center = center
             )
@@ -325,37 +320,39 @@ fun SkeletonOverlay(
                 color = when {
                     isCorrecting -> FormFault
                     isHighlighted -> SignalOrange
-                    else -> CrispWhite
+                    else -> CrispWhite.copy(alpha = 0.92f)
                 },
                 radius = when {
-                    isCorrecting -> 8f
-                    isHighlighted -> 7f
-                    else -> 4.2f
+                    isCorrecting -> 6.5f
+                    isHighlighted -> 5.5f
+                    else -> 3.2f
                 },
                 center = center
             )
         }
 
-        // 6. Draw exact degree pills ("114°→95°" when correcting, "86°" when optimal)
-        val nativeCanvas = drawContext.canvas.nativeCanvas
-        for (badge in overlayState.angleBadges) {
-            val anchor = mapNorm(badge.x, badge.y)
-            val label = if (badge.targetDegHint != null) {
-                "${badge.degrees}°→${badge.targetDegHint}°"
-            } else {
-                "${badge.degrees}°"
-            }
-            val badgeColor = qualityColor(badge.quality)
-            val textWidth = textPaint.measureText(label)
-            val halfW = (textWidth * 0.5f + 16f).coerceAtLeast(38f)
-            val bx = (anchor.x + halfW + 18f).coerceIn(halfW + 10f, size.width - halfW - 10f)
-            val by = (anchor.y - 34f).coerceIn(42f, size.height - 42f)
-            reusablePillRect.set(bx - halfW, by - 23f, bx + halfW, by + 15f)
+        // 6. Floating degree pills (ONLY in Detailed mode — keeps default camera 100% uncluttered!)
+        if (detailed) {
+            val nativeCanvas = drawContext.canvas.nativeCanvas
+            for (badge in overlayState.angleBadges) {
+                val anchor = mapNorm(badge.x, badge.y)
+                val label = if (badge.targetDegHint != null) {
+                    "${badge.degrees}°→${badge.targetDegHint}°"
+                } else {
+                    "${badge.degrees}°"
+                }
+                val badgeColor = qualityColor(badge.quality)
+                val textWidth = textPaint.measureText(label)
+                val halfW = (textWidth * 0.5f + 14f).coerceAtLeast(34f)
+                val bx = (anchor.x + halfW + 16f).coerceIn(halfW + 10f, size.width - halfW - 10f)
+                val by = (anchor.y - 30f).coerceIn(42f, size.height - 42f)
+                reusablePillRect.set(bx - halfW, by - 20f, bx + halfW, by + 13f)
 
-            pillBorderPaint.color = badgeColor.toArgb()
-            nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBgPaint)
-            nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBorderPaint)
-            nativeCanvas.drawText(label, bx, by + 5f, textPaint)
+                pillBorderPaint.color = badgeColor.toArgb()
+                nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBgPaint)
+                nativeCanvas.drawRoundRect(reusablePillRect, 9f, 9f, pillBorderPaint)
+                nativeCanvas.drawText(label, bx, by + 4f, textPaint)
+            }
         }
     }
 }

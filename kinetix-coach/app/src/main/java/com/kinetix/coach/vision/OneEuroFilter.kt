@@ -9,8 +9,8 @@ import kotlin.math.abs
  * cutoff frequency during high-velocity explosive movements for near-zero phase lag.
  */
 class OneEuroFilter1D(
-    private val minCutoff: Float = 1.25f,
-    private val beta: Float = 0.08f,
+    private val minCutoff: Float = 1.65f,
+    private val beta: Float = 0.12f,
     private val dCutoff: Float = 1.0f
 ) {
     private var initialized: Boolean = false
@@ -76,8 +76,8 @@ class OneEuroFilter1D(
  */
 class PoseOneEuroSmoother(
     private val landmarkCount: Int = 33,
-    private val minCutoff: Float = 1.25f,
-    private val beta: Float = 0.08f,
+    private val minCutoff: Float = 1.65f,
+    private val beta: Float = 0.12f,
     private val dCutoff: Float = 1.0f,
     private val visibilityAlpha: Float = 0.45f
 ) {

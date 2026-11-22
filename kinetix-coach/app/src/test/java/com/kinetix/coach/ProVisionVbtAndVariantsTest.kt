@@ -5,6 +5,7 @@ import com.kinetix.coach.data.MovementPhase
 import com.kinetix.coach.vision.AngleCorrection
 import com.kinetix.coach.vision.AutoExerciseDetector
 import com.kinetix.coach.vision.BiomechanicsEngine
+import com.kinetix.coach.vision.BufferedPoseFrame
 import com.kinetix.coach.vision.FormQuality
 import com.kinetix.coach.vision.PosePoint
 import com.kinetix.coach.vision.PostureFeedbackCoach
@@ -905,5 +906,131 @@ class ProVisionVbtAndVariantsTest {
             }
             assertEquals("Standing up from floor in BURPEE mode must count 0 fake burpees", 0, engine.emptyFrame().repCount)
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. RETROACTIVE AUTO-SWITCH REPLAY (ZERO LOST REP #1) & MONOCULAR PUSH-UP SELF-CALIBRATION
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun autoSwitchRetroactiveReplay_recoversFirstRepWithoutDroppingCount() {
+        // 8A. Full Rep #1 already completed just as AUTO confirms SQUAT -> PUSHUP
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.SQUAT)
+            val history = ArrayList<BufferedPoseFrame>()
+            var ts = 1000L
+
+            // Brief plank hold + complete Rep #1 while engine is still on default SQUAT
+            repeat(6) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildPushup3D(164f, depthFrac = 0f), yawDeg = 35f)
+                history.add(BufferedPoseFrame(s, w, ts))
+                engine.processFrame(s, w, ts)
+            }
+            for (i in 0 until 36) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val (s, w) = rotateAndProject(buildPushup3D(164f - p * 78f, depthFrac = p), yawDeg = 35f)
+                history.add(BufferedPoseFrame(s, w, ts))
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("SQUAT engine must not have counted push-ups as squats", 0, engine.emptyFrame().repCount)
+
+            // AUTO switches to PUSHUP and retroactively replays buffered history -> Rep #1 recovered!
+            val replayed = engine.switchExerciseWithReplay(ExerciseType.PUSHUP, history)
+            assertNotNull("Replay must return latest frame", replayed)
+            assertEquals("Retroactive AUTO replay must immediately recover Rep #1", 1, replayed!!.repCount)
+
+            // Athlete continues with 3 more push-ups -> total MUST be 4/4!
+            repeat(3) {
+                for (i in 0 until 36) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildPushup3D(164f - p * 78f, depthFrac = p), yawDeg = 35f)
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("Rep #1 recovered + 3 live push-ups must equal 4", 4, engine.emptyFrame().repCount)
+        }
+
+        // 8B. Mid-rep AUTO switch right at the bottom of Rep #1 (still descending/bottoming when AUTO locks in)
+        run {
+            val engine = BiomechanicsEngine(ExerciseType.SQUAT)
+            val history = ArrayList<BufferedPoseFrame>()
+            var ts = 2000L
+
+            repeat(5) {
+                ts += 33L
+                val (s, w) = rotateAndProject(buildPushup3D(164f, depthFrac = 0f), yawDeg = 35f)
+                history.add(BufferedPoseFrame(s, w, ts))
+                engine.processFrame(s, w, ts)
+            }
+            // Descend to bottom of Rep #1 (first half of cosine)
+            for (i in 0 until 18) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val (s, w) = rotateAndProject(buildPushup3D(164f - p * 78f, depthFrac = p), yawDeg = 35f)
+                history.add(BufferedPoseFrame(s, w, ts))
+                engine.processFrame(s, w, ts)
+            }
+
+            // AUTO switches mid-rep right at the bottom -> replay syncs ECCENTRIC/BOTTOM state!
+            val midFrame = engine.switchExerciseWithReplay(ExerciseType.PUSHUP, history)
+            assertNotNull(midFrame)
+            assertEquals("Rep #1 not finished yet at bottom", 0, midFrame!!.repCount)
+
+            // Finish pushing up on Rep #1 (second half of cosine)
+            for (i in 18 until 36) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val (s, w) = rotateAndProject(buildPushup3D(164f - p * 78f, depthFrac = p), yawDeg = 35f)
+                engine.processFrame(s, w, ts)
+            }
+            assertEquals("Finishing Rep #1 after mid-rep AUTO switch must count 1", 1, engine.emptyFrame().repCount)
+
+            // 2 more reps -> total 3/3!
+            repeat(2) {
+                for (i in 0 until 36) {
+                    ts += 33L
+                    val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                    val (s, w) = rotateAndProject(buildPushup3D(164f - p * 78f, depthFrac = p), yawDeg = 35f)
+                    engine.processFrame(s, w, ts)
+                }
+            }
+            assertEquals("Mid-rep AUTO switch + 2 more reps must equal 3", 3, engine.emptyFrame().repCount)
+        }
+    }
+
+    @Test
+    fun monocularPushup3DBias_selfCalibratesTopElbowAndCountsEveryRepCleanly() {
+        // Real front/oblique floor cameras frequently under-read straight locked push-up arms at ~134°
+        // instead of ideal 165° due to monocular 3D foreshortening. Previously, elbowProgress stayed > 0.34f
+        // and trapped reps in CONCENTRIC (or blocked requiresNeutralStart).
+        val engine = BiomechanicsEngine(ExerciseType.PUSHUP)
+        var ts = 1000L
+
+        // Initial plank top with monocular-biased 134° straight arms (10 frames)
+        repeat(10) {
+            ts += 33L
+            val (s, w) = rotateAndProject(buildPushup3D(134f, depthFrac = 0f), yawDeg = 20f)
+            engine.processFrame(s, w, ts)
+        }
+
+        // Perform 4 continuous smooth push-ups oscillating 134° (top) -> 88° (bottom) -> 134° (top)
+        repeat(4) {
+            for (i in 0 until 36) {
+                ts += 33L
+                val p = (0.5f - 0.5f * cos(2.0 * PI * (i / 35.0))).toFloat()
+                val elbowDeg = 134f - p * 46f
+                val (s, w) = rotateAndProject(buildPushup3D(elbowDeg, depthFrac = p * 0.88f), yawDeg = 20f)
+                engine.processFrame(s, w, ts)
+            }
+        }
+
+        assertEquals(
+            "Self-calibrating top-elbow lockout must count all 4 monocular-biased (134° top) push-ups",
+            4,
+            engine.emptyFrame().repCount
+        )
     }
 }

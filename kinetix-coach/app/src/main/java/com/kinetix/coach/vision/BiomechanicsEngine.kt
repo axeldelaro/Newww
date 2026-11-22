@@ -98,6 +98,12 @@ data class BiomechanicsFrame(
     val completedRepVelocityMps: Float = 0f
 )
 
+data class BufferedPoseFrame(
+    val screenPoints: List<PosePoint>,
+    val worldPoints: List<PosePoint>,
+    val timestampMs: Long
+)
+
 /**
  * Pure-Kotlin real-time 3D multi-angle biomechanics & VBT analyzer for all 16 KINETIX exercises.
  *
@@ -314,7 +320,8 @@ class BiomechanicsEngine(
         val normHeight: Float,
         val wristX: Float,
         val wristY: Float,
-        val elbowDeg: Float
+        val elbowDeg: Float,
+        val armRatio: Float
     )
 
     private val isDeterministicMode: Boolean
@@ -401,6 +408,33 @@ class BiomechanicsEngine(
         currentExercise = exercise
         velocityEstimator.setExercise(exercise, clearSessionHistory = false)
         resetExerciseCountersOnly()
+    }
+
+    /**
+     * Switches to a newly auto-detected exercise and replays the last ~2.2 seconds of buffered pose
+     * frames chronologically (< 0.5 ms pure Kotlin) so an in-progress or just-completed Rep #1 is
+     * NEVER lost during initial AUTO exercise detection!
+     */
+    fun switchExerciseWithReplay(
+        exercise: ExerciseType,
+        recentFrames: List<BufferedPoseFrame>
+    ): BiomechanicsFrame? {
+        if (recentFrames.isEmpty()) {
+            switchExerciseSmoothly(exercise)
+            return null
+        }
+        currentExercise = exercise
+        velocityEstimator.setExercise(exercise, clearSessionHistory = false)
+        resetTrackingFilters()
+        resetExerciseCountersOnly()
+        var lastFrame: BiomechanicsFrame? = null
+        var lastTs = Long.MIN_VALUE
+        for (buffered in recentFrames) {
+            if (buffered.timestampMs <= lastTs) continue
+            lastTs = buffered.timestampMs
+            lastFrame = processFrame(buffered.screenPoints, buffered.worldPoints, buffered.timestampMs)
+        }
+        return lastFrame
     }
 
     /**
@@ -1211,7 +1245,7 @@ class BiomechanicsEngine(
                     metric = effectiveSquatMetric,
                     startThreshold = if (isStrict) 152f else 148f,
                     bottomThreshold = if (isStrict) 98f else 108f,
-                    finishThreshold = if (isStrict) 156f else 150f,
+                    finishThreshold = if (isStrict) 156f else 144f,
                     currentRom = romPct,
                     primaryPosMeters = primaryPosMeters,
                     instantSpeedMps = instantSpeedMps,
@@ -1459,29 +1493,25 @@ class BiomechanicsEngine(
                     isIncline -> 108f
                     else -> 110f
                 }
-                val elbowProgress = ((148f - activeElbow) / (148f - elbowBottomTarget).coerceAtLeast(10f))
-                    .coerceIn(0f, 1.25f)
 
-                // Signal B: Self-normalized 3D arm compression ratio (shoulder-to-wrist chord / anatomical arm length)
-                val armCompProgress = if (use3D && bestArmVis >= 0.42f) {
-                    fun compForSide(sI: Int, eI: Int, wI: Int): Float {
+                // Compute current 3D arm chord compression ratio (shoulder-to-wrist chord / anatomical arm length)
+                val activeArmRatio = if (use3D && bestArmVis >= 0.42f) {
+                    fun ratioForSide(sI: Int, eI: Int, wI: Int): Float {
                         val totalLen = (dist3D(worldPts[sI], worldPts[eI]) + dist3D(worldPts[eI], worldPts[wI]))
                             .coerceAtLeast(0.24f)
                         val chord = dist3D(worldPts[sI], worldPts[wI])
-                        val ratio = (chord / totalLen).coerceIn(0.40f, 1.0f)
-                        val span = if (isStrict) 0.22f else 0.16f
-                        return ((0.96f - ratio) / span).coerceIn(0f, 1.25f)
+                        return (chord / totalLen).coerceIn(0.40f, 1.0f)
                     }
-                    val lComp = compForSide(LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST)
-                    val rComp = compForSide(RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST)
+                    val lRatio = ratioForSide(LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST)
+                    val rRatio = ratioForSide(RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST)
                     when {
-                        isArcher && bothArmsVis -> maxOf(lComp, rComp)
-                        bothArmsVis -> 0.40f * ((lComp + rComp) * 0.5f) + 0.60f * maxOf(lComp, rComp)
-                        lArmW >= rArmW -> lComp
-                        else -> rComp
+                        isArcher && bothArmsVis -> minOf(lRatio, rRatio)
+                        bothArmsVis -> 0.40f * ((lRatio + rRatio) * 0.5f) + 0.60f * minOf(lRatio, rRatio)
+                        lArmW >= rArmW -> lRatio
+                        else -> rRatio
                     }
                 } else {
-                    0f
+                    1.0f
                 }
 
                 // Signal C: Anti-lockup sliding-window screen-space Chest+Head vertical drop relative to planted wrists
@@ -1501,7 +1531,8 @@ class BiomechanicsEngine(
                             normHeight = currentScreenHeight,
                             wristX = activeWrSX,
                             wristY = activeWrSY,
-                            elbowDeg = activeElbow
+                            elbowDeg = activeElbow,
+                            armRatio = activeArmRatio
                         )
                     )
                     while (pushupHeightWindow.size > 120 ||
@@ -1544,12 +1575,17 @@ class BiomechanicsEngine(
                     }
                 }
 
-                // Verify wrists stayed planted on floor in BOTH X and Y (prevents adjusting hand spacing or waving hands from faking chest drop)
+                // Self-calibrated rolling top elbow & arm ratio baselines from the athlete's ACTUAL camera angle
+                // (prevents monocular MediaPipe 3D bias like 134° straight arms from trapping pushupDepth in CONCENTRIC!)
+                var windowMaxElbow = activeElbow
+                var windowMaxArmRatio = activeArmRatio
                 var minWrX = activeWrSX
                 var maxWrX = activeWrSX
                 var minWrY = activeWrSY
                 var maxWrY = activeWrSY
                 for (s in pushupHeightWindow) {
+                    if (s.elbowDeg > windowMaxElbow) windowMaxElbow = s.elbowDeg
+                    if (s.armRatio > windowMaxArmRatio) windowMaxArmRatio = s.armRatio
                     if ((timestampMs - s.timestampMs) <= 1500L) {
                         if (s.wristX < minWrX) minWrX = s.wristX
                         if (s.wristX > maxWrX) maxWrX = s.wristX
@@ -1558,6 +1594,32 @@ class BiomechanicsEngine(
                     }
                 }
                 val handsPlanted = (maxWrY - minWrY) <= 0.13f && (maxWrX - minWrX) <= 0.13f
+
+                val rollingTopElbow = if (!isStrict && pushupHeightWindow.size >= 4 && windowMaxElbow in 126f..148f) {
+                    windowMaxElbow.coerceIn(130f, 148f)
+                } else {
+                    148f
+                }
+                val effElbowBottom = if (!isStrict) {
+                    minOf(elbowBottomTarget, rollingTopElbow - 24f)
+                } else {
+                    elbowBottomTarget
+                }
+                val elbowProgress = ((rollingTopElbow - activeElbow) / (rollingTopElbow - effElbowBottom).coerceAtLeast(16f))
+                    .coerceIn(0f, 1.25f)
+
+                // Signal B: Self-normalized 3D arm compression progress relative to observed top arm ratio
+                val armCompProgress = if (use3D && bestArmVis >= 0.42f) {
+                    val topRatioRef = if (!isStrict && pushupHeightWindow.size >= 4 && windowMaxArmRatio in 0.84f..0.96f) {
+                        windowMaxArmRatio.coerceIn(0.86f, 0.96f)
+                    } else {
+                        0.96f
+                    }
+                    val span = if (isStrict) 0.22f else 0.16f
+                    ((topRatioRef - activeArmRatio) / span).coerceIn(0f, 1.25f)
+                } else {
+                    0f
+                }
 
                 var chestDropProgress = if (inPushupAttitude && handsPlanted && adaptivePushupTopHeight > 0.14f) {
                     val dropDenom = maxOf(adaptivePushupTopHeight * 0.34f, 0.16f)
@@ -1572,15 +1634,29 @@ class BiomechanicsEngine(
                     chestDropProgress = minOf(chestDropProgress, 0.16f)
                 }
 
-                val pushupDepth = if (isStrict) {
+                val peakThresh = if (isStrict) 0.78f else 0.60f
+                val finishThresh = if (isStrict) 0.25f else 0.34f
+
+                var pushupDepth = if (isStrict) {
                     maxOf(elbowProgress, if (bestArmVis >= 0.50f) armCompProgress * 0.85f else chestDropProgress * 0.88f)
                 } else {
                     maxOf(elbowProgress, armCompProgress * 0.94f, chestDropProgress * 0.96f)
                 }
+
+                // Concentric Top-Return Completion: if chest+head visibly returned all the way to top height
+                // AND elbow extended near top lockout, never let one noisy 3D axis stall rep completion!
+                if (!isStrict &&
+                    reachedBottom &&
+                    handsPlanted &&
+                    adaptivePushupTopHeight > 0.14f &&
+                    chestDropProgress <= 0.16f &&
+                    activeElbow >= (rollingTopElbow - 12f).coerceAtMost(134f)
+                ) {
+                    pushupDepth = minOf(pushupDepth, finishThresh - 0.04f)
+                }
+
                 romPct = (pushupDepth * 100f).roundToInt().coerceIn(0, 100)
 
-                val peakThresh = if (isStrict) 0.78f else 0.60f
-                val finishThresh = if (isStrict) 0.25f else 0.34f
                 val cycle = updateProgressCycle(
                     progress = pushupDepth,
                     startThreshold = 0.22f,
@@ -1926,7 +2002,7 @@ class BiomechanicsEngine(
                     metric = activeHip,
                     startThreshold = 150f,
                     bottomThreshold = deadliftBottom,
-                    finishThreshold = if (isStrict) 162f else 154f,
+                    finishThreshold = if (isStrict) 162f else 148f,
                     currentRom = romPct,
                     primaryPosMeters = primaryPosMeters,
                     instantSpeedMps = instantSpeedMps,
@@ -2158,7 +2234,7 @@ class BiomechanicsEngine(
                     metric = activeCurlElbow,
                     startThreshold = if (isStrict) 140f else 136f,
                     bottomThreshold = if (isStrict) 58f else 74f,
-                    finishThreshold = if (isStrict) 148f else 136f,
+                    finishThreshold = if (isStrict) 148f else 132f,
                     currentRom = romPct,
                     primaryPosMeters = primaryPosMeters,
                     instantSpeedMps = instantSpeedMps,
@@ -2292,7 +2368,7 @@ class BiomechanicsEngine(
                         progress = dipDepth,
                         startThreshold = 0.20f,
                         peakThreshold = 0.64f,
-                        finishThreshold = 0.24f,
+                        finishThreshold = 0.30f,
                         currentRom = romPct,
                         primaryPosMeters = primaryPosMeters,
                         instantSpeedMps = instantSpeedMps,
@@ -3459,7 +3535,7 @@ class BiomechanicsEngine(
         when (phase) {
             MovementPhase.READY -> {
                 if (!isDeterministicMode && requiresNeutralStart) {
-                    if (progress <= finishThreshold) {
+                    if (progress <= maxOf(finishThreshold, 0.38f)) {
                         requiresNeutralStart = false
                     }
                     return CycleResult(false, 0, 0f)
@@ -3548,7 +3624,7 @@ class BiomechanicsEngine(
         when (phase) {
             MovementPhase.READY -> {
                 if (!isDeterministicMode && requiresNeutralStart) {
-                    if (metric >= finishThreshold) {
+                    if (metric >= finishThreshold - 5f) {
                         requiresNeutralStart = false
                     }
                     return CycleResult(false, 0, 0f)
@@ -3634,7 +3710,7 @@ class BiomechanicsEngine(
         when (phase) {
             MovementPhase.READY -> {
                 if (!isDeterministicMode && requiresNeutralStart) {
-                    if (metric <= finishThreshold) {
+                    if (metric <= finishThreshold + 5f) {
                         requiresNeutralStart = false
                     }
                     return CycleResult(false, 0, 0f)

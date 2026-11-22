@@ -16,6 +16,11 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -23,7 +28,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -35,27 +39,22 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.EmojiEvents
-import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.LocalFireDepartment
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.LockOpen
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Timer
-import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -64,6 +63,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -76,17 +77,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size as ComposeSize
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -112,7 +117,6 @@ import com.kinetix.coach.ui.theme.ObsidianBg
 import com.kinetix.coach.ui.theme.SignalOrange
 import com.kinetix.coach.ui.theme.SignalOrangeDim
 import com.kinetix.coach.ui.theme.SteelGray
-import com.kinetix.coach.vision.AngleCorrection
 import com.kinetix.coach.vision.DetectionStrictness
 import com.kinetix.coach.vision.ExerciseVideoMapper
 import com.kinetix.coach.vision.FormQuality
@@ -122,9 +126,9 @@ import com.kinetix.coach.vision.VelocityFatigueZone
 import com.kinetix.coach.vision.VelocityTelemetry
 import java.util.Locale
 import java.util.concurrent.Executors
-import kotlin.math.roundToInt
 
 private val REST_PRESETS_SEC = listOf(45, 60, 90, 120)
+private val SETUP_PRESETS_SEC = listOf(0, 5, 8, 10)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -175,7 +179,9 @@ fun VisionScreen(
     }
 
     var showExercisePicker by remember { mutableStateOf(false) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
     var showChallengesSheet by remember { mutableStateOf(false) }
+    var showExpandedVbt by remember { mutableStateOf(false) }
     var demoPreviewExercise by remember { mutableStateOf<ExerciseType?>(null) }
 
     // Ensure offline music stops cleanly on ON_PAUSE (lock screen / phone call) or tab switch
@@ -200,6 +206,27 @@ fun VisionScreen(
         }
     }
 
+    // Subtle crisp pop + haptic feedback on every counted rep
+    var repPulseActive by remember { mutableStateOf(false) }
+    LaunchedEffect(uiState.frame.repCount) {
+        if (uiState.frame.repCount > 0 && !uiState.selectedExercise.isIsometric) {
+            repPulseActive = true
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            kotlinx.coroutines.delay(140L)
+            repPulseActive = false
+        }
+    }
+    val repScale by animateFloatAsState(
+        targetValue = if (repPulseActive) 1.13f else 1.0f,
+        animationSpec = spring(dampingRatio = 0.55f, stiffness = 550f),
+        label = "repPop"
+    )
+    val smoothRom by animateFloatAsState(
+        targetValue = (uiState.frame.romPct / 100f).coerceIn(0f, 1f),
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = 420f),
+        label = "romFill"
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -210,120 +237,103 @@ fun VisionScreen(
                 onRequest = { permissionLauncher.launch(Manifest.permission.CAMERA) }
             )
         } else {
+            // 1. Full-screen unobstructed live camera feed
             CameraPoseViewport(
                 isFrontCamera = uiState.isFrontCamera,
                 viewModel = viewModel
             )
 
-            // Isolated full-FPS Skeleton + Angle Badges Overlay (never recomposes HUD)
+            // 2. Sleek full-FPS Skeleton Overlay (minimalist by default; detailed angles optional in Settings)
             LiveSkeletonOverlayLayer(
                 viewModel = viewModel,
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Top Precision Control Bar
+            // Subtle top & bottom studio gradient scrims for effortless text legibility without heavy boxes
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(104.dp)
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(ObsidianBg.copy(alpha = 0.62f), Color.Transparent)
+                        )
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(172.dp)
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(Color.Transparent, ObsidianBg.copy(alpha = 0.72f))
+                        )
+                    )
+            )
+
+            // 3. Minimalist Single-Row Top Bar (ONLY 1 Exercise Pill + 2 Clean Round Buttons)
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // 1-Tap AUTO / FIXE Mode Pill Toggle
-                    Surface(
-                        modifier = Modifier
-                            .height(44.dp)
-                            .clickable { viewModel.toggleAutoDetect() },
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (uiState.isAutoDetectEnabled) SignalOrange else ObsidianBg.copy(alpha = 0.90f),
-                        border = BorderStroke(
-                            1.dp,
-                            if (uiState.isAutoDetectEnabled) SignalOrange else BorderHairline
-                        )
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = 9.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = if (uiState.isAutoDetectEnabled) "AUTO" else "FIXE",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (uiState.isAutoDetectEnabled) CrispWhite else SteelGray,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                    // Single Sleek Exercise + Variant Glass Pill
+                    val detectedVariant = if (uiState.frame.poseDetected && !uiState.isSettingUp && !uiState.isResting) {
+                        uiState.frame.detectedVariantFr
+                    } else null
+                    val statusDotColor = when {
+                        uiState.isSettingUp || uiState.frame.isStabilizing -> FormCaution
+                        uiState.isResting -> SignalOrange
+                        uiState.frame.poseDetected -> FormGood
+                        else -> SteelGray
                     }
 
-                    Spacer(Modifier.width(6.dp))
-
-                    // Exercise Selector Trigger + Auto-Detected Variant Pill
                     Surface(
                         modifier = Modifier
-                            .weight(1f)
+                            .weight(1f, fill = false)
                             .clickable { showExercisePicker = true },
-                        shape = RoundedCornerShape(10.dp),
-                        color = ObsidianBg.copy(alpha = 0.88f),
-                        border = BorderStroke(1.dp, BorderHairline)
+                        shape = RoundedCornerShape(24.dp),
+                        color = ObsidianBg.copy(alpha = 0.68f),
+                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.14f))
                     ) {
-                        val confPct = (uiState.autoDetectConfidence * 100f).roundToInt()
-                        val titleLabel = when {
-                            uiState.isAutoDetectEnabled && confPct >= 55 ->
-                                "AUTO · ${uiState.selectedExercise.labelFr} $confPct%"
-                            uiState.isAutoDetectEnabled ->
-                                "AUTO · ${uiState.selectedExercise.labelFr}"
-                            else -> uiState.selectedExercise.labelFr
-                        }
-                        val subLabel = if (uiState.isAutoDetectEnabled && confPct < 55) {
-                            "${uiState.autoDetectStatusFr} · ${uiState.delegateLabel}"
-                        } else {
-                            "${uiState.selectedExercise.musclesFr} · ${uiState.detectionStrictness.labelFr}"
-                        }
-                        val detectedVariant = if (uiState.frame.poseDetected) uiState.frame.detectedVariantFr else null
-
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
-                                ) {
-                                    Text(
-                                        text = titleLabel,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = CrispWhite,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f, fill = false)
-                                    )
-                                    if (!detectedVariant.isNullOrBlank()) {
-                                        Surface(
-                                            shape = RoundedCornerShape(4.dp),
-                                            color = SignalOrangeDim,
-                                            border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.75f))
-                                        ) {
-                                            Text(
-                                                text = detectedVariant,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = SignalOrange,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1,
-                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                            )
-                                        }
-                                    }
-                                }
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(statusDotColor)
+                            )
+                            Text(
+                                text = uiState.selectedExercise.labelFr,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            val badgeSuffix = when {
+                                !detectedVariant.isNullOrBlank() -> detectedVariant
+                                uiState.isAutoDetectEnabled -> "Auto"
+                                else -> null
+                            }
+                            if (badgeSuffix != null) {
                                 Text(
-                                    text = subLabel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = SteelGray,
+                                    text = "· $badgeSuffix",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (!detectedVariant.isNullOrBlank()) SignalOrange else SteelGray,
+                                    fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -331,272 +341,43 @@ fun VisionScreen(
                             Icon(
                                 imageVector = Icons.Default.KeyboardArrowDown,
                                 contentDescription = "Changer d'exercice",
-                                tint = SignalOrange,
+                                tint = CrispWhite.copy(alpha = 0.72f),
                                 modifier = Modifier.size(18.dp)
                             )
                         }
                     }
 
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(10.dp))
 
-                    // Crisp "Démo" Video Pill Button
-                    Surface(
-                        modifier = Modifier
-                            .height(44.dp)
-                            .clickable { demoPreviewExercise = uiState.selectedExercise },
-                        shape = RoundedCornerShape(10.dp),
-                        color = ObsidianBg.copy(alpha = 0.90f),
-                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.85f))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    // Just 2 Minimal Translucent Circular Buttons: Flip Camera & Settings/Tools
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircleGlassButton(
+                            onClick = { viewModel.toggleCamera() }
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.PlayArrow,
-                                contentDescription = "Voir la démo vidéo",
-                                tint = SignalOrange,
-                                modifier = Modifier.size(17.dp)
-                            )
-                            Spacer(Modifier.width(2.dp))
-                            Text(
-                                text = "Démo",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CrispWhite,
-                                fontWeight = FontWeight.Bold
+                                imageVector = Icons.Default.Cameraswitch,
+                                contentDescription = "Changer de caméra",
+                                tint = CrispWhite,
+                                modifier = Modifier.size(19.dp)
                             )
                         }
-                    }
-
-                    Spacer(Modifier.width(5.dp))
-
-                    // Voice Toggle
-                    HudIconButton(
-                        onClick = { viewModel.toggleVoice() }
-                    ) {
-                        Icon(
-                            imageVector = if (uiState.isVoiceEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
-                            contentDescription = "Coach vocal",
-                            tint = if (uiState.isVoiceEnabled) SignalOrange else SteelGray,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.width(5.dp))
-
-                    // Flip Camera
-                    HudIconButton(
-                        onClick = { viewModel.toggleCamera() }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Cameraswitch,
-                            contentDescription = "Changer de caméra",
-                            tint = CrispWhite,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(7.dp))
-
-                // Compact Telemetry Sub-Bar: 3D Viewpoint + Live Calories + Défis Pill + Framing Alert
-                val vp = uiState.viewpointInfo
-                val liveTotalKcal = uiState.sessionTotalCaloriesKcal + uiState.currentSetCaloriesKcal
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Camera Angle & 3D Precision Pill
-                    Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = ObsidianBg.copy(alpha = 0.86f),
-                        border = BorderStroke(1.dp, if (vp.is3DActive) FormGood.copy(alpha = 0.65f) else BorderHairline)
-                    ) {
-                        val modeTag = if (vp.is3DActive) "3D" else "2D"
-                        val vpLabel = if (uiState.frame.poseDetected) {
-                            "$modeTag · ${vp.viewpoint.shortLabelFr} ${vp.azimuthDeg}°"
-                        } else {
-                            "$modeTag · MULTI-ANGLES"
-                        }
-                        Text(
-                            text = vpLabel,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (vp.is3DActive && uiState.frame.poseDetected) FormGood else SteelGray,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
-
-                    // Live Profile-Calibrated Calories Pill
-                    Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = ObsidianBg.copy(alpha = 0.86f),
-                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                        CircleGlassButton(
+                            onClick = { showSettingsSheet = true },
+                            accentBorder = uiState.activeChallenge != null
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.LocalFireDepartment,
-                                contentDescription = null,
-                                tint = SignalOrange,
-                                modifier = Modifier.size(13.dp)
+                                imageVector = Icons.Default.Tune,
+                                contentDescription = "Réglages & outils",
+                                tint = if (uiState.activeChallenge != null) SignalOrange else CrispWhite,
+                                modifier = Modifier.size(19.dp)
                             )
-                            Spacer(Modifier.width(3.dp))
-                            Text(
-                                text = String.format(Locale.US, "%.1f kcal", liveTotalKcal),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CrispWhite,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    // Crisp "Défis" Challenges & Music Pill Button
-                    val challengeActive = uiState.activeChallenge != null
-                    Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = if (challengeActive) SignalOrange else ObsidianBg.copy(alpha = 0.90f),
-                        border = BorderStroke(1.dp, SignalOrange),
-                        modifier = Modifier.clickable { showChallengesSheet = true }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.EmojiEvents,
-                                contentDescription = "Ouvrir les défis",
-                                tint = if (challengeActive) CrispWhite else SignalOrange,
-                                modifier = Modifier.size(13.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                text = "Défis",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CrispWhite,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    // 1-Tap Quick Lock / Unlock Exercise Padlock (pins AUTO exercise without losing reps)
-                    if (!challengeActive) {
-                        val isLockedFixed = !uiState.isAutoDetectEnabled
-                        val showCompactLock = uiState.frame.poseDetected && !vp.framingWarningFr.isNullOrBlank()
-                        Surface(
-                            shape = RoundedCornerShape(7.dp),
-                            color = if (isLockedFixed) SignalOrangeDim else ObsidianBg.copy(alpha = 0.90f),
-                            border = BorderStroke(
-                                1.dp,
-                                if (isLockedFixed) SignalOrange else BorderHairline
-                            ),
-                            modifier = Modifier.clickable { viewModel.lockCurrentAutoExercise() }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = if (isLockedFixed) Icons.Filled.Lock else Icons.Filled.LockOpen,
-                                    contentDescription = if (isLockedFixed) "Déverrouiller AUTO" else "Verrouiller l'exercice",
-                                    tint = if (isLockedFixed) SignalOrange else CrispWhite,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                if (!showCompactLock) {
-                                    Spacer(Modifier.width(3.dp))
-                                    Text(
-                                        text = if (isLockedFixed) "Figé" else "Figer",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isLockedFixed) SignalOrange else CrispWhite,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        }
-
-                        // 1-Tap Setup Countdown Delay Pill (0s / 5s / 8s / 10s — prevents false reps while placing phone!)
-                        val setupEnabled = uiState.setupDelaySec > 0
-                        Surface(
-                            shape = RoundedCornerShape(7.dp),
-                            color = if (uiState.isSettingUp) FormCaution.copy(alpha = 0.22f) else ObsidianBg.copy(alpha = 0.90f),
-                            border = BorderStroke(
-                                1.dp,
-                                when {
-                                    uiState.isSettingUp -> FormCaution
-                                    setupEnabled -> FormGood.copy(alpha = 0.65f)
-                                    else -> BorderHairline
-                                }
-                            ),
-                            modifier = Modifier.clickable { viewModel.cycleSetupDelay() }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Timer,
-                                    contentDescription = "Délai d'installation",
-                                    tint = when {
-                                        uiState.isSettingUp -> FormCaution
-                                        setupEnabled -> FormGood
-                                        else -> SteelGray
-                                    },
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(Modifier.width(3.dp))
-                                Text(
-                                    text = if (setupEnabled) "${uiState.setupDelaySec}s" else "0s",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = when {
-                                        uiState.isSettingUp -> FormCaution
-                                        setupEnabled -> CrispWhite
-                                        else -> SteelGray
-                                    },
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-
-                    // Framing Alert Chip (only appears if body parts are clipped out of frame)
-                    val framingWarn = vp.framingWarningFr
-                    if (uiState.frame.poseDetected && !framingWarn.isNullOrBlank()) {
-                        Surface(
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(7.dp),
-                            color = ObsidianBg.copy(alpha = 0.90f),
-                            border = BorderStroke(1.dp, FormCaution)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.WarningAmber,
-                                    contentDescription = null,
-                                    tint = FormCaution,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(Modifier.width(4.dp))
-                                Text(
-                                    text = framingWarn,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = FormCaution,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
                         }
                     }
                 }
 
-                // Active Camera-Verified Challenge Banner
+                // Active Camera-Verified Challenge Banner (only shown when a challenge is actively running)
                 uiState.activeChallenge?.let { activeSnap ->
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     ActiveChallengeBanner(
                         snapshot = activeSnap,
                         selectedTrack = uiState.selectedMusicTrack,
@@ -609,20 +390,9 @@ fun VisionScreen(
                     )
                 }
 
-                // Active Hands-Free Installation Countdown Pill (Zero false reps while setting phone down!)
-                if (uiState.isSettingUp && !uiState.isResting && uiState.activeChallenge == null) {
-                    Spacer(Modifier.height(8.dp))
-                    SetupCountdownOverlayPill(
-                        remainingSec = uiState.setupRemainingSec,
-                        totalSec = maxOf(uiState.setupDelaySec, uiState.setupRemainingSec),
-                        onAdd5s = { viewModel.addSetupSeconds(5) },
-                        onStartNow = { viewModel.skipSetupCountdown() }
-                    )
-                }
-
-                // Active Smart Rest Countdown Overlay Pill
+                // Sleek Minimal Rest Countdown Pill (only shown during inter-set rest)
                 if (uiState.isResting && uiState.activeChallenge == null) {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     RestCountdownOverlayPill(
                         remainingSec = uiState.restRemainingSec,
                         totalSec = uiState.restDurationSec,
@@ -633,226 +403,241 @@ fun VisionScreen(
                 }
             }
 
-            // Bottom Stack: Live Precision Angle Correction Banner + Bottom Telemetry HUD
+            // 4. Giant Centered Minimalist Setup Countdown (readable from 3 meters, zero bulky panels!)
+            if (uiState.isSettingUp && !uiState.isResting && uiState.activeChallenge == null) {
+                SetupCenterCountdown(
+                    remainingSec = uiState.setupRemainingSec,
+                    totalSec = maxOf(uiState.setupDelaySec, uiState.setupRemainingSec),
+                    onAdd5s = { viewModel.addSetupSeconds(5) },
+                    onStartNow = { viewModel.skipSetupCountdown() },
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            // 5. Minimalist Floating Bottom Dock (Conditional Toast + Sleek Glass Counter / VBT / Actions)
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                PrecisionCorrectionBanner(
-                    poseDetected = uiState.frame.poseDetected,
-                    isStabilizing = uiState.frame.isStabilizing,
-                    formScore = uiState.frame.formScore,
-                    formQuality = uiState.frame.formQuality,
-                    topCorrection = uiState.frame.corrections.firstOrNull(),
-                    fallbackMessage = uiState.errorMessage ?: uiState.frame.feedbackFr
-                )
+                // Conditional Minimal Coach Toast: COMPLETELY HIDDEN during clean reps!
+                val topCorrection = uiState.frame.corrections.firstOrNull()
+                val framingWarn = if (uiState.frame.poseDetected) uiState.viewpointInfo.framingWarningFr else null
+                val postureGateHint = if (uiState.frame.poseDetected &&
+                    !uiState.isSettingUp &&
+                    !uiState.isResting &&
+                    (uiState.frame.feedbackFr.startsWith("Mettez-vous") ||
+                        uiState.frame.feedbackFr.startsWith("Allongez-vous") ||
+                        uiState.frame.feedbackFr.startsWith("Redressez-vous") ||
+                        uiState.frame.feedbackFr.startsWith("Saisissez") ||
+                        uiState.frame.feedbackFr.startsWith("Position détectée"))
+                ) {
+                    uiState.frame.feedbackFr
+                } else null
 
+                val toastData: Pair<String, Color>? = when {
+                    uiState.errorMessage != null -> uiState.errorMessage!! to FormFault
+                    uiState.isSettingUp || uiState.isResting -> null
+                    uiState.frame.isStabilizing -> "Stabilisation…" to FormCaution
+                    topCorrection != null -> {
+                        val c = when (topCorrection.severity) {
+                            FormQuality.FAULT -> FormFault
+                            FormQuality.CAUTION -> FormCaution
+                            FormQuality.GOOD -> FormGood
+                        }
+                        topCorrection.instructionFr to c
+                    }
+                    !framingWarn.isNullOrBlank() -> framingWarn to FormCaution
+                    postureGateHint != null -> postureGateHint to SteelGray
+                    !uiState.frame.poseDetected -> "Placez-vous face à la caméra" to SteelGray
+                    else -> null
+                }
+
+                AnimatedVisibility(
+                    visible = toastData != null,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    toastData?.let { (message, accent) ->
+                        MinimalCoachToast(message = message, accentColor = accent)
+                    }
+                }
+
+                // Optional Tap-to-Expand Live VBT Sparkline Strip (hidden by default to keep HUD ultra-clean!)
+                val vbt = uiState.frame.velocityTelemetry
+                AnimatedVisibility(
+                    visible = showExpandedVbt && !uiState.selectedExercise.isIsometric && vbt.isSupported && !uiState.isSettingUp,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = ObsidianBg.copy(alpha = 0.80f),
+                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.10f))
+                    ) {
+                        Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                            VelocityTelemetryStrip(
+                                vbt = vbt,
+                                currentReps = uiState.frame.repCount
+                            )
+                        }
+                    }
+                }
+
+                // Main Compact Floating Glass Dock
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    color = ObsidianBg.copy(alpha = 0.93f),
-                    border = BorderStroke(1.dp, BorderHairline)
+                    shape = RoundedCornerShape(22.dp),
+                    color = ObsidianBg.copy(alpha = 0.78f),
+                    border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.12f))
                 ) {
-                    Column(modifier = Modifier.padding(13.dp)) {
-                    // Multi-Set Header + Rest Preset Chips
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Surface(
-                                shape = RoundedCornerShape(5.dp),
-                                color = SignalOrangeDim,
-                                border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.6f))
-                            ) {
-                                Text(
-                                    text = "SÉRIE ${uiState.currentSetNumber}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = SignalOrange,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
-                                )
-                            }
-                            val totalSessionMetric = if (uiState.selectedExercise.isIsometric) {
-                                val totSec = uiState.sessionTotalHoldSec + uiState.frame.isometricHoldSec.toInt()
-                                "Total ${totSec}s"
-                            } else {
-                                val totReps = uiState.sessionTotalReps + uiState.frame.repCount
-                                "Total $totReps reps"
-                            }
-                            Text(
-                                text = totalSessionMetric,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SteelGray
-                            )
-                        }
-
-                        // Configurable Rest Duration Presets (45s / 60s / 90s / 120s)
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            REST_PRESETS_SEC.forEach { sec ->
-                                val selected = uiState.restDurationSec == sec
-                                Surface(
-                                    shape = RoundedCornerShape(5.dp),
-                                    color = if (selected) ElevatedSurface else ObsidianBg,
-                                    border = BorderStroke(1.dp, if (selected) SignalOrange else BorderHairline),
-                                    modifier = Modifier.clickable { viewModel.setRestDuration(sec) }
-                                ) {
-                                    Text(
-                                        text = "${sec}s",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (selected) SignalOrange else SteelGray,
-                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(10.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        // Giant Tabular Counter (Reps or Isometric Hold Time)
-                        Column {
-                            Text(
-                                text = if (uiState.selectedExercise.isIsometric) "MAINTIEN ALIGNÉ" else "RÉPÉTITIONS",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SteelGray
-                            )
-                            val primaryValue = if (uiState.selectedExercise.isIsometric) {
-                                String.format("%.1fs", uiState.frame.isometricHoldSec)
-                            } else {
-                                uiState.frame.repCount.toString()
-                            }
-                            Text(
-                                text = primaryValue,
-                                style = MaterialTheme.typography.displayLarge,
-                                color = CrispWhite
-                            )
-                        }
-
-                        // Phase + ROM + Action Controls
-                        Column(
-                            horizontalAlignment = Alignment.End,
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        // Ultra-thin 3dp ROM progress line seamlessly integrated at the top edge of the dock
+                        LinearProgressIndicator(
+                            progress = { if (uiState.isSettingUp || uiState.isResting) 0f else smoothRom },
                             modifier = Modifier
-                                .weight(1f)
-                                .padding(start = 14.dp)
+                                .fillMaxWidth()
+                                .height(3.dp),
+                            color = if (uiState.frame.romPct >= 80) FormGood else SignalOrange,
+                            trackColor = CrispWhite.copy(alpha = 0.08f)
+                        )
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = ElevatedSurface,
-                                    border = BorderStroke(1.dp, BorderHairline)
-                                ) {
-                                    Text(
-                                        text = uiState.frame.phase.labelFr,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = SignalOrange,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
+                            // LEFT: Giant Crisp Tabular Counter (readable from 2.5m!)
+                            Column {
+                                val primaryValue = if (uiState.selectedExercise.isIsometric) {
+                                    String.format(Locale.US, "%.1fs", uiState.frame.isometricHoldSec)
+                                } else {
+                                    uiState.frame.repCount.toString()
                                 }
                                 Text(
-                                    text = "ROM ${uiState.frame.romPct}%",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = CrispWhite
+                                    text = primaryValue,
+                                    fontSize = 44.sp,
+                                    lineHeight = 46.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = CrispWhite,
+                                    modifier = Modifier.scale(repScale)
+                                )
+                                val subMetric = if (uiState.currentSetNumber > 1 && !uiState.selectedExercise.isIsometric) {
+                                    "Série ${uiState.currentSetNumber} · ${uiState.sessionTotalReps + uiState.frame.repCount} tot."
+                                } else {
+                                    "Série ${uiState.currentSetNumber}"
+                                }
+                                Text(
+                                    text = subMetric,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SteelGray
                                 )
                             }
 
-                            Spacer(Modifier.height(7.dp))
-
-                            LinearProgressIndicator(
-                                progress = { uiState.frame.romPct / 100f },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(RoundedCornerShape(3.dp)),
-                                color = SignalOrange,
-                                trackColor = ElevatedSurface
-                            )
-
-                            Spacer(Modifier.height(9.dp))
-
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                OutlinedButton(
-                                    onClick = { viewModel.resetSession() },
-                                    shape = RoundedCornerShape(8.dp),
-                                    border = BorderStroke(1.dp, BorderHairline),
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Refresh,
-                                        contentDescription = "Réinitialiser",
-                                        tint = SteelGray,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                            // CENTER: Minimalist 2-Line VBT Pill (Speed + Estimated Max Reps; tap to expand graph)
+                            if (!uiState.selectedExercise.isIsometric && vbt.isSupported) {
+                                val zoneColor = fatigueZoneColor(vbt.fatigueZone)
+                                val displaySpeed = if (vbt.lastRepVelocityMps > 0.01f) vbt.lastRepVelocityMps else vbt.currentLiveVelocityMps
+                                val speedStr = if (displaySpeed > 0.01f) {
+                                    String.format(Locale.US, "%.2f m/s", displaySpeed)
+                                } else {
+                                    "— m/s"
                                 }
-                                OutlinedButton(
-                                    onClick = { viewModel.completeSetAndStartRest() },
-                                    shape = RoundedCornerShape(8.dp),
-                                    border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.7f)),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Timer,
-                                        contentDescription = "Fin de série / Repos",
-                                        tint = SignalOrange,
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("Repos", style = MaterialTheme.typography.labelMedium, color = CrispWhite)
+                                val maxStr = when {
+                                    vbt.estimatedMaxReps != null -> "MAX ~${vbt.estimatedMaxReps}"
+                                    uiState.frame.repCount > 0 -> "Calib. ${uiState.frame.repCount}/3"
+                                    vbt.estimatedFreshMaxReps != null -> "Réf. ~${vbt.estimatedFreshMaxReps}"
+                                    else -> "Vitesse"
                                 }
-                                Button(
-                                    onClick = { viewModel.finishSession() },
-                                    shape = RoundedCornerShape(8.dp),
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = SignalOrange,
-                                        contentColor = CrispWhite
+
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = CrispWhite.copy(alpha = 0.06f),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (vbt.estimatedMaxReps != null) zoneColor.copy(alpha = 0.55f) else CrispWhite.copy(alpha = 0.08f)
                                     ),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    modifier = Modifier.clickable { showExpandedVbt = !showExpandedVbt }
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Flag,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(15.dp)
+                                    Column(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(7.dp)
+                                                    .clip(CircleShape)
+                                                    .background(zoneColor)
+                                            )
+                                            Text(
+                                                text = speedStr,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = CrispWhite,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Spacer(Modifier.height(1.dp))
+                                        Text(
+                                            text = maxStr,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (vbt.estimatedMaxReps != null) zoneColor else SteelGray,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+
+                            // RIGHT: Just 2 Crisp Action Pills ("Repos" & "Fin")
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    shape = RoundedCornerShape(13.dp),
+                                    color = CrispWhite.copy(alpha = 0.09f),
+                                    border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.16f)),
+                                    modifier = Modifier.clickable { viewModel.completeSetAndStartRest() }
+                                ) {
+                                    Text(
+                                        text = "Repos",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = CrispWhite,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp)
                                     )
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("Fin", style = MaterialTheme.typography.labelMedium)
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(13.dp),
+                                    color = SignalOrange,
+                                    modifier = Modifier.clickable { viewModel.finishSession() }
+                                ) {
+                                    Text(
+                                        text = "Fin",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = CrispWhite,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)
+                                    )
                                 }
                             }
                         }
-                    }
-
-                    // Live VBT Concentric Speed & Estimated Max Reps Telemetry Strip (dynamic exercises)
-                    if (!uiState.selectedExercise.isIsometric && uiState.frame.velocityTelemetry.isSupported) {
-                        Spacer(Modifier.height(9.dp))
-                        HairlineDivider()
-                        Spacer(Modifier.height(8.dp))
-                        VelocityTelemetryStrip(
-                            vbt = uiState.frame.velocityTelemetry,
-                            currentReps = uiState.frame.repCount
-                        )
-                    }
                     }
                 }
             }
         }
     }
 
-    // 16-Exercise Selector Sheet (with Adaptatif/Strict mode toggle + inline "Voir la vidéo" trigger)
+    // Clean 16-Exercise Selector Sheet (with integrated Auto / Fixe toggle right at top)
     if (showExercisePicker) {
         ModalBottomSheet(
             onDismissRequest = { showExercisePicker = false },
@@ -867,12 +652,12 @@ fun VisionScreen(
                     .padding(bottom = 24.dp)
             ) {
                 SectionLabel(
-                    text = "Sélectionner un exercice",
-                    trailing = "${ExerciseType.entries.size} MOUVEMENTS · VIDÉO"
+                    text = "Choisir un exercice",
+                    trailing = "${ExerciseType.entries.size} EXERCICES"
                 )
                 Spacer(Modifier.height(10.dp))
 
-                // 1-Tap Adaptatif / Strict Detection Strictness Toggle
+                // Clean Auto vs Fixe Toggle Card
                 IndustrialCard(containerColor = ObsidianBg) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -881,46 +666,38 @@ fun VisionScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "MODE DE DÉTECTION",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SteelGray,
+                                text = "Détection automatique",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = CrispWhite,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = uiState.detectionStrictness.descFr,
+                                text = if (uiState.isAutoDetectEnabled) {
+                                    "Reconnaît l'exercice tout seul (sans perdre la 1re rep)"
+                                } else {
+                                    "Verrouillé sur ${uiState.selectedExercise.labelFr}"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = CrispWhite,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                color = SteelGray
                             )
                         }
-                        Spacer(Modifier.width(8.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            DetectionStrictness.entries.forEach { mode ->
-                                val isSel = uiState.detectionStrictness == mode
-                                Surface(
-                                    shape = RoundedCornerShape(7.dp),
-                                    color = if (isSel) SignalOrange else ElevatedSurface,
-                                    border = BorderStroke(1.dp, if (isSel) SignalOrange else BorderHairline),
-                                    modifier = Modifier.clickable { viewModel.setDetectionStrictness(mode) }
-                                ) {
-                                    Text(
-                                        text = mode.labelFr,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isSel) CrispWhite else SteelGray,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
-                                    )
-                                }
-                            }
-                        }
+                        Switch(
+                            checked = uiState.isAutoDetectEnabled,
+                            onCheckedChange = { viewModel.toggleAutoDetect() },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = CrispWhite,
+                                checkedTrackColor = SignalOrange,
+                                uncheckedThumbColor = SteelGray,
+                                uncheckedTrackColor = ElevatedSurface
+                            )
+                        )
                     }
                 }
 
                 Spacer(Modifier.height(10.dp))
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.height(420.dp)
+                    modifier = Modifier.height(430.dp)
                 ) {
                     items(ExerciseType.entries) { ex ->
                         val selected = ex == uiState.selectedExercise
@@ -956,19 +733,12 @@ fun VisionScreen(
                                     }
                                     Spacer(Modifier.height(2.dp))
                                     Text(
-                                        text = "${ex.musclesFr} · Caméra : ${ex.cameraAngleHint}",
+                                        text = ex.musclesFr,
                                         style = MaterialTheme.typography.labelMedium,
                                         color = SignalOrange
                                     )
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(
-                                        text = ex.targetCueFr,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = SteelGray
-                                    )
                                 }
                                 Spacer(Modifier.width(10.dp))
-                                // Direct "Voir la vidéo" Preview Button
                                 Surface(
                                     shape = RoundedCornerShape(8.dp),
                                     color = SignalOrangeDim,
@@ -978,19 +748,19 @@ fun VisionScreen(
                                         demoPreviewExercise = ex
                                     }
                                 ) {
-                                    Column(
+                                    Row(
                                         modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         Icon(
                                             imageVector = Icons.Filled.PlayCircleOutline,
-                                            contentDescription = "Voir la vidéo",
+                                            contentDescription = "Voir la démo",
                                             tint = SignalOrange,
-                                            modifier = Modifier.size(20.dp)
+                                            modifier = Modifier.size(16.dp)
                                         )
-                                        Spacer(Modifier.height(2.dp))
                                         Text(
-                                            text = "VIDÉO",
+                                            text = "Démo",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = CrispWhite,
                                             fontWeight = FontWeight.Bold
@@ -1003,6 +773,37 @@ fun VisionScreen(
                 }
             }
         }
+    }
+
+    // Sleek Quick Settings & Pro Tools Sheet (keeps the camera 100% clean while preserving all pro features!)
+    if (showSettingsSheet) {
+        VisionSettingsSheet(
+            uiState = uiState,
+            onDismiss = { showSettingsSheet = false },
+            onOpenChallenges = {
+                showSettingsSheet = false
+                showChallengesSheet = true
+            },
+            onOpenDemo = {
+                showSettingsSheet = false
+                demoPreviewExercise = uiState.selectedExercise
+            },
+            onResetSession = {
+                showSettingsSheet = false
+                viewModel.resetSession()
+            },
+            onToggleAuto = { viewModel.toggleAutoDetect() },
+            onToggleVoice = { viewModel.toggleVoice() },
+            onToggleDetailedAngles = { viewModel.toggleDetailedAngles() },
+            onSelectSetupDelay = { viewModel.setSetupDelay(it) },
+            onTriggerSetupNow = {
+                showSettingsSheet = false
+                val sec = if (uiState.setupDelaySec > 0) uiState.setupDelaySec else 5
+                viewModel.startSetupCountdown(sec, announce = true)
+            },
+            onSelectRestDuration = { viewModel.setRestDuration(it) },
+            onSelectStrictness = { viewModel.setDetectionStrictness(it) }
+        )
     }
 
     // Challenges & Offline Music Modal Bottom Sheet
@@ -1079,126 +880,124 @@ private fun LiveSkeletonOverlayLayer(
 }
 
 @Composable
-private fun PrecisionCorrectionBanner(
-    poseDetected: Boolean,
-    isStabilizing: Boolean,
-    formScore: Int,
-    formQuality: FormQuality,
-    topCorrection: AngleCorrection?,
-    fallbackMessage: String
+private fun CircleGlassButton(
+    onClick: () -> Unit,
+    accentBorder: Boolean = false,
+    content: @Composable () -> Unit
 ) {
-    val accentColor = when {
-        !poseDetected -> SteelGray
-        isStabilizing -> FormCaution
-        topCorrection != null -> when (topCorrection.severity) {
-            FormQuality.FAULT -> FormFault
-            FormQuality.CAUTION -> FormCaution
-            FormQuality.GOOD -> FormGood
-        }
-        else -> when (formQuality) {
-            FormQuality.GOOD -> FormGood
-            FormQuality.CAUTION -> FormCaution
-            FormQuality.FAULT -> FormFault
+    Surface(
+        shape = CircleShape,
+        color = ObsidianBg.copy(alpha = 0.68f),
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (accentBorder) SignalOrange.copy(alpha = 0.80f) else CrispWhite.copy(alpha = 0.14f)
+        ),
+        modifier = Modifier.size(42.dp)
+    ) {
+        IconButton(onClick = onClick) {
+            content()
         }
     }
+}
 
-    Surface(
-        shape = RoundedCornerShape(9.dp),
-        color = ObsidianBg.copy(alpha = 0.90f),
-        border = BorderStroke(1.dp, if (poseDetected) accentColor.copy(alpha = 0.85f) else BorderHairline),
-        modifier = Modifier.fillMaxWidth()
+@Composable
+private fun SetupCenterCountdown(
+    remainingSec: Int,
+    totalSec: Int,
+    onAdd5s: () -> Unit,
+    onStartNow: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val targetProgress = if (totalSec > 0) {
+        (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+    val smoothProgress by animateFloatAsState(
+        targetValue = targetProgress,
+        animationSpec = spring(dampingRatio = 0.9f, stiffness = 220f),
+        label = "setupRing"
+    )
+
+    Column(
+        modifier = modifier.padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+        // Giant readable floating circular ring (visible from 3m away without hiding the body)
+        Surface(
+            shape = CircleShape,
+            color = ObsidianBg.copy(alpha = 0.72f),
+            border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.10f)),
+            modifier = Modifier.size(144.dp)
         ) {
-            // Swiss Precision vertical status bar
-            Box(
-                modifier = Modifier
-                    .width(4.dp)
-                    .height(30.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(accentColor)
-            )
-            Spacer(Modifier.width(9.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                if (poseDetected && isStabilizing) {
+            Box(contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(
+                    progress = { smoothProgress },
+                    modifier = Modifier.size(132.dp),
+                    color = FormCaution,
+                    trackColor = CrispWhite.copy(alpha = 0.14f),
+                    strokeWidth = 5.dp,
+                    strokeCap = StrokeCap.Round
+                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = fallbackMessage,
-                        style = MaterialTheme.typography.bodySmall,
+                        text = "$remainingSec",
+                        fontSize = 58.sp,
+                        lineHeight = 60.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = CrispWhite
+                    )
+                    Text(
+                        text = "PRÊT",
+                        style = MaterialTheme.typography.labelSmall,
                         color = FormCaution,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                } else if (poseDetected && topCorrection != null) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(4.dp),
-                            color = accentColor.copy(alpha = 0.22f),
-                            border = BorderStroke(1.dp, accentColor.copy(alpha = 0.7f))
-                        ) {
-                            Text(
-                                text = topCorrection.shortBadgeFr,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = accentColor,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
-                            )
-                        }
-                        Text(
-                            text = topCorrection.jointLabelFr.uppercase(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = SteelGray,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        text = topCorrection.instructionFr,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = CrispWhite,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                } else {
-                    Text(
-                        text = if (poseDetected && formQuality == FormQuality.GOOD && fallbackMessage.startsWith("Posture")) {
-                            "Alignement optimal · Angles validés"
-                        } else {
-                            fallbackMessage
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (poseDetected && formQuality == FormQuality.GOOD) FormGood else CrispWhite,
-                        fontWeight = if (poseDetected && formQuality == FormQuality.GOOD) FontWeight.SemiBold else FontWeight.Normal,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
+        }
 
-            Spacer(Modifier.width(8.dp))
+        // Concise 1-line placement hint pill
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = ObsidianBg.copy(alpha = 0.72f),
+            border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.12f))
+        ) {
+            Text(
+                text = "Placez-vous · comptage en pause",
+                style = MaterialTheme.typography.labelMedium,
+                color = CrispWhite,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+            )
+        }
 
+        // Two minimal action pills: +5s & Start Now
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Surface(
-                shape = RoundedCornerShape(6.dp),
-                color = accentColor.copy(alpha = 0.18f),
-                border = BorderStroke(1.dp, accentColor)
+                shape = RoundedCornerShape(20.dp),
+                color = ObsidianBg.copy(alpha = 0.76f),
+                border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.18f)),
+                modifier = Modifier.clickable(onClick = onAdd5s)
             ) {
                 Text(
-                    text = if (isStabilizing) "STAB" else "$formScore%",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = accentColor,
+                    text = "+5s",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = CrispWhite,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp)
+                )
+            }
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = FormGood,
+                modifier = Modifier.clickable(onClick = onStartNow)
+            ) {
+                Text(
+                    text = "Commencer",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = ObsidianBg,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 9.dp)
                 )
             }
         }
@@ -1206,105 +1005,33 @@ private fun PrecisionCorrectionBanner(
 }
 
 @Composable
-private fun SetupCountdownOverlayPill(
-    remainingSec: Int,
-    totalSec: Int,
-    onAdd5s: () -> Unit,
-    onStartNow: () -> Unit
+private fun MinimalCoachToast(
+    message: String,
+    accentColor: Color
 ) {
-    val progress = if (totalSec > 0) (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f) else 0f
-
     Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = ObsidianBg.copy(alpha = 0.94f),
-        border = BorderStroke(1.dp, FormCaution),
-        modifier = Modifier.fillMaxWidth()
+        shape = RoundedCornerShape(20.dp),
+        color = ObsidianBg.copy(alpha = 0.76f),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.55f))
     ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Timer,
-                        contentDescription = null,
-                        tint = FormCaution,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = "INSTALLATION · COMPTAGE EN PAUSE",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = FormCaution,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Row(
-                            verticalAlignment = Alignment.Bottom,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = "${remainingSec}s",
-                                style = MaterialTheme.typography.titleLarge,
-                                color = CrispWhite,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "Posez le téléphone et placez-vous",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SteelGray,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(bottom = 3.dp)
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.width(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = ElevatedSurface,
-                        border = BorderStroke(1.dp, BorderHairline),
-                        modifier = Modifier.clickable(onClick = onAdd5s)
-                    ) {
-                        Text(
-                            text = "+5s",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = CrispWhite,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
-                        )
-                    }
-                    Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = FormGood,
-                        modifier = Modifier.clickable(onClick = onStartNow)
-                    ) {
-                        Text(
-                            text = "Prêt !",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = ObsidianBg,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            LinearProgressIndicator(
-                progress = { progress },
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp)),
-                color = FormCaution,
-                trackColor = ElevatedSurface
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(accentColor)
+            )
+            Text(
+                text = message,
+                style = MaterialTheme.typography.labelMedium,
+                color = CrispWhite,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
@@ -1324,14 +1051,16 @@ private fun RestCountdownOverlayPill(
     val progress = if (totalSec > 0) (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f) else 0f
 
     Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = ObsidianBg.copy(alpha = 0.94f),
-        border = BorderStroke(1.dp, SignalOrange),
+        shape = RoundedCornerShape(18.dp),
+        color = ObsidianBg.copy(alpha = 0.80f),
+        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.65f)),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
+        Column(modifier = Modifier.fillMaxWidth()) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1342,27 +1071,27 @@ private fun RestCountdownOverlayPill(
                         tint = SignalOrange,
                         modifier = Modifier.size(18.dp)
                     )
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(9.dp))
                     Column {
                         Text(
-                            text = "REPOS AVANT SÉRIE $nextSetNumber",
+                            text = "Repos · Série $nextSetNumber",
                             style = MaterialTheme.typography.labelSmall,
                             color = SteelGray,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.SemiBold
                         )
                         Text(
                             text = formattedTime,
                             style = MaterialTheme.typography.titleLarge,
-                            color = SignalOrange,
+                            color = CrispWhite,
                             fontWeight = FontWeight.Bold
                         )
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Surface(
-                        shape = RoundedCornerShape(7.dp),
-                        color = ElevatedSurface,
-                        border = BorderStroke(1.dp, BorderHairline),
+                        shape = RoundedCornerShape(12.dp),
+                        color = CrispWhite.copy(alpha = 0.08f),
+                        border = BorderStroke(1.dp, CrispWhite.copy(alpha = 0.16f)),
                         modifier = Modifier.clickable(onClick = onAdd15s)
                     ) {
                         Text(
@@ -1370,11 +1099,11 @@ private fun RestCountdownOverlayPill(
                             style = MaterialTheme.typography.labelMedium,
                             color = CrispWhite,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
                         )
                     }
                     Surface(
-                        shape = RoundedCornerShape(7.dp),
+                        shape = RoundedCornerShape(12.dp),
                         color = SignalOrange,
                         modifier = Modifier.clickable(onClick = onSkip)
                     ) {
@@ -1383,39 +1112,377 @@ private fun RestCountdownOverlayPill(
                             style = MaterialTheme.typography.labelMedium,
                             color = CrispWhite,
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                         )
                     }
                 }
             }
-            Spacer(Modifier.height(6.dp))
             LinearProgressIndicator(
                 progress = { progress },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp)),
+                    .height(3.dp),
                 color = SignalOrange,
-                trackColor = ElevatedSurface
+                trackColor = CrispWhite.copy(alpha = 0.08f)
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VisionSettingsSheet(
+    uiState: VisionUiState,
+    onDismiss: () -> Unit,
+    onOpenChallenges: () -> Unit,
+    onOpenDemo: () -> Unit,
+    onResetSession: () -> Unit,
+    onToggleAuto: () -> Unit,
+    onToggleVoice: () -> Unit,
+    onToggleDetailedAngles: () -> Unit,
+    onSelectSetupDelay: (Int) -> Unit,
+    onTriggerSetupNow: () -> Unit,
+    onSelectRestDuration: (Int) -> Unit,
+    onSelectStrictness: (DetectionStrictness) -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = CharcoalSurface,
+        contentColor = CrispWhite
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 26.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            SectionLabel(
+                text = "Réglages caméra",
+                trailing = uiState.selectedExercise.labelFr.uppercase()
+            )
+
+            // 1. Clean 3-Tile Quick Action Strip (Challenges, Demo, Reset)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SettingsQuickActionTile(
+                    icon = Icons.Default.EmojiEvents,
+                    label = if (uiState.activeChallenge != null) "Défi actif" else "Défis",
+                    highlighted = uiState.activeChallenge != null,
+                    onClick = onOpenChallenges,
+                    modifier = Modifier.weight(1f)
+                )
+                SettingsQuickActionTile(
+                    icon = Icons.Default.PlayCircleOutline,
+                    label = "Démo",
+                    highlighted = false,
+                    onClick = onOpenDemo,
+                    modifier = Modifier.weight(1f)
+                )
+                SettingsQuickActionTile(
+                    icon = Icons.Default.Refresh,
+                    label = "Réinitialiser",
+                    highlighted = false,
+                    onClick = onResetSession,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // 2. Core Toggles (Auto Detect, Voice Coach, Expert Skeleton Angles)
+            IndustrialCard(containerColor = ObsidianBg) {
+                SettingsToggleRow(
+                    title = "Détection automatique",
+                    subtitle = "Reconnaît l'exercice et récupère la 1re rep",
+                    checked = uiState.isAutoDetectEnabled,
+                    onCheckedChange = { onToggleAuto() }
+                )
+                HairlineDivider()
+                SettingsToggleRow(
+                    title = "Coach vocal",
+                    subtitle = "Compte les répétitions et alerte sur les défauts",
+                    checked = uiState.isVoiceEnabled,
+                    onCheckedChange = { onToggleVoice() }
+                )
+                HairlineDivider()
+                SettingsToggleRow(
+                    title = "Angles sur le squelette",
+                    subtitle = "Mode expert : affiche les degrés et arcs en direct",
+                    checked = uiState.showDetailedAngles,
+                    onCheckedChange = { onToggleDetailedAngles() }
+                )
+            }
+
+            // 3. Hands-Free Setup Countdown Preset + Instant Trigger
+            IndustrialCard(containerColor = ObsidianBg) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Délai d'installation",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = CrispWhite,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Pause le comptage le temps de vous placer",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SteelGray
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = SignalOrangeDim,
+                        border = BorderStroke(1.dp, SignalOrange.copy(alpha = 0.7f)),
+                        modifier = Modifier.clickable(onClick = onTriggerSetupNow)
+                    ) {
+                        Text(
+                            text = "Lancer",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = SignalOrange,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SETUP_PRESETS_SEC.forEach { sec ->
+                        val active = uiState.setupDelaySec == sec
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (active) SignalOrange else ElevatedSurface,
+                            border = BorderStroke(1.dp, if (active) SignalOrange else BorderHairline),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onSelectSetupDelay(sec) }
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = if (sec == 0) "Off" else "${sec}s",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (active) CrispWhite else SteelGray,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Rest Timer Preset
+            IndustrialCard(containerColor = ObsidianBg) {
+                Text(
+                    text = "Temps de repos entre séries",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = CrispWhite,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    REST_PRESETS_SEC.forEach { sec ->
+                        val active = uiState.restDurationSec == sec
+                        val label = if (sec >= 60) {
+                            val m = sec / 60
+                            val s = sec % 60
+                            if (s == 0) "${m}m" else "${m}m${s}"
+                        } else "${sec}s"
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (active) SignalOrange else ElevatedSurface,
+                            border = BorderStroke(1.dp, if (active) SignalOrange else BorderHairline),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onSelectRestDuration(sec) }
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (active) CrispWhite else SteelGray,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Counting Strictness (Adaptive vs Strict)
+            IndustrialCard(containerColor = ObsidianBg) {
+                Text(
+                    text = "Exigence d'amplitude",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = CrispWhite,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val isAdaptive = uiState.detectionStrictness == DetectionStrictness.ADAPTIVE
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (isAdaptive) SignalOrange else ElevatedSurface,
+                        border = BorderStroke(1.dp, if (isAdaptive) SignalOrange else BorderHairline),
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onSelectStrictness(DetectionStrictness.ADAPTIVE) }
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(vertical = 9.dp, horizontal = 8.dp)
+                        ) {
+                            Text(
+                                text = "Adaptatif",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Fluide & naturel",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isAdaptive) CrispWhite.copy(alpha = 0.85f) else SteelGray
+                            )
+                        }
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (!isAdaptive) SignalOrange else ElevatedSurface,
+                        border = BorderStroke(1.dp, if (!isAdaptive) SignalOrange else BorderHairline),
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onSelectStrictness(DetectionStrictness.STRICT) }
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(vertical = 9.dp, horizontal = 8.dp)
+                        ) {
+                            Text(
+                                text = "Strict",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Amplitude complète",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (!isAdaptive) CrispWhite.copy(alpha = 0.85f) else SteelGray
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 6. Discreet Telemetry Footer (keeps technical metrics accessible without cluttering the camera!)
+            val totalKcal = uiState.sessionTotalCaloriesKcal + uiState.currentSetCaloriesKcal
+            val primaryDeg = uiState.frame.angleBadges.firstOrNull()?.degrees
+            val angleStr = if (uiState.frame.poseDetected && primaryDeg != null) "${primaryDeg}°" else "—"
+            val mode3d = if (uiState.viewpointInfo.is3DActive) "3D" else "2D"
+            Text(
+                text = "Télémétrie : $angleStr ($mode3d) · Posture ${uiState.frame.formScore}% · ${String.format(Locale.US, "%.1f", totalKcal)} kcal · ${uiState.delegateLabel}",
+                style = MaterialTheme.typography.labelSmall,
+                color = SteelGray,
+                modifier = Modifier.padding(horizontal = 4.dp)
             )
         }
     }
 }
 
 @Composable
-private fun HudIconButton(
+private fun SettingsQuickActionTile(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    highlighted: Boolean,
     onClick: () -> Unit,
-    content: @Composable () -> Unit
+    modifier: Modifier = Modifier
 ) {
     Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = ObsidianBg.copy(alpha = 0.88f),
-        border = BorderStroke(1.dp, BorderHairline),
-        modifier = Modifier.size(44.dp)
+        shape = RoundedCornerShape(12.dp),
+        color = if (highlighted) SignalOrangeDim else ObsidianBg,
+        border = BorderStroke(1.dp, if (highlighted) SignalOrange else BorderHairline),
+        modifier = modifier.clickable(onClick = onClick)
     ) {
-        IconButton(onClick = onClick) {
-            content()
+        Column(
+            modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = if (highlighted) SignalOrange else CrispWhite,
+                modifier = Modifier.size(20.dp)
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (highlighted) SignalOrange else CrispWhite,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
+    }
+}
+
+@Composable
+private fun SettingsToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = CrispWhite,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = SteelGray
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = CrispWhite,
+                checkedTrackColor = SignalOrange,
+                uncheckedThumbColor = SteelGray,
+                uncheckedTrackColor = ElevatedSurface
+            )
+        )
     }
 }
 
