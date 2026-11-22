@@ -47,11 +47,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.ExerciseType
+import com.kinetix.coach.progression.ProgressionDelta
 import com.kinetix.coach.ui.components.FilterChipPill
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
@@ -716,6 +718,7 @@ fun ChallengesAndMusicSheet(
 @Composable
 fun ChallengeResultSheet(
     result: ChallengeResult,
+    progressionDelta: ProgressionDelta? = null,
     onReplay: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -736,9 +739,15 @@ fun ChallengeResultSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (result.completedGoal) "DÉFI ACCOMPLI" else "BILAN DU DÉFI",
+                    text = if (progressionDelta?.rankedUpTo != null) {
+                        "ÉPREUVE DE RANG VALIDÉE"
+                    } else if (result.completedGoal) {
+                        "DÉFI ACCOMPLI"
+                    } else {
+                        "BILAN DU DÉFI"
+                    },
                     style = MaterialTheme.typography.labelMedium,
-                    color = SteelGray,
+                    color = if (progressionDelta?.rankedUpTo != null) FormGood else SteelGray,
                     fontWeight = FontWeight.Bold
                 )
                 if (result.isNewRecord) {
@@ -780,6 +789,50 @@ fun ChallengeResultSheet(
                 style = MaterialTheme.typography.labelMedium,
                 color = SignalOrange
             )
+
+            if (progressionDelta != null && (progressionDelta.rankedUpTo != null || progressionDelta.xpGained > 0)) {
+                Spacer(Modifier.height(10.dp))
+                val rankColor = progressionDelta.rankedUpTo?.let { Color(it.accentHex) } ?: SignalOrange
+                IndustrialCard(containerColor = ObsidianBg, borderColor = rankColor) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = progressionDelta.rankedUpTo?.let {
+                                    "Promotion Rang ${it.code} · ${it.labelFr}"
+                                } ?: "Progression athlète",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = rankColor,
+                                fontWeight = FontWeight.Bold
+                            )
+                            val detail = buildString {
+                                if (progressionDelta.leveledUpTo != null) append("Niveau ${progressionDelta.leveledUpTo} atteint")
+                                if (progressionDelta.completedQuestTitles.isNotEmpty()) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("Quête validée")
+                                }
+                                if (isEmpty()) append("Séance vérifiée caméra")
+                            }
+                            Text(
+                                text = detail,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SteelGray
+                            )
+                        }
+                        if (progressionDelta.xpGained > 0) {
+                            Text(
+                                text = "+${progressionDelta.xpGained} XP",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = FormGood,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(14.dp))
 

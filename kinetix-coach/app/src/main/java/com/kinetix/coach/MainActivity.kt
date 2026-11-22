@@ -137,7 +137,17 @@ private fun KinetixRootShell() {
                     viewModel = encyclopediaVm,
                     onAskCoach = askCoachAndSwitch
                 )
-                KinetixTab.TRACKER -> TrackerScreen(viewModel = trackerVm)
+                KinetixTab.TRACKER -> TrackerScreen(
+                    viewModel = trackerVm,
+                    onLaunchExerciseInVision = { exercise ->
+                        visionVm.selectExercise(exercise)
+                        activeTab = KinetixTab.VISION
+                    },
+                    onLaunchRankExamInVision = { exam ->
+                        visionVm.startRankExam(exam)
+                        activeTab = KinetixTab.VISION
+                    }
+                )
             }
         }
     }

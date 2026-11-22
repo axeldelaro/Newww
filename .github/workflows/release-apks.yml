@@ -148,7 +148,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
-          TAG="${TAG:-v2.7.0}"
+          TAG="${TAG:-v2.8.0}"
           APK_K="/tmp/release-apks/Kinetix-Coach-${TAG}-arm64.apk"
           APK_A="/tmp/release-apks/AstroPro-14U-${TAG}-arm64.apk"
           ls -lh /tmp/release-apks/
@@ -157,15 +157,15 @@ jobs:
           cat > /tmp/release-notes.md <<EOF
           ## 2 Applications Android 100 % Hors-Ligne Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
-          ### 1. KINETIX Coach v2.4.0 Pro (\`Kinetix-Coach-${TAG}-arm64.apk\`)
-          - **Démarrage 100 % Contrôlé — Fini l'Auto-Lancement à l'Ouverture** :
-            - L'écran caméra s'ouvre désormais en mode **Prêt / Prévisualisation (\`IDLE\`)** : cadrage squelette 60 FPS sans aucun comptage, décompte ni alerte tant que vous n'appuyez pas explicitement sur **\`Démarrer\`** (avec réglage rapide \`0s / 5s / 8s / 10s\` et bouton \`Annuler\`).
-          - **Comptage IA Anti-Fausses-Reps Blindé — Tractions, Marche & 16 Exercices (65/65 tests)** :
-            - **Tractions (\`PULL_UP\`) par physique réelle de barre** : porte posturale haute toujours active (même en cours de rep), **ancrage 2D des poignets sur la barre** (\`pullupAnchorWindow\`) + **élévation verticale réelle des épaules** + validation bras tendus au-dessus de la tête — s'accrocher à la barre, lâcher la barre ou marcher en baissant les bras ne compte plus **jamais** de fausse répétition.
-            - **Garde anti-marche & anti-gestes parasites généralisée** : détection de marche lente, dérive latérale cumulée \`0,7 s\` et approche caméra (\`PoseSanityFilter\`), gel immédiat des frames hors-posture, ancrage mains \`Dips\`, arrêt sur décollement mains \`Pompes\`, portes posturales strictes \`Rowing\` / \`Développé militaire\` / \`Dips\` / \`Curl\` / \`Élévations latérales\` / \`Jumping Jack\`.
-            - **Rejeu rétroactif 2,4 s en mode \`AUTO\`** (zéro 1re rep perdue) + **auto-calibration monoculaire 3D des pompes** + filtre One-Euro réactif.
-          - **Interface Caméra Studio Minimaliste Pro + VBT Rep Max + 16 Exos / Variantes** :
-            - ~85 % d'écran libre, 1 ligne en haut, squelette épuré (angles expert optionnels), toast conditionnel, dock verre compact avec compteur géant animé, VBT (\`m/s\`, \`VL%\`, \`MAX ~X\`) et débriefing Coach IA local.
+          ### 1. KINETIX Coach v2.5.0 Pro (\`Kinetix-Coach-${TAG}-arm64.apk\`)
+          - **Progression Athlète Pro (\`E → S\`), Quêtes Procédurales & Épreuves de Rang Vérifiées Caméra (77/77 tests)** :
+            - **Zéro pénalité, zéro boutique, 100 % mérite & studio pro** : courbe continue de Niveaux et XP pondérée par la qualité biomécanique réelle (score posture + VBT), **zéro perte d'XP à minuit**, **12 Badges** et **10 Titres équipables** débloqués uniquement par la performance.
+            - **Épreuves de Passage de Rang (\`E → D → C → B → A → S\`) vérifiées à la caméra** : atteindre 100 % d'XP de rang débloque une épreuve physique réelle devant la caméra (Squats, Pompes, Planche, *Bip & Go* Militaire) avec annonce vocale et promotion officielle persistée en SQLite v5.
+            - **3 Quêtes Quotidiennes Procédurales & Adaptatives** : tirage quotidien déterministe (\`Exercice × Modificateur × Format\`) calibré selon votre Rang et votre matériel, lancement caméra en 1 tap et **auto-validation** dès que vos séries caméra atteignent l'objectif.
+          - **Cockpit Athlète (\`Suivi\`) + Radar 5 Axes + Podomètre Matériel Hors-Ligne** :
+            - Header compact Rang/Niveau/Titre/Streak, **Streak 7 cases visuel** (+150 XP bonus semaine complète 7/7), **Podomètre natif \`Sensor.TYPE_STEP_COUNTER\`** (palier 10 000 pas + graphique 7 jours + ajout manuel de secours), **Radar biomécanique 5 axes** (\`Force\`, \`Endurance\`, \`Agilité\`, \`Vitalité\`, \`Maîtrise\`) et **Palmarès cumulé à vie** (auto-migré depuis vos anciennes séances SQLite v4).
+            - **Coach IA Local (\`Gemma-3 1B\`) contextualisé** : connaît votre Rang, Streak, pas du jour, point faible du radar et quêtes ouvertes.
+          - **Caméra Studio Minimaliste Pro intacte (~85 % libre)** : démarrage contrôlé \`IDLE\` / \`Démarrer\`, comptage IA blindé Tractions/Pompes/16 exos, VBT Rep Max, 7 Défis, 42 vidéos MP4 et 2 683 fiches FTS5.
           - **SHA-256** : \`$SHA_K\`
 
           ### 2. AstroPro 14U v2.0.0 (\`AstroPro-14U-${TAG}-arm64.apk\`)
@@ -177,5 +177,5 @@ jobs:
             "$APK_K" \
             "$APK_A" \
             --repo "${{ github.repository }}" \
-            --title "${TAG} — KINETIX Coach v2.4.0 Pro (Démarrage Contrôlé, Tractions & Anti-Fausses-Reps Blindés) & AstroPro 14U v2.0" \
+            --title "${TAG} — KINETIX Coach v2.5.0 Pro (Progression E→S, Quêtes & Épreuves Caméra, Radar 5 Axes, Podomètre & Badges/Titres) & AstroPro 14U v2.0" \
             --notes-file /tmp/release-notes.md

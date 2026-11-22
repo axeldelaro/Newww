@@ -1,5 +1,8 @@
 package com.kinetix.coach.ui.tracker
 
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -57,6 +60,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -65,6 +70,7 @@ import com.kinetix.coach.data.AthleteProfile
 import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.WorkoutSession
+import com.kinetix.coach.progression.RankExamSpec
 import com.kinetix.coach.ui.components.FilterChipPill
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
@@ -89,7 +95,13 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 private enum class TrackerTab(val labelFr: String) {
-    HISTORY("Historique"),
+    QUESTS("Quêtes"),
+    PROGRESSION("Progression"),
+    HISTORY("Historique")
+}
+
+private enum class ProgressionSubSection(val labelFr: String) {
+    STATS("Stats & Badges"),
     PROFILE("Profil"),
     CALCULATORS("Calculateurs")
 }
@@ -120,20 +132,45 @@ private val ACTIVITY_LEVELS = listOf(
 )
 
 @Composable
-fun TrackerScreen(viewModel: TrackerViewModel) {
+fun TrackerScreen(
+    viewModel: TrackerViewModel,
+    onLaunchExerciseInVision: (ExerciseType) -> Unit = {},
+    onLaunchRankExamInVision: (RankExamSpec) -> Unit = {}
+) {
+    val haptic = LocalHapticFeedback.current
     val sessions by viewModel.sessions.collectAsStateWithLifecycle()
     val challengeRecords by viewModel.challengeRecords.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val savedFeedback by viewModel.profileSavedFeedback.collectAsStateWithLifecycle()
+    val progression by viewModel.progression.collectAsStateWithLifecycle()
+    val celebration by viewModel.celebration.collectAsStateWithLifecycle()
+    val pedometerActive by viewModel.pedometerActive.collectAsStateWithLifecycle()
 
-    var selectedTab by rememberSaveable { mutableStateOf(TrackerTab.HISTORY) }
+    var selectedTab by rememberSaveable { mutableStateOf(TrackerTab.QUESTS) }
+    var progressionSubSection by rememberSaveable { mutableStateOf(ProgressionSubSection.STATS) }
+
+    val pedometerPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        viewModel.onPedometerPermissionResult(granted)
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshToday()
+    }
+
+    LaunchedEffect(celebration) {
+        if (celebration != null) {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianBg)
     ) {
-        // Header + Sub-tabs
+        // Compact Pro Athlete Header (Rank E->S, Name, Merit Title, Level, Streak, XP bar) + 3 Clean Sub-tabs
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -141,25 +178,10 @@ fun TrackerScreen(viewModel: TrackerViewModel) {
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "SUIVI & TÉLÉMÉTRIE",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = CrispWhite,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "${profile.name} · ${profile.level} · ${profile.weightKg.toInt()} kg",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = SteelGray
-                    )
-                }
-            }
+            AthleteCompactHeader(
+                profile = profile,
+                state = progression
+            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -194,24 +216,103 @@ fun TrackerScreen(viewModel: TrackerViewModel) {
         HairlineDivider()
 
         when (selectedTab) {
+            TrackerTab.QUESTS -> QuestsCockpitTab(
+                state = progression,
+                pedometerActive = pedometerActive,
+                hasHardwarePedometer = viewModel.hasHardwarePedometer,
+                onRequestPedometerPermission = {
+                    if (viewModel.hasActivityPermission()) {
+                        viewModel.onPedometerPermissionResult(true)
+                    } else {
+                        pedometerPermissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)
+                    }
+                },
+                onAddManualSteps = { delta ->
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    viewModel.addManualSteps(delta)
+                },
+                onLaunchQuestInCamera = onLaunchExerciseInVision,
+                onCompleteQuestManually = { id ->
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    viewModel.completeQuestManually(id)
+                },
+                onLaunchRankExam = onLaunchRankExamInVision,
+                modifier = Modifier.weight(1f)
+            )
+            TrackerTab.PROGRESSION -> Column(modifier = Modifier.weight(1f)) {
+                // Clean Inner Section Selector: Stats & Badges | Profil | Calculateurs
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ProgressionSubSection.entries.forEach { sec ->
+                        val active = progressionSubSection == sec
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (active) ElevatedSurface else CharcoalSurface,
+                            border = BorderStroke(1.dp, if (active) SignalOrange else BorderHairline),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { progressionSubSection = sec }
+                        ) {
+                            Box(
+                                modifier = Modifier.padding(vertical = 7.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = sec.labelFr,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (active) CrispWhite else SteelGray,
+                                    fontWeight = if (active) FontWeight.Bold else FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+                }
+
+                when (progressionSubSection) {
+                    ProgressionSubSection.STATS -> Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp)
+                            .padding(bottom = 18.dp)
+                    ) {
+                        ProgressionOverviewSection(
+                            state = progression,
+                            onEquipTitle = { viewModel.equipTitle(it) },
+                            onLaunchRankExam = onLaunchRankExamInVision
+                        )
+                    }
+                    ProgressionSubSection.PROFILE -> ProfileTabContent(
+                        profile = profile,
+                        savedFeedback = savedFeedback,
+                        onSave = { viewModel.saveProfile(it) },
+                        onClearFeedback = { viewModel.clearProfileSavedFeedback() },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ProgressionSubSection.CALCULATORS -> CalculatorsTabContent(
+                        profile = profile,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
             TrackerTab.HISTORY -> HistoryTabContent(
                 sessions = sessions,
                 challengeRecords = challengeRecords,
                 onDeleteSession = { viewModel.deleteSession(it) },
                 modifier = Modifier.weight(1f)
             )
-            TrackerTab.PROFILE -> ProfileTabContent(
-                profile = profile,
-                savedFeedback = savedFeedback,
-                onSave = { viewModel.saveProfile(it) },
-                onClearFeedback = { viewModel.clearProfileSavedFeedback() },
-                modifier = Modifier.weight(1f)
-            )
-            TrackerTab.CALCULATORS -> CalculatorsTabContent(
-                profile = profile,
-                modifier = Modifier.weight(1f)
-            )
         }
+    }
+
+    celebration?.let { delta ->
+        ProgressionCelebrationDialog(
+            delta = delta,
+            onDismiss = { viewModel.dismissCelebration() }
+        )
     }
 }
 

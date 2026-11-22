@@ -9,7 +9,10 @@ import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.MovementPhase
 import com.kinetix.coach.data.WorkoutSession
+import com.kinetix.coach.progression.ProgressionDelta
+import com.kinetix.coach.progression.RankExamSpec
 import com.kinetix.coach.vision.AutoExerciseDetector
+import com.kinetix.coach.vision.BeepType
 import com.kinetix.coach.vision.BiomechanicsEngine
 import com.kinetix.coach.vision.BiomechanicsFrame
 import com.kinetix.coach.vision.BufferedPoseFrame
@@ -82,6 +85,7 @@ data class VisionUiState(
     val completedSummary: WorkoutSession? = null,
     val completedBreakdown: List<ExerciseBreakdownItem> = emptyList(),
     val completedVelocityTelemetry: VelocityTelemetry? = null,
+    val completedProgressionDelta: ProgressionDelta? = null,
     // Challenges & Music state
     val activeChallenge: ChallengeSnapshot? = null,
     val completedChallengeResult: ChallengeResult? = null,
@@ -168,6 +172,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private var challengeTickerJob: Job? = null
     private var musicStartedForChallenge = false
     private var lastActiveChallengeConfig: ChallengeConfig? = null
+    private var lastAttemptedRankExam: RankExamSpec? = null
 
     // Rolling ~2.4s landmark history for zero-lost-first-rep retroactive replay when AUTO switches exercises
     private val recentPoseHistory = ArrayDeque<BufferedPoseFrame>(REPLAY_HISTORY_MAX_FRAMES + 4)
@@ -525,7 +530,17 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     // Camera-Verified Challenges Lifecycle
     // -------------------------------------------------------------------------
 
-    fun startChallenge(config: ChallengeConfig) {
+    fun startRankExam(exam: RankExamSpec) {
+        lastAttemptedRankExam = exam
+        app.progressionRepo.beginRankExam(exam)
+        startChallenge(exam.challengeConfig, preserveRankExam = true)
+    }
+
+    fun startChallenge(config: ChallengeConfig, preserveRankExam: Boolean = false) {
+        if (!preserveRankExam) {
+            lastAttemptedRankExam = null
+            app.progressionRepo.clearActiveRankExam()
+        }
         cancelRestTimer()
         cancelSetupTimer()
         cancelChallengeTicker()
@@ -581,6 +596,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 setupRemainingSec = 0,
                 completedSummary = null,
                 completedBreakdown = emptyList(),
+                completedProgressionDelta = null,
                 selectedMusicTrack = resolvedTrack,
                 isMusicMuted = false,
                 activeChallenge = startOutput.snapshot,
@@ -595,6 +611,12 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun replayLastChallenge() {
+        val pendingExam = lastAttemptedRankExam
+        val progState = app.progressionRepo.state.value
+        if (pendingExam != null && progState.rank == pendingExam.fromRank && progState.rankExamReady) {
+            startRankExam(pendingExam)
+            return
+        }
         val cfg = synchronized(pipelineLock) { lastActiveChallengeConfig } ?: return
         startChallenge(cfg)
     }
@@ -611,6 +633,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
         if (out != null) {
             applyChallengeOutputEffects(out)
         } else {
+            app.progressionRepo.clearActiveRankExam()
             _uiState.update { it.copy(activeChallenge = null) }
         }
     }
@@ -622,6 +645,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 activeChallenge = null,
                 completedChallengeResult = null,
+                completedProgressionDelta = null,
                 isSessionActive = true
             )
         }
@@ -634,6 +658,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
     private fun stopChallengeSilentlyLocked() {
         cancelChallengeTicker()
         challengeController.stopAndReset()
+        app.progressionRepo.clearActiveRankExam()
         audioEngine.stopMusic()
         musicStartedForChallenge = false
     }
@@ -714,6 +739,64 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             previousRecordLabel = prevBest?.scoreLabel
         )
 
+        val recordedSession = if (enriched.totalReps > 0 || (ex.isIsometric && enriched.durationSec >= 3)) {
+            WorkoutSession(
+                timestampMs = System.currentTimeMillis(),
+                exerciseType = ex,
+                reps = enriched.totalReps,
+                durationSec = enriched.durationSec,
+                avgFormScore = enriched.avgFormScore,
+                avgRomPct = _uiState.value.frame.avgRomPct.coerceAtLeast(if (ex.isIsometric) 100 else 75),
+                topFaults = _uiState.value.frame.topFaults,
+                notes = "Défi · ${cfg.type.shortTitleFr} (${enriched.scoreLabel})",
+                caloriesKcal = enriched.caloriesKcal
+            )
+        } else null
+
+        // Credit athletic XP, daily quests, lifetime palmarès & evaluate camera Rank Exam promotion!
+        val workoutDelta = recordedSession?.let {
+            app.progressionRepo.recordWorkoutSession(it, emitGlobalCelebration = false)
+        } ?: ProgressionDelta()
+        val activeExam = app.progressionRepo.activeRankExam
+        val examDelta = if (activeExam != null) {
+            val achieved = when (cfg.type) {
+                ChallengeType.BIP_AND_GO_PUSHUPS,
+                ChallengeType.PLANK_MUSIC_HOLD -> enriched.scoreValue.toInt()
+                else -> enriched.totalReps
+            }
+            val passed = achieved >= activeExam.minScoreToPass
+            app.progressionRepo.recordRankExamResult(
+                achievedScore = achieved,
+                passed = passed,
+                emitGlobalCelebration = false
+            )
+        } else {
+            ProgressionDelta()
+        }
+        if (examDelta.rankedUpTo != null) {
+            lastAttemptedRankExam = null
+        }
+
+        val combinedDelta = ProgressionDelta(
+            xpGained = workoutDelta.xpGained + examDelta.xpGained,
+            rankXpGained = workoutDelta.rankXpGained + examDelta.rankXpGained,
+            completedQuestTitles = workoutDelta.completedQuestTitles,
+            leveledUpFrom = workoutDelta.leveledUpFrom ?: examDelta.leveledUpFrom,
+            leveledUpTo = examDelta.leveledUpTo ?: workoutDelta.leveledUpTo,
+            rankedUpFrom = examDelta.rankedUpFrom,
+            rankedUpTo = examDelta.rankedUpTo,
+            newlyUnlockedBadges = (workoutDelta.newlyUnlockedBadges + examDelta.newlyUnlockedBadges).distinct(),
+            newlyUnlockedTitles = (workoutDelta.newlyUnlockedTitles + examDelta.newlyUnlockedTitles).distinct(),
+            weeklyStreakBonusAwarded = workoutDelta.weeklyStreakBonusAwarded
+        )
+
+        if (combinedDelta.rankedUpTo != null) {
+            audioEngine.playBeep(BeepType.COMPLETE)
+            voiceCoach.speak("Félicitations ! Promotion au rang ${combinedDelta.rankedUpTo.code} !", force = true)
+        } else if (combinedDelta.hasCelebration) {
+            audioEngine.playBeep(BeepType.COMPLETE)
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
             if (eligibleForPr) {
                 app.userDb.insertChallengeRecord(
@@ -728,20 +811,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                     )
                 )
             }
-            if (enriched.totalReps > 0 || (ex.isIsometric && enriched.durationSec >= 3)) {
-                app.userDb.insertSession(
-                    WorkoutSession(
-                        timestampMs = System.currentTimeMillis(),
-                        exerciseType = ex,
-                        reps = enriched.totalReps,
-                        durationSec = enriched.durationSec,
-                        avgFormScore = enriched.avgFormScore,
-                        avgRomPct = _uiState.value.frame.avgRomPct.coerceAtLeast(if (ex.isIsometric) 100 else 75),
-                        topFaults = _uiState.value.frame.topFaults,
-                        notes = "Défi · ${cfg.type.shortTitleFr} (${enriched.scoreLabel})",
-                        caloriesKcal = enriched.caloriesKcal
-                    )
-                )
+            if (recordedSession != null) {
+                app.userDb.insertSession(recordedSession)
             }
         }
 
@@ -749,7 +820,9 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 activeChallenge = null,
                 isSessionActive = false,
-                completedChallengeResult = enriched
+                isTrackingStarted = false,
+                completedChallengeResult = enriched,
+                completedProgressionDelta = combinedDelta.takeIf { d -> d.xpGained > 0 || d.rankedUpTo != null }
             )
         }
     }
@@ -1289,6 +1362,7 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 completedSummary = null,
                 completedBreakdown = emptyList(),
                 completedVelocityTelemetry = null,
+                completedProgressionDelta = null,
                 activeChallenge = null,
                 completedChallengeResult = null
             )
@@ -1423,6 +1497,16 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
+        val perExerciseWork = completedBreakdownList.map { Triple(it.exercise, it.reps, it.holdSec) }
+        val progressionDelta = app.progressionRepo.recordWorkoutSession(
+            session = session,
+            perExerciseWork = perExerciseWork,
+            emitGlobalCelebration = false
+        )
+        if (progressionDelta.hasCelebration) {
+            audioEngine.playBeep(BeepType.COMPLETE)
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
             if (session.reps > 0 || (session.exerciseType.isIsometric && session.durationSec >= 3) || session.caloriesKcal >= 0.5) {
                 app.userDb.insertSession(session)
@@ -1438,7 +1522,8 @@ class VisionViewModel(application: Application) : AndroidViewModel(application) 
                 setupRemainingSec = 0,
                 completedSummary = session,
                 completedBreakdown = completedBreakdownList,
-                completedVelocityTelemetry = finalVelocityTelemetry
+                completedVelocityTelemetry = finalVelocityTelemetry,
+                completedProgressionDelta = progressionDelta.takeIf { d -> d.xpGained > 0 || d.hasCelebration }
             )
         }
     }

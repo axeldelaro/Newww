@@ -101,6 +101,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kinetix.coach.data.ExerciseType
 import com.kinetix.coach.data.WorkoutSession
+import com.kinetix.coach.progression.ProgressionDelta
 import com.kinetix.coach.ui.components.ExerciseDemoSheetContent
 import com.kinetix.coach.ui.components.HairlineDivider
 import com.kinetix.coach.ui.components.IndustrialCard
@@ -913,6 +914,7 @@ fun VisionScreen(
     uiState.completedChallengeResult?.let { result ->
         ChallengeResultSheet(
             result = result,
+            progressionDelta = uiState.completedProgressionDelta,
             onReplay = { viewModel.replayLastChallenge() },
             onClose = { viewModel.dismissChallengeResult() }
         )
@@ -942,6 +944,7 @@ fun VisionScreen(
             session = summary,
             breakdown = uiState.completedBreakdown,
             velocityTelemetry = uiState.completedVelocityTelemetry,
+            progressionDelta = uiState.completedProgressionDelta,
             onDismiss = { viewModel.dismissSummaryAndRestart() },
             onAnalyzeWithCoach = {
                 val prompt = viewModel.buildCoachDebriefPrompt(summary)
@@ -1908,6 +1911,7 @@ private fun SessionSummarySheet(
     session: WorkoutSession,
     breakdown: List<ExerciseBreakdownItem>,
     velocityTelemetry: VelocityTelemetry?,
+    progressionDelta: ProgressionDelta? = null,
     onDismiss: () -> Unit,
     onAnalyzeWithCoach: () -> Unit
 ) {
@@ -1953,6 +1957,69 @@ private fun SessionSummarySheet(
                     }
                 }
             }
+
+            if (progressionDelta != null && (progressionDelta.xpGained > 0 || progressionDelta.hasCelebration)) {
+                Spacer(Modifier.height(10.dp))
+                val borderAccent = if (progressionDelta.leveledUpTo != null) FormGood else SignalOrange.copy(alpha = 0.75f)
+                IndustrialCard(containerColor = ObsidianBg, borderColor = borderAccent) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = when {
+                                    progressionDelta.leveledUpTo != null -> "Niveau ${progressionDelta.leveledUpTo} atteint !"
+                                    progressionDelta.completedQuestTitles.isNotEmpty() -> "Quête du jour validée"
+                                    else -> "Progression enregistrée"
+                                },
+                                style = MaterialTheme.typography.titleSmall,
+                                color = if (progressionDelta.leveledUpTo != null) FormGood else CrispWhite,
+                                fontWeight = FontWeight.Bold
+                            )
+                            val sub = buildString {
+                                if (progressionDelta.completedQuestTitles.isNotEmpty()) {
+                                    append(progressionDelta.completedQuestTitles.joinToString(" · "))
+                                }
+                                if (progressionDelta.newlyUnlockedBadges.isNotEmpty()) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("Badge : ${progressionDelta.newlyUnlockedBadges.first().titleFr}")
+                                }
+                                if (progressionDelta.weeklyStreakBonusAwarded) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("Bonus 7/7 (+150 XP)")
+                                }
+                                if (isEmpty()) {
+                                    append("Attributs & palmarès mis à jour")
+                                }
+                            }
+                            Text(
+                                text = sub,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SteelGray,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = FormGood.copy(alpha = 0.16f),
+                            border = BorderStroke(1.dp, FormGood.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = "+${progressionDelta.xpGained} XP",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = FormGood,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(14.dp))
 
             IndustrialCard(containerColor = ObsidianBg) {

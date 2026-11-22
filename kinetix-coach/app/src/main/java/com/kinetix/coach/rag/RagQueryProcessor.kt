@@ -174,7 +174,8 @@ object RagQueryProcessor {
         userQuestion: String,
         profile: AthleteProfile,
         ragHits: List<RagHit>,
-        recentHistory: List<Pair<Boolean, String>>
+        recentHistory: List<Pair<Boolean, String>>,
+        progressionContext: String? = null
     ): String {
         val sb = StringBuilder(2200)
         sb.append("Tu es KINETIX Coach, préparateur physique, biomécanicien et expert en nutrition sportive 100% hors-ligne. ")
@@ -182,6 +183,9 @@ object RagQueryProcessor {
         sb.append("Appuie-toi prioritairement sur les sources locales fournies ci-dessous. ")
         sb.append("En cas de douleur aiguë ou symptôme grave, rappelle de consulter un médecin du sport ou kinésithérapeute.\n\n")
         sb.append("PROFIL ATHLÈTE : ").append(profile.toPromptSummary()).append("\n")
+        if (!progressionContext.isNullOrBlank()) {
+            sb.append("STATUT PROGRESSION : ").append(progressionContext).append("\n")
+        }
 
         if (ragHits.isNotEmpty()) {
             sb.append("\nSOURCES LOCALES KINETIX :\n")

@@ -129,12 +129,13 @@ class CoachViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // 3. Build grounded French coaching prompt with athlete profile + local RAG sources
+            // 3. Build grounded French coaching prompt with athlete profile + live progression + local RAG sources
             val promptPayload = RagQueryProcessor.buildCoachSystemAndUserMessage(
                 userQuestion = question,
                 profile = profile.value,
                 ragHits = ragHits,
-                recentHistory = previousHistory
+                recentHistory = previousHistory,
+                progressionContext = app.progressionRepo.state.value.toCoachContextLine()
             )
 
             // 4. Stream tokens directly from native llama.cpp engine

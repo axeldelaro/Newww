@@ -6,6 +6,7 @@ import com.kinetix.coach.data.ModelAssetManager
 import com.kinetix.coach.data.ModelPrepareState
 import com.kinetix.coach.data.UserDatabaseHelper
 import com.kinetix.coach.llm.LlamaEngine
+import com.kinetix.coach.progression.ProgressionRepository
 import com.kinetix.coach.rag.RagEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +23,9 @@ class KinetixApp : Application() {
     lateinit var userDb: UserDatabaseHelper
         private set
 
+    lateinit var progressionRepo: ProgressionRepository
+        private set
+
     lateinit var ragEngine: RagEngine
         private set
 
@@ -35,6 +39,7 @@ class KinetixApp : Application() {
         super.onCreate()
         kbHelper = KnowledgeBaseHelper(this)
         userDb = UserDatabaseHelper(this)
+        progressionRepo = ProgressionRepository(this, userDb, appScope)
         ragEngine = RagEngine(kbHelper)
         modelAssetManager = ModelAssetManager(this, userDb)
         llamaEngine = LlamaEngine()

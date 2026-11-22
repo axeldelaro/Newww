@@ -7,6 +7,8 @@ import com.kinetix.coach.KinetixApp
 import com.kinetix.coach.data.AthleteProfile
 import com.kinetix.coach.data.ChallengeRecord
 import com.kinetix.coach.data.WorkoutSession
+import com.kinetix.coach.progression.AthleteProgressState
+import com.kinetix.coach.progression.ProgressionDelta
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -116,8 +118,48 @@ class TrackerViewModel(application: Application) : AndroidViewModel(application)
     val profile: StateFlow<AthleteProfile> = app.userDb.profile
         .stateIn(viewModelScope, SharingStarted.Eagerly, AthleteProfile())
 
+    val progression: StateFlow<AthleteProgressState> = app.progressionRepo.state
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AthleteProgressState())
+
+    val celebration: StateFlow<ProgressionDelta?> = app.progressionRepo.lastCelebration
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    val pedometerActive: StateFlow<Boolean> = app.progressionRepo.pedometerActive
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    val hasHardwarePedometer: Boolean
+        get() = app.progressionRepo.stepTracker.hasHardwareSensor
+
+    fun hasActivityPermission(): Boolean = app.progressionRepo.stepTracker.hasActivityPermission()
+
     private val _profileSavedFeedback = MutableStateFlow(false)
     val profileSavedFeedback: StateFlow<Boolean> = _profileSavedFeedback.asStateFlow()
+
+    fun refreshToday() {
+        app.progressionRepo.initializeAndRefreshToday()
+    }
+
+    fun onPedometerPermissionResult(granted: Boolean) {
+        if (granted) {
+            app.progressionRepo.onPedometerPermissionGranted()
+        }
+    }
+
+    fun addManualSteps(delta: Int) {
+        app.progressionRepo.addManualSteps(delta)
+    }
+
+    fun completeQuestManually(questId: String) {
+        app.progressionRepo.completeQuestManually(questId)
+    }
+
+    fun equipTitle(titleId: String) {
+        app.progressionRepo.equipTitle(titleId)
+    }
+
+    fun dismissCelebration() {
+        app.progressionRepo.dismissCelebration()
+    }
 
     fun saveProfile(updated: AthleteProfile) {
         app.userDb.saveProfile(updated)
