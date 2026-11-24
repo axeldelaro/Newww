@@ -33,5 +33,24 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
+## 3. ZAAGFORGE (`zaagforge/` — v1.0.0)
+**Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20**
+
+- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, `157/157` assertions C++20 + JVM tests)
+- **8 Presets Studio Extrêmes (`155 → 225 BPM`)** : *UOK Piep Madness*, *Noiseflow Krach*, *Pure Zaag Chainsaw*, *Bounce Uptempo*, *GPF Piep Terror*, *Xtra Rawstyle*, *Frenchcore Euphoric*, *Schranz Industrial*.
+- **8 Topologies de Kicks Synthétisées en C++20** : `PIEP_UOK`, `KRACH_NOISEFLOW`, `ZAAG_CHAINSAW`, `UPTEMPO_BOUNCE`, `ZAAG_PIEP_HYBRID`, `RAWSTYLE_GATED`, `FRENCHCORE_MELODIC`, `SCHRANZ_INDUSTRIAL`, avec screeches, risers, build-up rolls, stutter vocal chops, WSOLA time-stretch/pitch-shift, crossover Linkwitz-Riley 4e ordre, sidechain, structure complète (*Intro → Break → Build-Up → Fake-Drop → Drop 1 → Kick Switch → Drop 2*) et master 3-bandes OTT/Hard-Clipper.
+- **Bridge Hybride MP3 & Streaming** : import local `MP3/WAV/FLAC/M4A/OGG`, recherche API publique **Deezer** (aperçus officiels 30s remixables immédiatement), résolution de liens partagés **Spotify / Deezer / SoundCloud** (`oEmbed` + matching fuzzy MP3 local), écoute A/B instantanée et exports `M4A AAC 256k` / `WAV 16-bit` dans `Music/ZaagForge/`.
+
+---
+
+## 4. StrikeCam Arcade (`strikecam/` — v1.0.0)
+**Jeu d'Arcade Rythme-Boxe Full-Body Caméra (Beat Saber × BoxVR) — 60–120 FPS + FFT C++20**
+
+- **Package** : `com.strikecam.arcade` (`arm64-v8a`, Android 10+, MediaPipe Pose + CameraX `4:3` pixel-perfect)
+- **Gameplay Rythme-Boxe Caméra** : jabs poing gauche rouge / droit cyan, **Slashes directionnels (`↑ ↓ ← →`, bonus `×1.5`)**, **Double Power Strikes (`×1.5`)**, **Murs Laser d'Esquive** (*Baisse-toi !*, *Esquive ← / →*), auto-calibration `3-2-1`, combo multiplicateur `1× → 8× FEVER`, modes **Solo Arcade**, **Survie (3 vies + accélération jusqu'à `1.60×`)** et **Duel 2 Joueurs**.
+- **Synergie ZAAGFORGE & Streaming** : 5 pistes synthétisées C++20 (*Neon Velocity 135* → *Piep Boss 215 BPM*), **détection automatique prioritaire de vos remixes `Music/ZaagForge/`**, import MP3 local avec beatmap FFT 3-bandes automatique, recherche **Deezer 30s FFT**, et **Mode Live Sync Spotify / Deezer / SoundCloud** (*Tap-Sync*, phase `±50ms`, *Micro Beat Tracker C++20*, télécommande média).
+
+---
+
 ## Installation des APK Release Signés
-Les 2 APK prêts à installer (signés v2, `arm64-v8a`) sont publiés dans **[Releases](https://github.com/axeldelaro/Newww/releases)**.
+Les APK prêts à installer (signés v2, `arm64-v8a`) sont publiés dans **[Releases](https://github.com/axeldelaro/Newww/releases)**.

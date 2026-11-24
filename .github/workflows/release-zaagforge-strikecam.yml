@@ -1,0 +1,185 @@
+name: Build & Publish ZAAGFORGE + StrikeCam Arcade APKs
+
+on:
+  push:
+    tags:
+      - "studio-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name"
+        required: true
+        default: "studio-v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-zaagforge:
+    name: Build ZAAGFORGE APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+
+      - name: Run Native C++20 ZAAGFORGE DSP Unit Tests
+        run: |
+          g++ -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter \
+            zaagforge/app/src/main/cpp/music_analyzer.cpp \
+            zaagforge/app/src/main/cpp/hardcore_kicks.cpp \
+            zaagforge/app/src/main/cpp/remix_engine.cpp \
+            zaagforge/app/src/main/cpp/tests/test_zaagforge_dsp.cpp \
+            -Izaagforge/app/src/main/cpp -lm -o /tmp/test_zaagforge && /tmp/test_zaagforge
+
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass astrocoach2026 -keypass astrocoach2026 \
+            -dname "CN=Newww Mobile, OU=Engineering, O=Newww, L=Paris, ST=IDF, C=FR"
+
+      - name: Test & Assemble ZAAGFORGE Release APK
+        working-directory: zaagforge
+        env:
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-studio-v1.0.0}"
+          VER="${TAG#studio-}"
+          gradle :app:testDebugUnitTest assembleRelease --no-daemon --console=plain
+          OUT="/tmp/ZaagForge-${VER}-arm64.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$OUT"
+          echo "APK_PATH=$OUT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zaagforge-apk
+          path: ${{ env.APK_PATH }}
+
+  build-strikecam:
+    name: Build StrikeCam Arcade APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+
+      - name: Install Android NDK 27.3 & CMake 3.22
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+
+      - name: Fetch Embedded MediaPipe Pose Landmarker Model
+        run: |
+          mkdir -p strikecam/app/src/main/assets/models
+          curl -fSL -o strikecam/app/src/main/assets/models/pose_landmarker_full.task \
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+          ls -lh strikecam/app/src/main/assets/models/
+
+      - name: Run Native C++20 StrikeCam Beatmap & Synth Tests
+        run: |
+          g++ -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter \
+            strikecam/app/src/main/cpp/beatmap_generator.cpp \
+            strikecam/app/src/main/cpp/arcade_synth.cpp \
+            strikecam/app/src/main/cpp/live_beat_tracker.cpp \
+            strikecam/app/src/main/cpp/tests/test_strikecam_engine.cpp \
+            -Istrikecam/app/src/main/cpp -lm -o /tmp/test_strikecam && /tmp/test_strikecam
+
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore /tmp/release.keystore -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass astrocoach2026 -keypass astrocoach2026 \
+            -dname "CN=Newww Mobile, OU=Engineering, O=Newww, L=Paris, ST=IDF, C=FR"
+
+      - name: Test & Assemble StrikeCam Arcade Release APK
+        working-directory: strikecam
+        env:
+          RELEASE_KEYSTORE_PATH: /tmp/release.keystore
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-studio-v1.0.0}"
+          VER="${TAG#studio-}"
+          gradle :app:testDebugUnitTest assembleRelease --no-daemon --console=plain
+          OUT="/tmp/StrikeCam-Arcade-${VER}-arm64.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$OUT"
+          echo "APK_PATH=$OUT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strikecam-arcade-apk
+          path: ${{ env.APK_PATH }}
+
+  publish-studio-release:
+    name: Publish GitHub Release (ZAAGFORGE + StrikeCam Arcade)
+    needs: [build-zaagforge, build-strikecam]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zaagforge-apk
+          path: /tmp/release-apks
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: strikecam-arcade-apk
+          path: /tmp/release-apks
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          TAG="${TAG:-studio-v1.0.0}"
+          VER="${TAG#studio-}"
+          APK_Z="/tmp/release-apks/ZaagForge-${VER}-arm64.apk"
+          APK_S="/tmp/release-apks/StrikeCam-Arcade-${VER}-arm64.apk"
+          ls -lh /tmp/release-apks/
+          SHA_Z=$(sha256sum "$APK_Z" | awk '{print $1}')
+          SHA_S=$(sha256sum "$APK_S" | awk '{print $1}')
+          cat > /tmp/release-notes.md <<EOF
+          ## 2 Nouvelles Applications Android Natives Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
+
+          ### 1. ZAAGFORGE ${VER} (\`ZaagForge-${VER}-arm64.apk\`)
+          **Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20**
+          - **8 Presets Studio Extrêmes** (\`155 → 225 BPM\`) : *UOK Piep Madness*, *Noiseflow Krach*, *Pure Zaag Chainsaw*, *Bounce Uptempo*, *GPF Piep Terror*, *Xtra Rawstyle*, *Frenchcore Euphoric*, *Schranz Industrial*.
+          - **8 Topologies de Kicks Synthétisées en C++20** (0 sample recyclé) : \`PIEP_UOK\` (chirp 1,8→3,4 kHz + waveshaper), \`KRACH_NOISEFLOW\` (bandpass resonant overdrive + crush industriel), \`ZAAG_CHAINSAW\` (saw-sub + tronçonneuse FM/clipping), \`UPTEMPO_BOUNCE\`, \`ZAAG_PIEP_HYBRID\`, \`RAWSTYLE_GATED\`, \`FRENCHCORE_MELODIC\`, \`SCHRANZ_INDUSTRIAL\` + screeches, risers, build-up rolls et stutter vocal chops.
+          - **Arrangement Automatique Complet** : détection BPM/beatgrid + WSOLA time-stretch & pitch-shift vocal + crossover Linkwitz-Riley 4e ordre + sidechain + structure complète (*Intro → Break → Build-Up → Fake-Drop → Drop 1 → Kick Switch → Drop 2*) + master 3-bandes OTT/Hard-Clipper (\`-4.2\` à \`-5.8 dB RMS\`).
+          - **Bridge Hybride MP3 & Streaming** : import local \`MP3/WAV/FLAC/M4A/OGG\`, recherche **Deezer API** (remix instantané d'aperçus officiels 30s), résolution de liens partagés **Spotify / Deezer / SoundCloud** (\`oEmbed\` + matching fuzzy MP3 local), comparaison A/B instantanée + exports \`M4A AAC 256k\` / \`WAV 16-bit\` directement dans \`Music/ZaagForge/\`.
+          - **Tests** : \`157/157\` assertions C++20 + \`6/6\` tests JVM.
+          - **SHA-256** : \`$SHA_Z\`
+
+          ### 2. StrikeCam Arcade ${VER} (\`StrikeCam-Arcade-${VER}-arm64.apk\`)
+          **Jeu d'Arcade Rythme-Boxe Full-Body Caméra (Beat Saber × BoxVR) — 60–120 FPS + FFT C++20**
+          - **Vision 3D Temps Réel** (\`MediaPipe Pose\` + filtre \`One Euro\` + alignement \`4:3\` pixel-perfect) : jabs poing gauche rouge / droit cyan, **Slashes directionnels** (\`↑ ↓ ← →\`, bonus \`×1.5\`), **Double Power Strikes** (\`×1.5\`), **Murs Laser d'Esquive** (*Baisse-toi ! / Esquive ← / →*), auto-calibration pendant le compte à rebours \`3-2-1\`, modes **Solo Arcade**, **Survie (3 vies + accélération jusqu'à \`1.60×\`)** et **Duel 2 Joueurs** sur la même beatmap.
+          - **Synergie Directe ZAAGFORGE & Streaming** : 5 pistes synthétisées C++20 intégrées (*Neon Velocity 135* → *Piep Boss 215 BPM*), **détection automatique prioritaire de vos remixes \`Music/ZaagForge/\`**, import MP3 local avec génération auto de beatmap FFT 3-bandes, recherche **Deezer 30s FFT**, et **Mode Live Sync Spotify / Deezer / SoundCloud** (*Tap-Sync*, décalage \`±50ms\`, *Micro Beat Tracker C++20* et télécommande média).
+          - **Tests** : \`5/5\` suites C++20 + \`9/9\` tests JVM.
+          - **SHA-256** : \`$SHA_S\`
+          EOF
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes || true
+          gh release create "$TAG" \
+            "$APK_Z" \
+            "$APK_S" \
+            --repo "${{ github.repository }}" \
+            --title "${TAG} — ZAAGFORGE ${VER} (Remixer Uptempo/Zaag/Piep/Krach) & StrikeCam Arcade ${VER}" \
+            --notes-file /tmp/release-notes.md

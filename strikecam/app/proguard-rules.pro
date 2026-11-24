@@ -1,0 +1,2 @@
+-keep class com.strikecam.arcade.nativeengine.StrikeCamNative { *; }
+-keep class com.google.mediapipe.** { *; }
