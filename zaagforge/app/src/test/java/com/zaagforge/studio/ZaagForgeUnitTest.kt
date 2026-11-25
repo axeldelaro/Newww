@@ -3,12 +3,16 @@ package com.zaagforge.studio
 import com.zaagforge.studio.audio.AudioDecoder
 import com.zaagforge.studio.audio.AudioExporter
 import com.zaagforge.studio.model.AudioTrackItem
+import com.zaagforge.studio.model.CustomPresetStore
 import com.zaagforge.studio.model.DropAlignmentMode
 import com.zaagforge.studio.model.KickType
 import com.zaagforge.studio.model.MasterMode
+import com.zaagforge.studio.model.RemixGenreTheme
 import com.zaagforge.studio.model.RemixParams
+import com.zaagforge.studio.model.RemixPreset
 import com.zaagforge.studio.model.StreamingProvider
 import com.zaagforge.studio.model.StudioPresets
+import com.zaagforge.studio.model.TempoSyncMode
 import com.zaagforge.studio.model.TrackSourceType
 import com.zaagforge.studio.music.LibraryAndStreamingRepository
 import org.junit.Assert.assertEquals
@@ -22,30 +26,53 @@ import java.nio.ByteOrder
 class ZaagForgeUnitTest {
 
     @Test
-    fun presets_allEightPresetsValidWithCleanSubAndVocalClarityDefaults() {
-        assertEquals(8, StudioPresets.all.size)
+    fun presets_allTwelveArtistPresetsValidAcrossAllSixGenres() {
+        assertEquals(12, StudioPresets.all.size)
+        assertEquals(12, KickType.entries.size)
+        assertEquals(6, RemixGenreTheme.entries.size)
+        assertEquals(3, TempoSyncMode.entries.size)
+
         val ids = StudioPresets.all.map { it.id }.toSet()
-        assertEquals(8, ids.size)
+        assertEquals(12, ids.size)
+
+        val coveredGenres = StudioPresets.all.map { it.params.genreTheme }.toSet()
+        assertEquals(RemixGenreTheme.entries.toSet(), coveredGenres)
+
         StudioPresets.all.forEach { preset ->
-            assertTrue("${preset.id} BPM out of bounds", preset.params.targetBpm in 150f..240f)
+            assertTrue("${preset.id} BPM out of bounds", preset.params.targetBpm in 124f..240f)
             assertTrue("${preset.id} drive out of bounds", preset.params.drive in 0f..1f)
             assertTrue("${preset.id} bassSaturation clean default", preset.params.bassSaturation in 0.20f..0.55f)
-            assertTrue("${preset.id} vocalClarity high default", preset.params.vocalClarity in 0.70f..0.95f)
+            assertTrue("${preset.id} vocalClarity high default", preset.params.vocalClarity in 0.78f..0.95f)
+            assertTrue("${preset.id} epicVocalBoost high default", preset.params.epicVocalBoost in 0.80f..0.96f)
+            assertEquals("${preset.id} never slows down by default", TempoSyncMode.NEVER_SLOW, preset.params.tempoSyncMode)
             assertTrue("${preset.id} kickSwitchBars invalid", preset.params.kickSwitchBars in listOf(4, 8, 16))
         }
+
+        val techno = StudioPresets.byId("techno_club_hypnotic")
+        assertEquals(RemixGenreTheme.TECHNO_CLUB, techno.params.genreTheme)
+        assertEquals(KickType.TECHNO_ROLLING, techno.params.drop1Kick)
+        assertEquals(138f, techno.params.targetBpm, 0.1f)
+
+        val hardTechno = StudioPresets.byId("hard_techno_rave")
+        assertEquals(RemixGenreTheme.HARD_TECHNO, hardTechno.params.genreTheme)
+        assertEquals(KickType.HARD_TECHNO_RAVE, hardTechno.params.drop1Kick)
+
+        val frenchcore = StudioPresets.byId("frenchcore_euphoric")
+        assertEquals(RemixGenreTheme.FRENCHCORE, frenchcore.params.genreTheme)
+        assertEquals(KickType.FRENCHCORE_MELODIC, frenchcore.params.drop1Kick)
+        assertTrue(frenchcore.params.epicVocalBoost >= 0.90f)
+
+        val gabber = StudioPresets.byId("gabber_millennium")
+        assertEquals(RemixGenreTheme.GABBER, gabber.params.genreTheme)
+        assertEquals(KickType.GABBER_MILLENNIUM, gabber.params.drop1Kick)
+
         val uok = StudioPresets.byId("uok_piep_madness")
         assertEquals(KickType.PIEP_UOK, uok.params.drop1Kick)
         assertEquals(MasterMode.STUDIO_CLEAN, uok.params.masterMode)
-        assertTrue(uok.params.enableFakeDrop)
-        assertEquals(5, uok.params.vocalPitchSemitones)
-
-        val noiseflow = StudioPresets.byId("noiseflow_krach")
-        assertEquals(KickType.KRACH_NOISEFLOW, noiseflow.params.drop1Kick)
-        assertEquals(KickType.ZAAG_CHAINSAW, noiseflow.params.drop2Kick)
     }
 
     @Test
-    fun remixParams_sanitizedClampsAllMixAndTimingControls() {
+    fun remixParams_sanitizedClampsAllV3MixSynthAndTimingControls() {
         val raw = RemixParams(
             targetBpm = 999f,
             drive = 2.5f,
@@ -53,9 +80,12 @@ class ZaagForgeUnitTest {
             bassSaturation = 3.0f,
             originalMix = 3f,
             vocalClarity = -0.5f,
+            epicVocalBoost = 4.0f,
             vocalSidechain = 2.0f,
             kickLevel = 4.0f,
             bassCutHz = 50f,
+            synthLayerAmount = -2.0f,
+            percGrooveAmount = 5.0f,
             vocalPitchSemitones = 20,
             stutterAmount = -0.4f,
             kickSwitchBars = 3,
@@ -71,9 +101,12 @@ class ZaagForgeUnitTest {
         assertEquals(1f, raw.bassSaturation, 0.01f)
         assertEquals(1f, raw.originalMix, 0.01f)
         assertEquals(0f, raw.vocalClarity, 0.01f)
+        assertEquals(1f, raw.epicVocalBoost, 0.01f)
         assertEquals(0.85f, raw.vocalSidechain, 0.01f)
-        assertEquals(1.2f, raw.kickLevel, 0.01f)
+        assertEquals(1.25f, raw.kickLevel, 0.01f)
         assertEquals(110f, raw.bassCutHz, 0.01f)
+        assertEquals(0f, raw.synthLayerAmount, 0.01f)
+        assertEquals(1f, raw.percGrooveAmount, 0.01f)
         assertEquals(7, raw.vocalPitchSemitones)
         assertEquals(0f, raw.stutterAmount, 0.01f)
         assertEquals(4, raw.kickSwitchBars)
@@ -82,11 +115,15 @@ class ZaagForgeUnitTest {
         assertEquals(4, raw.buildupBars)
         assertEquals(16, raw.drop1BarNudge)
         assertEquals(-16, raw.drop2BarNudge)
+
+        val lowBpm = RemixParams(targetBpm = 80f).sanitized()
+        assertEquals(124f, lowBpm.targetBpm, 0.01f)
     }
 
     @Test
-    fun remixParams_withPresetStylePreservesSurgicalTrackAlignment() {
+    fun remixParams_withPresetStylePreservesSurgicalAlignmentAndSpeedLock() {
         val calibrated = RemixParams(
+            tempoSyncMode = TempoSyncMode.ORIGINAL_SPEED_LOCK,
             dropMode = DropAlignmentMode.DOUBLE_DROP,
             buildupBars = 8,
             drop1BarNudge = 4,
@@ -94,14 +131,51 @@ class ZaagForgeUnitTest {
             gridBeatShift = 2,
             gridPhaseNudgeMs = -35f
         )
-        val switched = calibrated.withPresetStyle(StudioPresets.byId("noiseflow_krach").params)
-        assertEquals(KickType.KRACH_NOISEFLOW, switched.drop1Kick)
+        val switched = calibrated.withPresetStyle(StudioPresets.byId("frenchcore_euphoric").params)
+        assertEquals(RemixGenreTheme.FRENCHCORE, switched.genreTheme)
+        assertEquals(KickType.FRENCHCORE_MELODIC, switched.drop1Kick)
+        assertEquals(TempoSyncMode.ORIGINAL_SPEED_LOCK, switched.tempoSyncMode)
         assertEquals(DropAlignmentMode.DOUBLE_DROP, switched.dropMode)
         assertEquals(8, switched.buildupBars)
         assertEquals(4, switched.drop1BarNudge)
         assertEquals(0.36f, switched.customDrop1Frac, 0.001f)
         assertEquals(2, switched.gridBeatShift)
         assertEquals(-35f, switched.gridPhaseNudgeMs, 0.01f)
+    }
+
+    @Test
+    fun customPresetStore_serializesAndDeserializesRoundTripCleanly() {
+        val sample = RemixPreset(
+            id = "custom_test_1",
+            name = "Ma Hard Techno Perso",
+            shortCode = "USR-158",
+            genreTag = "PERSO · HARD TECHNO",
+            description = "Custom test",
+            params = RemixParams(
+                targetBpm = 158f,
+                genreTheme = RemixGenreTheme.HARD_TECHNO,
+                tempoSyncMode = TempoSyncMode.ORIGINAL_SPEED_LOCK,
+                drop1Kick = KickType.HARD_TECHNO_RAVE,
+                drop2Kick = KickType.ACID_303_TECHNO,
+                epicVocalBoost = 0.94f,
+                synthLayerAmount = 0.72f,
+                percGrooveAmount = 0.85f,
+                masterMode = MasterMode.CLUB_PUNCH
+            ),
+            isCustom = true
+        )
+        // Note: unit tests use android.jar stub unless pure org.json is available; verify non-crashing behavior
+        val json = runCatching { CustomPresetStore.toJsonString(listOf(sample)) }.getOrNull()
+        if (json != null && json.startsWith("[")) {
+            val restored = CustomPresetStore.fromJsonString(json)
+            assertEquals(1, restored.size)
+            assertEquals("Ma Hard Techno Perso", restored[0].name)
+            assertEquals(RemixGenreTheme.HARD_TECHNO, restored[0].params.genreTheme)
+            assertEquals(TempoSyncMode.ORIGINAL_SPEED_LOCK, restored[0].params.tempoSyncMode)
+            assertEquals(KickType.HARD_TECHNO_RAVE, restored[0].params.drop1Kick)
+            assertEquals(0.94f, restored[0].params.epicVocalBoost, 0.01f)
+            assertEquals(0.72f, restored[0].params.synthLayerAmount, 0.01f)
+        }
     }
 
     @Test

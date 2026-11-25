@@ -60,6 +60,8 @@ object NativeDspBridge {
     @JvmStatic
     external fun nativeSessionRenderRemix(
         targetBpm: Float,
+        genreTheme: Int,
+        tempoSyncMode: Int,
         drop1Kick: Int,
         drop2Kick: Int,
         drive: Float,
@@ -67,9 +69,12 @@ object NativeDspBridge {
         bassSaturation: Float,
         originalMix: Float,
         vocalClarity: Float,
+        epicVocalBoost: Float,
         vocalSidechain: Float,
         kickLevel: Float,
         bassCutHz: Float,
+        synthLayerAmount: Float,
+        percGrooveAmount: Float,
         masterMode: Int,
         vocalPitchSemitones: Float,
         stutterAmount: Float,
@@ -154,6 +159,8 @@ object NativeDspBridge {
         val p = params.sanitized()
         val raw = nativeSessionRenderRemix(
             targetBpm = p.targetBpm,
+            genreTheme = p.genreTheme.nativeId,
+            tempoSyncMode = p.tempoSyncMode.nativeId,
             drop1Kick = p.drop1Kick.nativeId,
             drop2Kick = p.drop2Kick.nativeId,
             drive = p.drive,
@@ -161,9 +168,12 @@ object NativeDspBridge {
             bassSaturation = p.bassSaturation,
             originalMix = p.originalMix,
             vocalClarity = p.vocalClarity,
+            epicVocalBoost = p.epicVocalBoost,
             vocalSidechain = p.vocalSidechain,
             kickLevel = p.kickLevel,
             bassCutHz = p.bassCutHz,
+            synthLayerAmount = p.synthLayerAmount,
+            percGrooveAmount = p.percGrooveAmount,
             masterMode = p.masterMode.nativeId,
             vocalPitchSemitones = p.vocalPitchSemitones.toFloat(),
             stutterAmount = p.stutterAmount,
@@ -197,7 +207,8 @@ object NativeDspBridge {
             keyName = obj.optString("keyName", fallbackAnalysis.keyName),
             durationSec = obj.optDouble("durationSec", totalFrames / 44100.0).toFloat(),
             peakDb = obj.optDouble("peakDb", -0.2).toFloat(),
-            rmsDb = obj.optDouble("rmsDb", -8.5).toFloat()
+            rmsDb = obj.optDouble("rmsDb", -8.5).toFloat(),
+            renderTimeMs = obj.optDouble("renderTimeMs", 0.0).toFloat()
         )
     }
 
@@ -211,7 +222,7 @@ object NativeDspBridge {
     ): FloatArray = nativeSynthesizeKickPreview(
         kickType.nativeId,
         rootHz.coerceIn(41.2f, 73.5f),
-        bpm.coerceIn(140f, 240f),
+        bpm.coerceIn(124f, 240f),
         drive.coerceIn(0.1f, 1f),
         aggression.coerceIn(0.1f, 1f),
         bassSaturation.coerceIn(0f, 1f)

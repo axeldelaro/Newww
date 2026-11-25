@@ -31,9 +31,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Equalizer
 import androidx.compose.material.icons.filled.FolderOpen
@@ -94,16 +96,17 @@ import com.zaagforge.studio.model.ExportedRemix
 import com.zaagforge.studio.model.KickType
 import com.zaagforge.studio.model.MasterMode
 import com.zaagforge.studio.model.MeterReading
+import com.zaagforge.studio.model.RemixGenreTheme
 import com.zaagforge.studio.model.RemixParams
 import com.zaagforge.studio.model.RemixPreset
 import com.zaagforge.studio.model.ResolvedStreamingTrack
 import com.zaagforge.studio.model.SectionKind
 import com.zaagforge.studio.model.SectionMarker
 import com.zaagforge.studio.model.StudioPresets
+import com.zaagforge.studio.model.TempoSyncMode
 import com.zaagforge.studio.music.LibraryAndStreamingRepository
 import com.zaagforge.studio.ui.theme.CrispWhite
 import com.zaagforge.studio.ui.theme.HazardRed
-import com.zaagforge.studio.ui.theme.HazardRedDim
 import com.zaagforge.studio.ui.theme.MeterGreen
 import com.zaagforge.studio.ui.theme.PeakAmber
 import com.zaagforge.studio.ui.theme.RackBorder
@@ -124,6 +127,10 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
     val isRemixActive by viewModel.isRemixActive.collectAsStateWithLifecycle()
     val meter by viewModel.meterReading.collectAsStateWithLifecycle()
     val context = LocalContext.current
+
+    // Dynamic Studio LED Accent matches active RemixGenreTheme (Techno Cyan / Hard Techno Orange / Frenchcore Green / Gabber Crimson / Uptempo Red)
+    val themeAccent = Color(state.params.genreTheme.accentHex)
+    val themeDimBg = Color(state.params.genreTheme.dimBgHex)
 
     val audioPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -150,6 +157,7 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
     }
 
     var showLinkDialog by remember { mutableStateOf(false) }
+    var showSavePresetDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = RackObsidian,
@@ -171,11 +179,11 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
                         icon = { Icon(icon, contentDescription = title) },
                         label = { Text(title, style = MaterialTheme.typography.labelSmall) },
                         colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = HazardRed,
-                            selectedTextColor = HazardRed,
+                            selectedIconColor = themeAccent,
+                            selectedTextColor = themeAccent,
                             unselectedIconColor = SteelGray,
                             unselectedTextColor = SteelGray,
-                            indicatorColor = HazardRedDim
+                            indicatorColor = themeDimBg
                         )
                     )
                 }
@@ -191,13 +199,18 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
             when (state.activeTab) {
                 StudioTab.STUDIO -> StudioScreen(
                     state = state,
+                    themeAccent = themeAccent,
+                    themeDimBg = themeDimBg,
                     isPlaying = isPlaying,
                     progress = progress,
                     isRemixActive = isRemixActive,
                     meter = meter,
                     onImportMp3 = { audioPicker.launch(arrayOf("audio/*")) },
                     onOpenLinkDialog = { showLinkDialog = true },
+                    onOpenSavePresetDialog = { showSavePresetDialog = true },
+                    onSelectGenreFilter = { viewModel.selectGenreFilter(it) },
                     onSelectPreset = { viewModel.selectPreset(it, renderNow = true) },
+                    onDeleteCustomPreset = { viewModel.deleteCustomPreset(it) },
                     onRenderRemix = { viewModel.renderCurrentRemix() },
                     onTogglePlay = { viewModel.togglePlayPause() },
                     onToggleAb = { viewModel.toggleAbSource() },
@@ -217,6 +230,7 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
 
                 StudioTab.LIBRARY -> LibraryScreen(
                     state = state,
+                    themeAccent = themeAccent,
                     hasAudioPermission = hasAudioPermission,
                     onRequestPermission = { permLauncher.launch(readPerm) },
                     onImportSaf = { audioPicker.launch(arrayOf("audio/*")) },
@@ -253,24 +267,25 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = RackCharcoal,
-                        border = BorderStroke(1.dp, HazardRed)
+                        border = BorderStroke(1.dp, themeAccent)
                     ) {
                         Column(
                             modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            CircularProgressIndicator(color = HazardRed, strokeWidth = 3.dp)
+                            CircularProgressIndicator(color = themeAccent, strokeWidth = 3.dp)
                             Spacer(Modifier.height(14.dp))
                             Text(
-                                text = "MOTEUR C++20 ZAAGFORGE v2",
+                                text = "MOTEUR TURBO C++20 ZAAGFORGE v3",
                                 style = MaterialTheme.typography.labelMedium,
-                                color = HazardRed
+                                color = themeAccent
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
                                 text = state.busyMessage,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = CrispWhite
+                                color = CrispWhite,
+                                textAlign = TextAlign.Center
                             )
                         }
                     }
@@ -281,10 +296,23 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
 
     if (showLinkDialog) {
         PasteStreamingLinkDialog(
+            themeAccent = themeAccent,
             onDismiss = { showLinkDialog = false },
             onResolve = { url ->
                 showLinkDialog = false
                 viewModel.handleIncomingShareLink(url)
+            }
+        )
+    }
+
+    if (showSavePresetDialog) {
+        SaveCustomPresetDialog(
+            themeAccent = themeAccent,
+            defaultName = "${state.params.genreTheme.shortLabel} ${state.params.targetBpm.roundToInt()}",
+            onDismiss = { showSavePresetDialog = false },
+            onSave = { name ->
+                showSavePresetDialog = false
+                viewModel.saveCustomPreset(name)
             }
         )
     }
@@ -293,13 +321,18 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
 @Composable
 private fun StudioScreen(
     state: ZaagForgeUiState,
+    themeAccent: Color,
+    themeDimBg: Color,
     isPlaying: Boolean,
     progress: Float,
     isRemixActive: Boolean,
     meter: MeterReading,
     onImportMp3: () -> Unit,
     onOpenLinkDialog: () -> Unit,
+    onOpenSavePresetDialog: () -> Unit,
+    onSelectGenreFilter: (RemixGenreTheme?) -> Unit,
     onSelectPreset: (RemixPreset) -> Unit,
+    onDeleteCustomPreset: (String) -> Unit,
     onRenderRemix: () -> Unit,
     onTogglePlay: () -> Unit,
     onToggleAb: () -> Unit,
@@ -323,27 +356,30 @@ private fun StudioScreen(
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Hardware Header Bar
+        // Dynamic Hardware Header Bar reflecting active genre theme
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "ZAAGFORGE // v2 PRO",
+                    text = "ZAAGFORGE // v3 PRO",
                     style = MaterialTheme.typography.headlineMedium,
                     color = CrispWhite
                 )
                 Text(
-                    text = "UPTEMPO • PIEP • KRACH • ZAAG STUDIO",
+                    text = "${state.params.genreTheme.shortLabel} · ${state.params.genreTheme.artistInspo}",
                     style = MaterialTheme.typography.labelSmall,
-                    color = SignalOrange
+                    color = themeAccent,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
+            Spacer(Modifier.width(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                RackMiniButton(icon = Icons.Filled.FolderOpen, label = "MP3", onClick = onImportMp3)
-                RackMiniButton(icon = Icons.Filled.Link, label = "LIEN", onClick = onOpenLinkDialog)
+                RackMiniButton(icon = Icons.Filled.FolderOpen, label = "MP3", accent = themeAccent, onClick = onImportMp3)
+                RackMiniButton(icon = Icons.Filled.Link, label = "LIEN", accent = themeAccent, onClick = onOpenLinkDialog)
             }
         }
 
@@ -355,7 +391,7 @@ private fun StudioScreen(
         }
 
         // Deck Telemetry + Interactive Waveform + A/B Transport
-        RackCard {
+        RackCard(borderColor = themeAccent.copy(alpha = 0.45f)) {
             val track = state.loadedTrack
             val analysis = state.analysis
             val remix = state.remixResult
@@ -386,14 +422,14 @@ private fun StudioScreen(
                 val hasRemix = remix != null
                 Surface(
                     shape = RoundedCornerShape(6.dp),
-                    color = if (isRemixActive && hasRemix) HazardRed else RackMetal,
-                    border = BorderStroke(1.dp, if (isRemixActive && hasRemix) HazardRed else RackBorder),
+                    color = if (isRemixActive && hasRemix) themeAccent else RackMetal,
+                    border = BorderStroke(1.dp, if (isRemixActive && hasRemix) themeAccent else RackBorder),
                     modifier = Modifier.clickable(enabled = hasRemix) { onToggleAb() }
                 ) {
                     Text(
                         text = if (isRemixActive && hasRemix) "REMIX ●" else "ORIGINAL",
                         style = MaterialTheme.typography.labelSmall,
-                        color = CrispWhite,
+                        color = if (isRemixActive && hasRemix && state.params.genreTheme == RemixGenreTheme.TECHNO_CLUB) RackObsidian else CrispWhite,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                     )
                 }
@@ -414,19 +450,19 @@ private fun StudioScreen(
                 TelemetryCell(
                     label = "REMIX",
                     value = "${(remix?.effectiveTargetBpm ?: state.params.targetBpm).roundToInt()}",
-                    valueColor = HazardRed,
+                    valueColor = themeAccent,
+                    modifier = Modifier.weight(1f)
+                )
+                TelemetryCell(
+                    label = "VITESSE",
+                    value = remix?.let { String.format(Locale.US, "×%.2f", it.tempoStretchRatio) } ?: "≥1.00",
+                    valueColor = MeterGreen,
                     modifier = Modifier.weight(1f)
                 )
                 TelemetryCell(
                     label = "CLÉ",
                     value = remix?.keyName ?: analysis?.keyName ?: "--",
                     valueColor = PeakAmber,
-                    modifier = Modifier.weight(1f)
-                )
-                TelemetryCell(
-                    label = "RMS",
-                    value = remix?.let { String.format(Locale.US, "%.1fdB", it.rmsDb) } ?: "--",
-                    valueColor = MeterGreen,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -438,6 +474,7 @@ private fun StudioScreen(
                 sections = state.sectionMarkers,
                 progress = progress,
                 isRemixActive = isRemixActive && remix != null,
+                remixAccent = themeAccent,
                 onSeek = onSeek,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -458,7 +495,7 @@ private fun StudioScreen(
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     state.sectionMarkers.forEach { marker ->
-                        val chipColor = sectionColor(marker.kind)
+                        val chipColor = sectionColor(marker.kind, themeAccent)
                         Surface(
                             shape = RoundedCornerShape(5.dp),
                             color = chipColor.copy(alpha = 0.16f),
@@ -502,12 +539,13 @@ private fun StudioScreen(
                     )
                 }
 
+                val btnContentColor = if (!state.hasPendingChanges && state.params.genreTheme == RemixGenreTheme.TECHNO_CLUB) RackObsidian else CrispWhite
                 Button(
                     onClick = onRenderRemix,
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (state.hasPendingChanges) SignalOrange else HazardRed,
-                        contentColor = CrispWhite
+                        containerColor = if (state.hasPendingChanges) SignalOrange else themeAccent,
+                        contentColor = btnContentColor
                     ),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                     modifier = Modifier.weight(0.58f)
@@ -515,7 +553,7 @@ private fun StudioScreen(
                     Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(5.dp))
                     Text(
-                        text = if (state.hasPendingChanges) "RE-CALCULER ●" else "AUTO REMIX C++",
+                        text = if (state.hasPendingChanges) "RE-CALCULER ●" else "AUTO REMIX TURBO",
                         style = MaterialTheme.typography.labelLarge
                     )
                 }
@@ -531,7 +569,368 @@ private fun StudioScreen(
             }
         }
 
-        // RACK 1: Surgical Drop & Beat-Grid Precision Cutting ("CALAGE & DÉCOUPE PRÉCISE")
+        // RACK 1: THÈMES & 12 PRESETS PRO ARTISTES + MES PRESETS PERSO
+        RackCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("THÈMES & PRESETS PRO (12)", style = MaterialTheme.typography.labelLarge, color = themeAccent)
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = themeDimBg,
+                    border = BorderStroke(1.dp, themeAccent),
+                    modifier = Modifier.clickable { onOpenSavePresetDialog() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, tint = themeAccent, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(3.dp))
+                        Text("SAUVER PERSO", style = MaterialTheme.typography.labelSmall, color = themeAccent)
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+
+            // Genre Filter Bar (TOUS / TECHNO / HARD TECHNO / FRENCHCORE / GABBER / RAWSTYLE / UPTEMPO)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                val allSel = state.selectedGenreFilter == null
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (allSel) themeAccent.copy(alpha = 0.22f) else RackMetal,
+                    border = BorderStroke(1.dp, if (allSel) themeAccent else RackBorder),
+                    modifier = Modifier.clickable { onSelectGenreFilter(null) }
+                ) {
+                    Text(
+                        text = "TOUS (${StudioPresets.all.size})",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (allSel) themeAccent else CrispWhite,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                    )
+                }
+                RemixGenreTheme.entries.forEach { genre ->
+                    val sel = state.selectedGenreFilter == genre
+                    val gAccent = Color(genre.accentHex)
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (sel) gAccent.copy(alpha = 0.22f) else RackMetal,
+                        border = BorderStroke(1.dp, if (sel) gAccent else RackBorder),
+                        modifier = Modifier.clickable { onSelectGenreFilter(genre) }
+                    ) {
+                        Text(
+                            text = genre.shortLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (sel) gAccent else CrispWhite,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // User-Saved Custom Presets Row (when present)
+            if (state.customPresets.isNotEmpty()) {
+                Text("MES PRESETS PERSO (${state.customPresets.size})", style = MaterialTheme.typography.labelSmall, color = PeakAmber)
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    state.customPresets.forEach { cp ->
+                        val selected = cp.id == state.selectedPreset.id
+                        val cAccent = Color(cp.params.genreTheme.accentHex)
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (selected) Color(cp.params.genreTheme.dimBgHex) else RackMetal,
+                            border = BorderStroke(1.dp, if (selected) cAccent else PeakAmber.copy(alpha = 0.55f)),
+                            modifier = Modifier.clickable { onSelectPreset(cp) }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(cp.name, style = MaterialTheme.typography.labelMedium, color = CrispWhite, maxLines = 1)
+                                    Text("${cp.params.genreTheme.shortLabel} · ${cp.params.targetBpm.roundToInt()} BPM", style = MaterialTheme.typography.labelSmall, color = cAccent)
+                                }
+                                IconButton(
+                                    onClick = { onDeleteCustomPreset(cp.id) },
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Supprimer", tint = SteelGray, modifier = Modifier.size(15.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+
+            // Filtered Studio Artist Presets Grid
+            val displayedPresets = state.selectedGenreFilter?.let { filter ->
+                StudioPresets.all.filter { it.params.genreTheme == filter }
+            } ?: StudioPresets.all
+
+            displayedPresets.chunked(2).forEach { pair ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    pair.forEach { preset ->
+                        val selected = preset.id == state.selectedPreset.id
+                        val pAccent = Color(preset.params.genreTheme.accentHex)
+                        val pDim = Color(preset.params.genreTheme.dimBgHex)
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (selected) pDim else RackMetal,
+                            border = BorderStroke(1.dp, if (selected) pAccent else RackBorder),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onSelectPreset(preset) }
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = preset.shortCode,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = pAccent
+                                    )
+                                    Text(
+                                        text = "${preset.params.targetBpm.roundToInt()} BPM",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SteelGray
+                                    )
+                                }
+                                Spacer(Modifier.height(3.dp))
+                                Text(
+                                    text = preset.name,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = CrispWhite,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = preset.genreTag,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SteelGray,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                    if (pair.size == 1) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+
+        // RACK 2: VITESSE, PAROLES ÉPIQUES, COUCHES SYNTHÉ & QUALITÉ MASTERING
+        RackCard {
+            val p = state.params
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onToggleMixControls() },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.Equalizer, contentDescription = null, tint = MeterGreen, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text("VITESSE, PAROLES ÉPIQUES & MIX", style = MaterialTheme.typography.labelLarge, color = CrispWhite)
+                        Text(
+                            text = "${p.tempoSyncMode.label} · Voix Épiques ${(p.epicVocalBoost * 100).roundToInt()}% · Sub ${(p.bassSaturation * 100).roundToInt()}%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MeterGreen,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                Text(
+                    text = if (state.showMixControls) "MASQUER ▲" else "OUVRIR ▼",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MeterGreen
+                )
+            }
+
+            if (state.showMixControls) {
+                Spacer(Modifier.height(10.dp))
+
+                // Speed Policy (NEVER SLOW DOWN!)
+                Text("CONTRÔLE VITESSE (NE RALENTIT JAMAIS LA MUSIQUE)", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    TempoSyncMode.entries.forEach { mode ->
+                        val sel = p.tempoSyncMode == mode
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (sel) themeAccent.copy(alpha = 0.22f) else RackMetal,
+                            border = BorderStroke(1.dp, if (sel) themeAccent else RackBorder),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onUpdateParams { it.copy(tempoSyncMode = mode) } }
+                        ) {
+                            Text(
+                                text = mode.label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (sel) themeAccent else CrispWhite,
+                                textAlign = TextAlign.Center,
+                                maxLines = 2,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 7.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(p.tempoSyncMode.subtitle, style = MaterialTheme.typography.bodySmall, color = SteelGray)
+
+                Spacer(Modifier.height(10.dp))
+
+                Text("QUALITÉ MASTERING", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    MasterMode.entries.forEach { mode ->
+                        val sel = p.masterMode == mode
+                        Surface(
+                            shape = RoundedCornerShape(7.dp),
+                            color = if (sel) MeterGreen.copy(alpha = 0.20f) else RackMetal,
+                            border = BorderStroke(1.dp, if (sel) MeterGreen else RackBorder),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onUpdateParams { it.copy(masterMode = mode) } }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = mode.label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (sel) MeterGreen else CrispWhite,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(p.masterMode.subtitle, style = MaterialTheme.typography.bodySmall, color = SteelGray)
+
+                Spacer(Modifier.height(10.dp))
+
+                StudioSlider(
+                    label = "BOOST PAROLES ÉPIQUES (DROP / BASSE)",
+                    valueText = "${(p.epicVocalBoost * 100).roundToInt()}%",
+                    value = p.epicVocalBoost,
+                    range = 0f..1f,
+                    accent = MeterGreen,
+                    onChange = { v -> onUpdateParams { it.copy(epicVocalBoost = v) } }
+                )
+                StudioSlider(
+                    label = "CLARTÉ PAROLES (FOCUS VOIX MID/SIDE)",
+                    valueText = "${(p.vocalClarity * 100).roundToInt()}%",
+                    value = p.vocalClarity,
+                    range = 0f..1f,
+                    accent = MeterGreen,
+                    onChange = { v -> onUpdateParams { it.copy(vocalClarity = v) } }
+                )
+                StudioSlider(
+                    label = "NIVEAU PAROLES / MUSIQUE ORIGINALE",
+                    valueText = "${(p.originalMix * 100).roundToInt()}%",
+                    value = p.originalMix,
+                    range = 0.15f..1f,
+                    accent = themeAccent,
+                    onChange = { v -> onUpdateParams { it.copy(originalMix = v) } }
+                )
+                StudioSlider(
+                    label = "SATURATION BASSES / SUB (0% = SUB PUR)",
+                    valueText = "${(p.bassSaturation * 100).roundToInt()}%",
+                    value = p.bassSaturation,
+                    range = 0f..1f,
+                    accent = themeAccent,
+                    onChange = { v -> onUpdateParams { it.copy(bassSaturation = v) } }
+                )
+                StudioSlider(
+                    label = "NIVEAU KICKS",
+                    valueText = "${(p.kickLevel * 100).roundToInt()}%",
+                    value = p.kickLevel,
+                    range = 0.35f..1.20f,
+                    accent = themeAccent,
+                    onChange = { v -> onUpdateParams { it.copy(kickLevel = v) } }
+                )
+                StudioSlider(
+                    label = "COUCHES SYNTHÉ (303 / EUPHORIC / HOOVER)",
+                    valueText = "${(p.synthLayerAmount * 100).roundToInt()}%",
+                    value = p.synthLayerAmount,
+                    range = 0f..1f,
+                    accent = PeakAmber,
+                    onChange = { v -> onUpdateParams { it.copy(synthLayerAmount = v) } }
+                )
+                StudioSlider(
+                    label = "PERCUSSIONS 909 (CLAP / 16TH HATS / RIDE)",
+                    valueText = "${(p.percGrooveAmount * 100).roundToInt()}%",
+                    value = p.percGrooveAmount,
+                    range = 0f..1f,
+                    accent = PeakAmber,
+                    onChange = { v -> onUpdateParams { it.copy(percGrooveAmount = v) } }
+                )
+                StudioSlider(
+                    label = "SIDECHAIN SUR LES VOIX (DOUX ← → FORT)",
+                    valueText = "${(p.vocalSidechain * 100).roundToInt()}%",
+                    value = p.vocalSidechain,
+                    range = 0f..0.80f,
+                    accent = themeAccent,
+                    onChange = { v -> onUpdateParams { it.copy(vocalSidechain = v) } }
+                )
+                StudioSlider(
+                    label = "COUPE-BAS PISTE ORIGINALE (HPF)",
+                    valueText = "${p.bassCutHz.roundToInt()} Hz",
+                    value = p.bassCutHz,
+                    range = 110f..340f,
+                    accent = themeAccent,
+                    onChange = { v -> onUpdateParams { it.copy(bassCutHz = (v / 5f).roundToInt() * 5f) } }
+                )
+
+                Button(
+                    onClick = onRenderRemix,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MeterGreen, contentColor = RackObsidian),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("APPLIQUER LE MIX TURBO C++", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+
+        // RACK 3: Surgical Drop & Beat-Grid Precision Cutting ("CALAGE & DÉCOUPE PRÉCISE")
         RackCard {
             val p = state.params
             val analysis = state.analysis
@@ -575,7 +974,6 @@ private fun StudioScreen(
                 )
                 Spacer(Modifier.height(8.dp))
 
-                // 1-Tap Playhead Drop Placement Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -610,7 +1008,6 @@ private fun StudioScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                // Fine Bar Nudge for Drop 1 & Drop 2
                 BarNudgeRow(
                     label = "DÉCALAGE DROP 1",
                     nudgeBars = p.drop1BarNudge,
@@ -627,7 +1024,6 @@ private fun StudioScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                // Drop Structure Mode Selector
                 Text("STRUCTURE DES DROPS", style = MaterialTheme.typography.labelSmall, color = SteelGray)
                 Spacer(Modifier.height(4.dp))
                 Row(
@@ -656,7 +1052,6 @@ private fun StudioScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                // Build-Up Length (4 / 8 / 12 exact bars)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -685,7 +1080,6 @@ private fun StudioScreen(
 
                 Spacer(Modifier.height(10.dp))
 
-                // Beat Grid Alignment (BPM ÷2 / ×2 + Shift +1 Beat + Fine ±250ms Phase Nudge)
                 Text("GRILLE RYTHMIQUE & CALAGE TEMPS 1", style = MaterialTheme.typography.labelSmall, color = SteelGray)
                 Spacer(Modifier.height(6.dp))
                 Row(
@@ -709,209 +1103,20 @@ private fun StudioScreen(
                     valueText = "${if (p.gridPhaseNudgeMs >= 0) "+" else ""}${p.gridPhaseNudgeMs.roundToInt()} ms",
                     value = p.gridPhaseNudgeMs,
                     range = -250f..250f,
+                    accent = PeakAmber,
                     onChange = { v -> onUpdateParams { it.copy(gridPhaseNudgeMs = (v / 5f).roundToInt() * 5f) } }
                 )
             }
         }
 
-        // RACK 2: Mix, Vocal Clarity, Bass Saturation & Master Quality ("MIX, PAROLES & QUALITÉ SON")
-        RackCard {
-            val p = state.params
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onToggleMixControls() },
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Equalizer, contentDescription = null, tint = MeterGreen, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Column {
-                        Text("MIX, PAROLES & QUALITÉ SON", style = MaterialTheme.typography.labelLarge, color = CrispWhite)
-                        Text(
-                            text = "${p.masterMode.label} · Voix ${(p.vocalClarity * 100).roundToInt()}% · Sat. Basses ${(p.bassSaturation * 100).roundToInt()}%",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MeterGreen
-                        )
-                    }
-                }
-                Text(
-                    text = if (state.showMixControls) "MASQUER ▲" else "OUVRIR ▼",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MeterGreen
-                )
-            }
-
-            if (state.showMixControls) {
-                Spacer(Modifier.height(10.dp))
-
-                Text("QUALITÉ MASTERING", style = MaterialTheme.typography.labelSmall, color = SteelGray)
-                Spacer(Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    MasterMode.entries.forEach { mode ->
-                        val sel = p.masterMode == mode
-                        Surface(
-                            shape = RoundedCornerShape(7.dp),
-                            color = if (sel) MeterGreen.copy(alpha = 0.20f) else RackMetal,
-                            border = BorderStroke(1.dp, if (sel) MeterGreen else RackBorder),
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable { onUpdateParams { it.copy(masterMode = mode) } }
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text(
-                                    text = mode.label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (sel) MeterGreen else CrispWhite,
-                                    textAlign = TextAlign.Center,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-                Text(p.masterMode.subtitle, style = MaterialTheme.typography.bodySmall, color = SteelGray)
-
-                Spacer(Modifier.height(10.dp))
-
-                StudioSlider(
-                    label = "CLARTÉ PAROLES (FOCUS VOIX MID/SIDE)",
-                    valueText = "${(p.vocalClarity * 100).roundToInt()}%",
-                    value = p.vocalClarity,
-                    range = 0f..1f,
-                    onChange = { v -> onUpdateParams { it.copy(vocalClarity = v) } }
-                )
-                StudioSlider(
-                    label = "SATURATION BASSES / SUB (0% = SUB PUR)",
-                    valueText = "${(p.bassSaturation * 100).roundToInt()}%",
-                    value = p.bassSaturation,
-                    range = 0f..1f,
-                    onChange = { v -> onUpdateParams { it.copy(bassSaturation = v) } }
-                )
-                StudioSlider(
-                    label = "NIVEAU PAROLES / MUSIQUE ORIGINALE",
-                    valueText = "${(p.originalMix * 100).roundToInt()}%",
-                    value = p.originalMix,
-                    range = 0.15f..1f,
-                    onChange = { v -> onUpdateParams { it.copy(originalMix = v) } }
-                )
-                StudioSlider(
-                    label = "NIVEAU KICKS HARDCORE",
-                    valueText = "${(p.kickLevel * 100).roundToInt()}%",
-                    value = p.kickLevel,
-                    range = 0.45f..1.15f,
-                    onChange = { v -> onUpdateParams { it.copy(kickLevel = v) } }
-                )
-                StudioSlider(
-                    label = "SIDECHAIN SUR LES VOIX (DOUX ← → FORT)",
-                    valueText = "${(p.vocalSidechain * 100).roundToInt()}%",
-                    value = p.vocalSidechain,
-                    range = 0f..0.80f,
-                    onChange = { v -> onUpdateParams { it.copy(vocalSidechain = v) } }
-                )
-                StudioSlider(
-                    label = "COUPE-BAS PISTE ORIGINALE (HPF)",
-                    valueText = "${p.bassCutHz.roundToInt()} Hz",
-                    value = p.bassCutHz,
-                    range = 110f..340f,
-                    onChange = { v -> onUpdateParams { it.copy(bassCutHz = (v / 5f).roundToInt() * 5f) } }
-                )
-
-                Button(
-                    onClick = onRenderRemix,
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MeterGreen, contentColor = RackObsidian),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("APPLIQUER LE MIX STUDIO", style = MaterialTheme.typography.labelLarge)
-                }
-            }
-        }
-
-        // RACK 3: 8 Iconic Hardcore Presets Grid
+        // RACK 4: 12-Pad Live Kick Audition Rack (3 rows x 4 pads)
         RackCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("PRESETS PRO (8 STYLES)", style = MaterialTheme.typography.labelLarge, color = SignalOrange)
-                Text("GARDE TON CALAGE", style = MaterialTheme.typography.labelSmall, color = SteelGray)
-            }
-            Spacer(Modifier.height(8.dp))
-
-            StudioPresets.all.chunked(2).forEach { pair ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    pair.forEach { preset ->
-                        val selected = preset.id == state.selectedPreset.id
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (selected) HazardRedDim else RackMetal,
-                            border = BorderStroke(1.dp, if (selected) HazardRed else RackBorder),
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable { onSelectPreset(preset) }
-                        ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = preset.shortCode,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (selected) HazardRed else PeakAmber
-                                    )
-                                    Text(
-                                        text = "${preset.params.targetBpm.roundToInt()}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = SteelGray
-                                    )
-                                }
-                                Spacer(Modifier.height(3.dp))
-                                Text(
-                                    text = preset.name,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = CrispWhite,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = preset.genreTag,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = SteelGray,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // RACK 4: 8-Pad Live Kick Audition Rack
-        RackCard {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("RACK D'ÉCOUTE KICKS (DIRECT)", style = MaterialTheme.typography.labelLarge, color = PeakAmber)
+                Text("RACK D'ÉCOUTE 12 KICKS (DIRECT)", style = MaterialTheme.typography.labelLarge, color = PeakAmber)
                 Text("TAP POUR TESTER", style = MaterialTheme.typography.labelSmall, color = SteelGray)
             }
             Spacer(Modifier.height(8.dp))
@@ -935,7 +1140,7 @@ private fun StudioScreen(
                                 .clickable { onAuditionKick(kick) }
                         ) {
                             Column(
-                                modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
+                                modifier = Modifier.padding(vertical = 9.dp, horizontal = 4.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
                                 Text(
@@ -958,7 +1163,7 @@ private fun StudioScreen(
             }
         }
 
-        // RACK 5: Expandable Kick Design & FX Rack
+        // RACK 5: Expandable Custom Kick Design, Arrangement Theme & FX Rack
         RackCard {
             Row(
                 modifier = Modifier
@@ -968,14 +1173,14 @@ private fun StudioScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Tune, contentDescription = null, tint = SignalOrange, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Filled.Tune, contentDescription = null, tint = themeAccent, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("DESIGN KICKS & FX AVANCÉS", style = MaterialTheme.typography.labelLarge, color = CrispWhite)
+                    Text("CUSTOMISATION KICKS, THÈME & FX", style = MaterialTheme.typography.labelLarge, color = CrispWhite)
                 }
                 Text(
                     text = if (state.showProTweaks) "MASQUER ▲" else "OUVRIR ▼",
                     style = MaterialTheme.typography.labelSmall,
-                    color = SignalOrange
+                    color = themeAccent
                 )
             }
 
@@ -983,22 +1188,52 @@ private fun StudioScreen(
                 Spacer(Modifier.height(12.dp))
                 val p = state.params
 
+                Text("THÈME D'ARRANGEMENT (PERCUSSIONS & SYNTHÉS)", style = MaterialTheme.typography.labelSmall, color = SteelGray)
+                Spacer(Modifier.height(5.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemixGenreTheme.entries.forEach { gt ->
+                        val sel = p.genreTheme == gt
+                        val gAccent = Color(gt.accentHex)
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (sel) gAccent.copy(alpha = 0.24f) else RackMetal,
+                            border = BorderStroke(1.dp, if (sel) gAccent else RackBorder),
+                            modifier = Modifier.clickable { onUpdateParams { it.copy(genreTheme = gt) } }
+                        ) {
+                            Text(
+                                text = gt.shortLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (sel) gAccent else CrispWhite,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
                 StudioSlider(
-                    label = "TEMPO CIBLE",
+                    label = "TEMPO CIBLE (TECHNO 124 → PIEP 240 BPM)",
                     valueText = "${p.targetBpm.roundToInt()} BPM",
                     value = p.targetBpm,
-                    range = 150f..240f,
+                    range = 124f..240f,
+                    accent = themeAccent,
                     onChange = { v -> onUpdateParams { it.copy(targetBpm = v.roundToInt().toFloat()) } }
                 )
 
                 KickSelectorRow(
-                    title = "DROP 1 KICK",
+                    title = "DROP 1 KICK (12 SIGNATURES)",
                     selected = p.drop1Kick,
                     onSelect = { k -> onUpdateParams { it.copy(drop1Kick = k) } }
                 )
                 Spacer(Modifier.height(6.dp))
                 KickSelectorRow(
-                    title = "DROP 2 KICK-SWITCH",
+                    title = "DROP 2 KICK-SWITCH (12 SIGNATURES)",
                     selected = p.drop2Kick,
                     onSelect = { k -> onUpdateParams { it.copy(drop2Kick = k) } }
                 )
@@ -1009,20 +1244,23 @@ private fun StudioScreen(
                     valueText = "${(p.drive * 100).roundToInt()}%",
                     value = p.drive,
                     range = 0.2f..1f,
+                    accent = themeAccent,
                     onChange = { v -> onUpdateParams { it.copy(drive = v) } }
                 )
                 StudioSlider(
-                    label = "AGRESSIVITÉ ZAAG / PIEP",
+                    label = "AGRESSIVITÉ ZAAG / PIEP / 303",
                     valueText = "${(p.zaagAggression * 100).roundToInt()}%",
                     value = p.zaagAggression,
                     range = 0.1f..1f,
+                    accent = themeAccent,
                     onChange = { v -> onUpdateParams { it.copy(zaagAggression = v) } }
                 )
                 StudioSlider(
-                    label = "PITCH VOCAL (CHIPMUNK UOK)",
+                    label = "PITCH VOCAL (0 = VOIX NATURELLE)",
                     valueText = if (p.vocalPitchSemitones >= 0) "+${p.vocalPitchSemitones} st" else "${p.vocalPitchSemitones} st",
                     value = p.vocalPitchSemitones.toFloat(),
                     range = -5f..7f,
+                    accent = themeAccent,
                     onChange = { v -> onUpdateParams { it.copy(vocalPitchSemitones = v.roundToInt()) } }
                 )
                 StudioSlider(
@@ -1030,19 +1268,20 @@ private fun StudioScreen(
                     valueText = "${(p.stutterAmount * 100).roundToInt()}%",
                     value = p.stutterAmount,
                     range = 0f..1f,
+                    accent = themeAccent,
                     onChange = { v -> onUpdateParams { it.copy(stutterAmount = v) } }
                 )
 
-                ToggleRow("FAKE-DROP (1 mesure avant Drop 1)", p.enableFakeDrop) { on ->
+                ToggleRow("FAKE-DROP (1 mesure avant Drop 1)", p.enableFakeDrop, themeAccent) { on ->
                     onUpdateParams { it.copy(enableFakeDrop = on) }
                 }
-                ToggleRow("SCREECHES & LASERS INDUSTRIELS", p.enableScreeches) { on ->
+                ToggleRow("SCREECHES & LASERS INDUSTRIELS", p.enableScreeches, themeAccent) { on ->
                     onUpdateParams { it.copy(enableScreeches = on) }
                 }
-                ToggleRow("MÉLODIE KICK EN CLÉ", p.enablePitchKickMelody) { on ->
+                ToggleRow("MÉLODIE KICK EN CLÉ (FRENCHCORE / RAW)", p.enablePitchKickMelody, themeAccent) { on ->
                     onUpdateParams { it.copy(enablePitchKickMelody = on) }
                 }
-                ToggleRow("TRIPLET KICK ROLLS", p.enableTripletRolls) { on ->
+                ToggleRow("TRIPLET KICK ROLLS", p.enableTripletRolls, themeAccent) { on ->
                     onUpdateParams { it.copy(enableTripletRolls = on) }
                 }
 
@@ -1057,14 +1296,14 @@ private fun StudioScreen(
                             val sel = p.kickSwitchBars == bars
                             Surface(
                                 shape = RoundedCornerShape(6.dp),
-                                color = if (sel) HazardRed else RackMetal,
-                                border = BorderStroke(1.dp, if (sel) HazardRed else RackBorder),
+                                color = if (sel) themeAccent else RackMetal,
+                                border = BorderStroke(1.dp, if (sel) themeAccent else RackBorder),
                                 modifier = Modifier.clickable { onUpdateParams { it.copy(kickSwitchBars = bars) } }
                             ) {
                                 Text(
                                     text = "$bars MES.",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = CrispWhite,
+                                    color = if (sel && p.genreTheme == RemixGenreTheme.TECHNO_CLUB) RackObsidian else CrispWhite,
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                                 )
                             }
@@ -1073,13 +1312,26 @@ private fun StudioScreen(
                 }
 
                 Spacer(Modifier.height(10.dp))
-                Button(
-                    onClick = onRenderRemix,
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = CrispWhite),
-                    modifier = Modifier.fillMaxWidth()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("APPLIQUER & RE-CALCULER LE REMIX", style = MaterialTheme.typography.labelLarge)
+                    OutlinedButton(
+                        onClick = onOpenSavePresetDialog,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, PeakAmber),
+                        modifier = Modifier.weight(0.45f)
+                    ) {
+                        Text("SAUVER PERSO", style = MaterialTheme.typography.labelSmall, color = PeakAmber)
+                    }
+                    Button(
+                        onClick = onRenderRemix,
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = CrispWhite),
+                        modifier = Modifier.weight(0.55f)
+                    ) {
+                        Text("APPLIQUER & REMIXER", style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
         }
@@ -1119,6 +1371,56 @@ private fun StudioScreen(
             }
         }
     }
+}
+
+@Composable
+private fun SaveCustomPresetDialog(
+    themeAccent: Color,
+    defaultName: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var presetName by remember { mutableStateOf(defaultName) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = RackCharcoal,
+        titleContentColor = CrispWhite,
+        textContentColor = SteelGray,
+        title = { Text("Sauvegarder mon Preset Perso", style = MaterialTheme.typography.titleMedium) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Enregistre tes réglages actuels (thème, BPM, kicks, voix épiques, synthés 303/Euphoric, percussions 909) pour les réutiliser en 1 clic.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = presetName,
+                    onValueChange = { presetName = it.take(28) },
+                    placeholder = { Text("Ex : Ma Hard Techno Perso") },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = themeAccent,
+                        unfocusedBorderColor = RackBorder,
+                        focusedTextColor = CrispWhite,
+                        unfocusedTextColor = CrispWhite
+                    )
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(presetName) },
+                colors = ButtonDefaults.buttonColors(containerColor = MeterGreen, contentColor = RackObsidian)
+            ) {
+                Text("SAUVEGARDER", style = MaterialTheme.typography.labelMedium)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Annuler", color = SteelGray)
+            }
+        }
+    )
 }
 
 @Composable
@@ -1194,6 +1496,7 @@ private fun SmallActionChip(
 @Composable
 private fun LibraryScreen(
     state: ZaagForgeUiState,
+    themeAccent: Color,
     hasAudioPermission: Boolean,
     onRequestPermission: () -> Unit,
     onImportSaf: () -> Unit,
@@ -1227,7 +1530,10 @@ private fun LibraryScreen(
                 Button(
                     onClick = onImportSaf,
                     shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = HazardRed, contentColor = CrispWhite),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = themeAccent,
+                        contentColor = if (state.params.genreTheme == RemixGenreTheme.TECHNO_CLUB) RackObsidian else CrispWhite
+                    ),
                     modifier = Modifier.weight(1f)
                 ) {
                     Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -1467,6 +1773,7 @@ private fun SectionWaveformView(
     sections: List<SectionMarker>,
     progress: Float,
     isRemixActive: Boolean,
+    remixAccent: Color,
     onSeek: (Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1490,7 +1797,7 @@ private fun SectionWaveformView(
             for (sec in sections) {
                 val x0 = sec.startFrac.coerceIn(0f, 1f) * w
                 val x1 = sec.endFrac.coerceIn(0f, 1f) * w
-                val c = sectionColor(sec.kind)
+                val c = sectionColor(sec.kind, remixAccent)
                 drawRect(
                     color = c.copy(alpha = 0.12f),
                     topLeft = Offset(x0, 0f),
@@ -1516,7 +1823,7 @@ private fun SectionWaveformView(
                     val barH = amp * h * 0.88f
                     val x = (i.toFloat() / barCount) * w
                     val frac = i.toFloat() / barCount
-                    val activeColor = if (isRemixActive) HazardRed else MeterGreen
+                    val activeColor = if (isRemixActive) remixAccent else MeterGreen
                     val barColor = if (frac <= progress) activeColor else activeColor.copy(alpha = 0.36f)
                     drawRoundRect(
                         color = barColor,
@@ -1616,6 +1923,7 @@ private fun StudioSlider(
     valueText: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
+    accent: Color = HazardRed,
     onChange: (Float) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -1631,8 +1939,8 @@ private fun StudioSlider(
             onValueChange = onChange,
             valueRange = range,
             colors = SliderDefaults.colors(
-                thumbColor = HazardRed,
-                activeTrackColor = HazardRed,
+                thumbColor = accent,
+                activeTrackColor = accent,
                 inactiveTrackColor = RackMetal
             )
         )
@@ -1640,7 +1948,12 @@ private fun StudioSlider(
 }
 
 @Composable
-private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun ToggleRow(
+    label: String,
+    checked: Boolean,
+    accent: Color = HazardRed,
+    onCheckedChange: (Boolean) -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1648,13 +1961,13 @@ private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, style = MaterialTheme.typography.labelSmall, color = CrispWhite)
+        Text(label, style = MaterialTheme.typography.labelSmall, color = CrispWhite, modifier = Modifier.weight(1f))
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = CrispWhite,
-                checkedTrackColor = HazardRed,
+                checkedTrackColor = accent,
                 uncheckedThumbColor = SteelGray,
                 uncheckedTrackColor = RackMetal
             )
@@ -1710,7 +2023,11 @@ private fun ResolvedLinkCard(
 }
 
 @Composable
-private fun PasteStreamingLinkDialog(onDismiss: () -> Unit, onResolve: (String) -> Unit) {
+private fun PasteStreamingLinkDialog(
+    themeAccent: Color,
+    onDismiss: () -> Unit,
+    onResolve: (String) -> Unit
+) {
     var linkText by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1730,7 +2047,7 @@ private fun PasteStreamingLinkDialog(onDismiss: () -> Unit, onResolve: (String) 
                     placeholder = { Text("https://open.spotify.com/track/...") },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = SignalOrange,
+                        focusedBorderColor = themeAccent,
                         unfocusedBorderColor = RackBorder,
                         focusedTextColor = CrispWhite,
                         unfocusedTextColor = CrispWhite
@@ -1741,7 +2058,7 @@ private fun PasteStreamingLinkDialog(onDismiss: () -> Unit, onResolve: (String) 
         confirmButton = {
             Button(
                 onClick = { onResolve(linkText) },
-                colors = ButtonDefaults.buttonColors(containerColor = HazardRed, contentColor = CrispWhite)
+                colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = CrispWhite)
             ) {
                 Text("RÉSOUDRE", style = MaterialTheme.typography.labelMedium)
             }
@@ -1789,11 +2106,14 @@ private fun TrackRowCard(
 }
 
 @Composable
-private fun RackCard(content: @Composable () -> Unit) {
+private fun RackCard(
+    borderColor: Color = RackBorder,
+    content: @Composable () -> Unit
+) {
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = RackCharcoal,
-        border = BorderStroke(1.dp, RackBorder),
+        border = BorderStroke(1.dp, borderColor),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
@@ -1806,6 +2126,7 @@ private fun RackCard(content: @Composable () -> Unit) {
 private fun RackMiniButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
+    accent: Color = SignalOrange,
     onClick: () -> Unit
 ) {
     Surface(
@@ -1818,7 +2139,7 @@ private fun RackMiniButton(
             modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(icon, contentDescription = label, tint = SignalOrange, modifier = Modifier.size(15.dp))
+            Icon(icon, contentDescription = label, tint = accent, modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(4.dp))
             Text(label, style = MaterialTheme.typography.labelSmall, color = CrispWhite)
         }
@@ -1839,12 +2160,12 @@ private fun TelemetryCell(
         modifier = modifier
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(label, style = MaterialTheme.typography.labelSmall, color = SteelGray)
+            Text(label, style = MaterialTheme.typography.labelSmall, color = SteelGray, maxLines = 1)
             Spacer(Modifier.height(2.dp))
-            Text(value, style = MaterialTheme.typography.titleSmall, color = valueColor, fontWeight = FontWeight.Black)
+            Text(value, style = MaterialTheme.typography.titleSmall, color = valueColor, fontWeight = FontWeight.Black, maxLines = 1)
         }
     }
 }
@@ -1866,12 +2187,12 @@ private fun BannerCard(text: String, accent: Color) {
     }
 }
 
-private fun sectionColor(kind: SectionKind): Color = when (kind) {
+private fun sectionColor(kind: SectionKind, dropAccent: Color = HazardRed): Color = when (kind) {
     SectionKind.INTRO -> SteelGray
     SectionKind.VOCAL_BREAK, SectionKind.MID_BREAK -> MeterGreen
     SectionKind.BUILDUP -> PeakAmber
     SectionKind.FAKE_DROP -> SignalOrange
-    SectionKind.DROP_1, SectionKind.DROP_2 -> HazardRed
+    SectionKind.DROP_1, SectionKind.DROP_2 -> dropAccent
 }
 
 private fun formatDuration(ms: Long): String {

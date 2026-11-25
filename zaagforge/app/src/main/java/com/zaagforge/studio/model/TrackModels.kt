@@ -14,10 +14,82 @@ enum class SectionKind(val nativeId: Int, val shortLabel: String) {
     }
 }
 
+enum class TempoSyncMode(val nativeId: Int, val label: String, val subtitle: String) {
+    NEVER_SLOW(0, "JAMAIS RALENTI ≥1×", "Garde la vitesse (≥1.00×) ou accélère proprement"),
+    ORIGINAL_SPEED_LOCK(1, "VITESSE 100% ORIG.", "Vitesse d'origine 1.00× exacte · Rendu ultra-rapide"),
+    FORCE_TARGET_BPM(2, "FORCER BPM CIBLE", "Accélère strictement au BPM cible (jamais ralenti)");
+
+    companion object {
+        fun fromNativeId(id: Int): TempoSyncMode = entries.firstOrNull { it.nativeId == id } ?: NEVER_SLOW
+    }
+}
+
+enum class RemixGenreTheme(
+    val nativeId: Int,
+    val shortLabel: String,
+    val displayName: String,
+    val artistInspo: String,
+    val accentHex: Long,
+    val dimBgHex: Long
+) {
+    UPTEMPO_ZAAG(
+        nativeId = 0,
+        shortLabel = "UPTEMPO",
+        displayName = "Uptempo / Piep / Krach / Zaag",
+        artistInspo = "Unicorn On Ketamine · Noiseflow · Dimitri K · GPF",
+        accentHex = 0xFFFF2E1F,
+        dimBgHex = 0xFF3A1012
+    ),
+    TECHNO_CLUB(
+        nativeId = 1,
+        shortLabel = "TECHNO",
+        displayName = "Techno Normale (Club / Hypnotic)",
+        artistInspo = "Charlotte de Witte · Amelie Lens · Adam Beyer",
+        accentHex = 0xFF00E5FF,
+        dimBgHex = 0xFF0C2A33
+    ),
+    HARD_TECHNO(
+        nativeId = 2,
+        shortLabel = "HARD TECHNO",
+        displayName = "Hard Techno / Rave / Acid 303",
+        artistInspo = "Sara Landry · Nico Moreno · 999999999 · Klangkuenstler",
+        accentHex = 0xFFFF7A00,
+        dimBgHex = 0xFF331C0B
+    ),
+    FRENCHCORE(
+        nativeId = 3,
+        shortLabel = "FRENCHCORE",
+        displayName = "Vrai Frenchcore Euphorique",
+        artistInspo = "Sefa · Dr. Peacock · Billx",
+        accentHex = 0xFF1ED760,
+        dimBgHex = 0xFF0E2B1A
+    ),
+    GABBER(
+        nativeId = 4,
+        shortLabel = "GABBER",
+        displayName = "Vrai Gabber 909 Millennium",
+        artistInspo = "Angerfist · Neophyte · Tha Playah",
+        accentHex = 0xFFFF3B5C,
+        dimBgHex = 0xFF33111C
+    ),
+    RAWSTYLE(
+        nativeId = 5,
+        shortLabel = "RAWSTYLE",
+        displayName = "Xtra Rawstyle / Klaplong",
+        artistInspo = "Dual Damage · Warface · Kruelty",
+        accentHex = 0xFFFFB800,
+        dimBgHex = 0xFF30240A
+    );
+
+    companion object {
+        fun fromNativeId(id: Int): RemixGenreTheme = entries.firstOrNull { it.nativeId == id } ?: UPTEMPO_ZAAG
+    }
+}
+
 enum class MasterMode(val nativeId: Int, val label: String, val subtitle: String) {
-    STUDIO_CLEAN(0, "STUDIO CLEAN", "Voix limpides & basses nettes"),
+    STUDIO_CLEAN(0, "STUDIO CLEAN", "Voix limpides & basses nettes sans saturation"),
     CLUB_PUNCH(1, "CLUB PUNCH", "Glue club & punch maîtrisé"),
-    FESTIVAL_HARD(2, "FESTIVAL HARD", "Loudness max & clipper 2×");
+    FESTIVAL_HARD(2, "FESTIVAL HARD", "Loudness max & clipper 2× anti-aliasing");
 
     companion object {
         fun fromNativeId(id: Int): MasterMode = entries.firstOrNull { it.nativeId == id } ?: STUDIO_CLEAN
@@ -81,7 +153,8 @@ data class RemixRenderResult(
     val keyName: String,
     val durationSec: Float,
     val peakDb: Float,
-    val rmsDb: Float
+    val rmsDb: Float,
+    val renderTimeMs: Float = 0f
 )
 
 enum class TrackSourceType {

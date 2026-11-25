@@ -33,13 +33,13 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 3. ZAAGFORGE (`zaagforge/` — v2.0.0)
-**Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20 Pro**
+## 3. ZAAGFORGE (`zaagforge/` — v3.0.0 Pro)
+**Studio Automatique de Remix Pro — Techno Normale / Hard Techno / Vrai Frenchcore / Vrai Gabber / Rawstyle / Uptempo / Piep / Krach / Zaag — Moteur Turbo C++20**
 
-- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, session audio native C++ zéro OOM jusqu'à 8 min, `141/141` assertions C++20 + `7/7` tests JVM)
-- **Qualité Audio Studio, Paroles Limpides & Basses Contrôlées** : séparation bus Voix vs bus Kicks (zéro intermodulation sur les paroles), sculpture vocale Mid/Side + sidechain sélectif par bande, **Limiter True-Peak Lookahead `4 ms`** (`STUDIO CLEAN` / `CLUB PUNCH` / `FESTIVAL HARD`), WSOLA haute précision `2048 pts` et réglage indépendant **Saturation Basses / Sub**, **Clarté Paroles**, **Niveau Kicks**, **Sidechain Voix** et **Coupe-Bas HPF (`110–340 Hz`)**.
-- **Découpe & Calage Chirurgical** : détection automatique du **Temps 1 de mesure (`4/4`)** et des **vrais Refrains 1 & 2** par analyse acoustique + rack **CALAGE & DÉCOUPE PRÉCISE** (`POSER DROP 1 / 2 ICI` au curseur, décalage `-4 / -1 / +1 / +4 mes.`, durée Build-Up `4 / 8 / 12 mes.`, `BPM ÷2 / ×2`, `Temps +1`, micro-calage `±250 ms` avec aperçu live).
-- **8 Presets Extrêmes (`155 → 225 BPM`) & 8 Topologies de Kicks C++20** + **Bridge Hybride MP3 / Deezer / Spotify / SoundCloud** + exports streaming `M4A 256k` / `WAV 16-bit` dans `Music/ZaagForge/`.
+- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, session audio native C++ zéro OOM jusqu'à 8 min, `330/330` assertions C++20 + `8/8` tests JVM)
+- **Vitesse Jamais Ralentie (`speedRatio >= 1.00×`) & Rendu Turbo C++20** : 3 modes (`JAMAIS RALENTI ≥1×`, `VITESSE 100% ORIG.`, `FORCER BPM CIBLE`), **Limiter True-Peak Lookahead O(1)** par deque circulaire monotone (~100× plus rapide), **WSOLA Multi-Thread 4 cœurs à recherche pyramidale 3 niveaux** et **Cache WSOLA Natif** pour des re-rendus quasi instantanés lors des retouches.
+- **Paroles Ultra-Claires Pendant les Drops Épiques & Basses Lourdes** : **`VocalAutoLeveller`** sur la bande vocale (`> 680 Hz`), sculpture Mid/Side, **Dynamic Kick Vocal-Pocket Carving** (`-5.2 dB` dynamiques à `1.85 kHz` sur le kick uniquement quand le chanteur chante, sub `< 150 Hz` intact), curseur **Boost Paroles Épiques**, **Saturation Basses / Sub** indépendante et 3 modes mastering (`STUDIO CLEAN` / `CLUB PUNCH` / `FESTIVAL HARD`).
+- **6 Vrais Thèmes Artistes, 12 Presets Studio, 12 Kicks C++20 & Customisation Totale** : **Techno Normale** (*Charlotte de Witte / Amelie Lens / 999999999*), **Hard Techno** (*Sara Landry / Nico Moreno / Klangkuenstler*), **Vrai Frenchcore** (*Sefa / Dr. Peacock* avec kicks mélodiques 4 mesures & nappes supersaw), **Vrai Gabber 909** (*Angerfist / Neophyte* avec Hoover stabs), **Xtra Rawstyle** (*Dual Damage*) et **Uptempo / Piep / Krach / Zaag** (*UOK / Noiseflow / Dimitri K / GPF*), thèmes LED dynamiques par genre, **sauvegarde de Presets Perso**, calage chirurgical sur les refrains (`POSER DROP 1 / 2 ICI`), bridge MP3/Deezer/Spotify/SoundCloud et exports `M4A 256k` / `WAV 16-bit` vers `Music/ZaagForge/`.
 
 ---
 

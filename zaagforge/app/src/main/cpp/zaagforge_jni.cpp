@@ -7,6 +7,7 @@
 #include "remix_engine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <locale>
@@ -22,16 +23,21 @@
 namespace {
 
 // ============================================================================
-// Zero-OOM Native C++ Audio Session Store
-// Keeps full 3-to-8 minute stereo PCM buffers strictly in C++ native RAM
-// (outside Android ART's 256 MB Java heap!), streaming tiny 8-32 KB chunks
-// across JNI for playback & export -> eliminates OutOfMemoryError completely!
+// Zero-OOM Native C++ Audio Session Store + Warped Audio Cache
+// Keeps full 3-to-8 minute stereo PCM strictly in native C++ heap AND caches
+// warped PCM keyed by (timeScale, pitchSemitones) so tweaking drops/kicks/mix
+// re-renders in < 0.3 seconds!!
 // ============================================================================
 struct NativeAudioSession {
     std::mutex mutex;
     std::vector<float> originalPcm; // Interleaved stereo 44.1 kHz Float32
     std::vector<float> remixPcm;    // Interleaved stereo 44.1 kHz Float32
     zaagforge::AnalysisResult lastAnalysis;
+
+    // Instant re-render WSOLA cache
+    std::vector<float> cachedWarpedPcm;
+    float cachedTimeScale = -1.0f;
+    float cachedPitchSt = -99.0f;
 
     // Streaming linear resampler state during MediaCodec decode
     int decodeSrcRate = 44100;
@@ -41,7 +47,14 @@ struct NativeAudioSession {
     float prevR = 0.0f;
     bool hasPrevSample = false;
 
-    static constexpr size_t kMaxSessionFrames = 44100u * 480u; // Up to 8 minutes cleanly!
+    static constexpr size_t kMaxSessionFrames = 44100u * 480u;
+
+    void clearWarpedCache() {
+        cachedWarpedPcm.clear();
+        cachedWarpedPcm.shrink_to_fit();
+        cachedTimeScale = -1.0f;
+        cachedPitchSt = -99.0f;
+    }
 };
 
 NativeAudioSession gSession;
@@ -113,15 +126,9 @@ jfloatArray vectorToJFloatArray(JNIEnv* env, const std::vector<float>& vec) {
 
 jobject buildAnalysisOutputObj(JNIEnv* env, const zaagforge::AnalysisResult& res, size_t totalFrames) {
     jclass outCls = env->FindClass("com/zaagforge/studio/dsp/NativeAnalysisOutput");
-    if (!outCls) {
-        LOGE("Failed to find NativeAnalysisOutput");
-        return nullptr;
-    }
+    if (!outCls) return nullptr;
     jmethodID ctor = env->GetMethodID(outCls, "<init>", "([FLjava/lang/String;)V");
-    if (!ctor) {
-        LOGE("Failed to find NativeAnalysisOutput constructor");
-        return nullptr;
-    }
+    if (!ctor) return nullptr;
     jfloatArray peaksArr = vectorToJFloatArray(env, res.waveformPeaks);
     jstring metaStr = env->NewStringUTF(serializeAnalysisJson(res, totalFrames).c_str());
     return env->NewObject(outCls, ctor, peaksArr, metaStr);
@@ -131,9 +138,6 @@ jobject buildAnalysisOutputObj(JNIEnv* env, const zaagforge::AnalysisResult& res
 
 extern "C" {
 
-// ----------------------------------------------------------------------------
-// 1. Streaming Decode -> Native C++ Original Buffer (ZERO Java FloatArray OOM!)
-// ----------------------------------------------------------------------------
 JNIEXPORT void JNICALL
 Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionBeginDecode(
     JNIEnv* /*env*/,
@@ -146,6 +150,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionBeginDecode(
     gSession.originalPcm.shrink_to_fit();
     gSession.remixPcm.clear();
     gSession.remixPcm.shrink_to_fit();
+    gSession.clearWarpedCache();
     gSession.originalPcm.reserve(44100u * 2u * 60u);
     gSession.decodeSrcRate = std::max(8000, static_cast<int>(srcSampleRate));
     gSession.decodeSrcChannels = std::max(1, static_cast<int>(srcChannels));
@@ -178,7 +183,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionAppendPcm16(
 
     std::lock_guard<std::mutex> lock(gSession.mutex);
     if (gSession.originalPcm.size() / 2 >= NativeAudioSession::kMaxSessionFrames) {
-        return JNI_FALSE; // Reached 8-minute cap cleanly
+        return JNI_FALSE;
     }
 
     const int ch = std::max(1, gSession.decodeSrcChannels);
@@ -202,7 +207,6 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionAppendPcm16(
             gSession.originalPcm.push_back(r);
         }
     } else {
-        // Streaming linear resampling directly into 44.1 kHz native stereo buffer
         const double ratio = static_cast<double>(srcRate) / 44100.0;
         auto sampleAt = [&](int idx, float& outL, float& outR) {
             if (idx < 0 && gSession.hasPrevSample) {
@@ -247,17 +251,13 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionFinalizeAndAnalyze(
     const size_t totalFrames = gSession.originalPcm.size() / 2;
     if (totalFrames == 0) return nullptr;
 
+    gSession.clearWarpedCache();
     gSession.lastAnalysis = zaagforge::MusicAnalyzer::analyze(
         gSession.originalPcm.data(),
         totalFrames,
         zaagforge::kSampleRate,
         240
     );
-    LOGI("Session analyzed: frames=%zu, bpm=%.1f, downbeat=%.3fs, chorus1Bar=%d, chorus2Bar=%d, key=%s",
-         totalFrames, gSession.lastAnalysis.bpm, gSession.lastAnalysis.downbeatSec,
-         gSession.lastAnalysis.chorus1Bar, gSession.lastAnalysis.chorus2Bar,
-         gSession.lastAnalysis.keyName.c_str());
-
     return buildAnalysisOutputObj(env, gSession.lastAnalysis, totalFrames);
 }
 
@@ -271,6 +271,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionLoadDemo(
     std::lock_guard<std::mutex> lock(gSession.mutex);
     gSession.remixPcm.clear();
     gSession.remixPcm.shrink_to_fit();
+    gSession.clearWarpedCache();
     gSession.originalPcm = zaagforge::MusicAnalyzer::generateDemoTrack(style, durationSec);
     const size_t totalFrames = gSession.originalPcm.size() / 2;
 
@@ -283,9 +284,6 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionLoadDemo(
     return buildAnalysisOutputObj(env, gSession.lastAnalysis, totalFrames);
 }
 
-// ----------------------------------------------------------------------------
-// 2. Instantaneous Live Section Preview (updates waveform markers in < 1 ms!)
-// ----------------------------------------------------------------------------
 JNIEXPORT jstring JNICALL
 Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionPreviewSections(
     JNIEnv* env,
@@ -318,14 +316,13 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionPreviewSections(
     return env->NewStringUTF(serializeSections(sections).c_str());
 }
 
-// ----------------------------------------------------------------------------
-// 3. Zero-OOM Native Remix Render (stores remix in C++ RAM, returns ~2 KB meta!)
-// ----------------------------------------------------------------------------
 JNIEXPORT jobject JNICALL
 Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     JNIEnv* env,
     jclass /*clazz*/,
     jfloat targetBpm,
+    jint genreTheme,
+    jint tempoSyncMode,
     jint drop1Kick,
     jint drop2Kick,
     jfloat drive,
@@ -333,9 +330,12 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     jfloat bassSaturation,
     jfloat originalMix,
     jfloat vocalClarity,
+    jfloat epicVocalBoost,
     jfloat vocalSidechain,
     jfloat kickLevel,
     jfloat bassCutHz,
+    jfloat synthLayerAmount,
+    jfloat percGrooveAmount,
     jint masterMode,
     jfloat vocalPitchSemitones,
     jfloat stutterAmount,
@@ -358,22 +358,28 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     const size_t totalFrames = gSession.originalPcm.size() / 2;
     if (totalFrames == 0) return nullptr;
 
-    // Free old remix buffer BEFORE rendering so native RAM never doubles!
+    const auto tWallStart = std::chrono::steady_clock::now();
+
     gSession.remixPcm.clear();
     gSession.remixPcm.shrink_to_fit();
 
     zaagforge::RemixConfig cfg;
     cfg.targetBpm = targetBpm;
-    cfg.drop1Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(7, static_cast<int>(drop1Kick))));
-    cfg.drop2Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(7, static_cast<int>(drop2Kick))));
+    cfg.genreTheme = static_cast<zaagforge::RemixGenreTheme>(std::max(0, std::min(5, static_cast<int>(genreTheme))));
+    cfg.tempoSyncMode = static_cast<zaagforge::TempoSyncMode>(std::max(0, std::min(2, static_cast<int>(tempoSyncMode))));
+    cfg.drop1Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(zaagforge::kNumKickTypes - 1, static_cast<int>(drop1Kick))));
+    cfg.drop2Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(zaagforge::kNumKickTypes - 1, static_cast<int>(drop2Kick))));
     cfg.drive = drive;
     cfg.zaagAggression = zaagAggression;
     cfg.bassSaturation = bassSaturation;
     cfg.originalMix = originalMix;
     cfg.vocalClarity = vocalClarity;
+    cfg.epicVocalBoost = epicVocalBoost;
     cfg.vocalSidechain = vocalSidechain;
     cfg.kickLevel = kickLevel;
     cfg.bassCutHz = bassCutHz;
+    cfg.synthLayerAmount = synthLayerAmount;
+    cfg.percGrooveAmount = percGrooveAmount;
     cfg.masterMode = masterMode;
     cfg.vocalPitchSemitones = vocalPitchSemitones;
     cfg.stutterAmount = stutterAmount;
@@ -392,18 +398,51 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     cfg.customDrop1Frac = customDrop1Frac;
     cfg.customDrop2Frac = customDrop2Frac;
 
-    LOGI("Rendering native session remix: frames=%zu, tgt=%.1f BPM, kicks=%d->%d, bassSat=%.2f, vocalClarity=%.2f, master=%d",
-         totalFrames, targetBpm, drop1Kick, drop2Kick, bassSaturation, vocalClarity, masterMode);
+    // Smart WSOLA Cache: re-uses warped track instantly when user adjusts kicks/mix/drops at same speed & pitch!
+    const float srcBpm = (cfg.sourceBpmOverride > 55.0f) ? cfg.sourceBpmOverride : gSession.lastAnalysis.bpm;
+    const auto sync = zaagforge::RemixEngine::computeNeverSlowTempoSync(srcBpm, cfg.targetBpm, cfg.tempoSyncMode);
+    const float timeScale = 1.0f / sync.speedRatio;
+    const bool needsWarp = (std::fabs(timeScale - 1.0f) >= 0.004f || std::fabs(cfg.vocalPitchSemitones) >= 0.05f);
+
+    const float* preWarpedPtr = nullptr;
+    size_t preWarpedFrames = 0;
+
+    if (needsWarp) {
+        const bool cacheHit = !gSession.cachedWarpedPcm.empty() &&
+            std::fabs(gSession.cachedTimeScale - timeScale) < 0.002f &&
+            std::fabs(gSession.cachedPitchSt - cfg.vocalPitchSemitones) < 0.05f;
+        if (!cacheHit) {
+            gSession.clearWarpedCache();
+            gSession.cachedWarpedPcm = zaagforge::RemixEngine::timeStretchAndPitchShift(
+                gSession.originalPcm.data(),
+                totalFrames,
+                timeScale,
+                cfg.vocalPitchSemitones
+            );
+            gSession.cachedTimeScale = timeScale;
+            gSession.cachedPitchSt = cfg.vocalPitchSemitones;
+        }
+        preWarpedPtr = gSession.cachedWarpedPcm.data();
+        preWarpedFrames = gSession.cachedWarpedPcm.size() / 2;
+    }
 
     auto out = zaagforge::RemixEngine::renderRemix(
         gSession.originalPcm.data(),
         totalFrames,
         gSession.lastAnalysis,
-        cfg
+        cfg,
+        preWarpedPtr,
+        preWarpedFrames
     );
+
+    const auto tWallEnd = std::chrono::steady_clock::now();
+    const float totalMs = std::chrono::duration<float, std::milli>(tWallEnd - tWallStart).count();
 
     const size_t remixFrames = out.stereoPcm.size() / 2;
     gSession.remixPcm = std::move(out.stereoPcm);
+
+    LOGI("Rendered v3 remix in %.0f ms (speed=%.2fx, bpm=%.1f, theme=%d, frames=%zu)",
+         totalMs, out.tempoStretchRatio, out.effectiveTargetBpm, genreTheme, remixFrames);
 
     std::ostringstream json;
     json.imbue(std::locale::classic());
@@ -417,29 +456,21 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
          << ",\"durationSec\":" << out.durationSec
          << ",\"peakDb\":" << out.peakDb
          << ",\"rmsDb\":" << out.rmsDb
+         << ",\"renderTimeMs\":" << totalMs
          << ",\"totalFrames\":" << remixFrames
          << ",\"sections\":" << serializeSections(out.sections)
          << "}";
 
     jclass outCls = env->FindClass("com/zaagforge/studio/dsp/NativeRemixMetadata");
-    if (!outCls) {
-        LOGE("Failed to find NativeRemixMetadata");
-        return nullptr;
-    }
+    if (!outCls) return nullptr;
     jmethodID ctor = env->GetMethodID(outCls, "<init>", "([FLjava/lang/String;)V");
-    if (!ctor) {
-        LOGE("Failed to find NativeRemixMetadata constructor");
-        return nullptr;
-    }
+    if (!ctor) return nullptr;
 
     jfloatArray peaksArr = vectorToJFloatArray(env, out.waveformPeaks);
     jstring metaStr = env->NewStringUTF(json.str().c_str());
     return env->NewObject(outCls, ctor, peaksArr, metaStr);
 }
 
-// ----------------------------------------------------------------------------
-// 4. Tiny Zero-GC Streaming Readers for Playback (8 KB) & Export (32 KB)
-// ----------------------------------------------------------------------------
 JNIEXPORT jint JNICALL
 Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionGetFrameCount(
     JNIEnv* /*env*/,
@@ -514,6 +545,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionClear(
     gSession.originalPcm.shrink_to_fit();
     gSession.remixPcm.clear();
     gSession.remixPcm.shrink_to_fit();
+    gSession.clearWarpedCache();
 }
 
 JNIEXPORT jfloatArray JNICALL
@@ -527,7 +559,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSynthesizeKickPreview(
     jfloat aggression,
     jfloat bassSaturation
 ) {
-    const auto kt = static_cast<zaagforge::KickType>(std::max(0, std::min(7, static_cast<int>(kickType))));
+    const auto kt = static_cast<zaagforge::KickType>(std::max(0, std::min(zaagforge::kNumKickTypes - 1, static_cast<int>(kickType))));
     const auto loop = zaagforge::HardcoreSynth::renderKickPreviewLoop(kt, rootHz, bpm, drive, aggression, bassSaturation);
     return vectorToJFloatArray(env, loop);
 }

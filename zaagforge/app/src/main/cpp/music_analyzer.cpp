@@ -156,10 +156,10 @@ BpmEstimate detectBpmAndDownbeat(const std::vector<float>& mono, float sr) {
     for (size_t lag = 1; lag <= maxLag; ++lag) {
         double acc = 0.0;
         const size_t count = numFrames - lag;
-        for (size_t i = 0; i < count; ++i) {
+        for (size_t i = 0; i < count; i += 2) {
             acc += static_cast<double>(onset[i]) * static_cast<double>(onset[i + lag]);
         }
-        acf[lag] = static_cast<float>(acc / static_cast<double>(std::max<size_t>(1, count)));
+        acf[lag] = static_cast<float>(acc / static_cast<double>(std::max<size_t>(1, (count + 1) / 2)));
     }
 
     auto sampleAcf = [&](float lagF) -> float {

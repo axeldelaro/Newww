@@ -16,6 +16,8 @@ target_include_directories(zaagforge_dsp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_options(zaagforge_dsp PRIVATE
     -O3
+    -funroll-loops
+    -fno-math-errno
     -Wall
     -Wextra
     -Wno-unused-parameter

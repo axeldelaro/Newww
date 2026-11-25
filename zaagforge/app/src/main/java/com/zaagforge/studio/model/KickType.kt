@@ -32,7 +32,7 @@ enum class KickType(
         nativeId = 3,
         code = "BNCE",
         displayName = "Uptempo Bounce",
-        subtitle = "Hollow Tok + Pitch Bounce",
+        subtitle = "Dimitri K Hollow Tok + Bounce",
         accentHex = 0xFFFFB800
     ),
     ZAAG_PIEP_HYBRID(
@@ -46,22 +46,50 @@ enum class KickType(
         nativeId = 5,
         code = "RAWG",
         displayName = "Rawstyle Gated",
-        subtitle = "Klaplong + Gated Reverb",
+        subtitle = "Dual Damage Klaplong + Gate",
         accentHex = 0xFFE5484D
     ),
     FRENCHCORE_MELODIC(
         nativeId = 6,
         code = "FRNC",
-        displayName = "Frenchcore Melodic",
-        subtitle = "Pitched Warm Lead Pocket",
+        displayName = "Frenchcore Sefa",
+        subtitle = "Sefa / Peacock Pitched Punch",
         accentHex = 0xFF1ED760
     ),
     SCHRANZ_INDUSTRIAL(
         nativeId = 7,
         code = "SCHR",
-        displayName = "Schranz Industrial",
-        subtitle = "Dark Rolling Rumble + Grit",
+        displayName = "Schranz Klang",
+        subtitle = "Klangkuenstler Industrial Loop",
         accentHex = 0xFF9EA6B8
+    ),
+    TECHNO_ROLLING(
+        nativeId = 8,
+        code = "TECH",
+        displayName = "Techno 909",
+        subtitle = "Charlotte / Amelie Berlin Rumble",
+        accentHex = 0xFF00E5FF
+    ),
+    HARD_TECHNO_RAVE(
+        nativeId = 9,
+        code = "HTEC",
+        displayName = "Hard Techno",
+        subtitle = "Sara Landry / Nico Moreno Slam",
+        accentHex = 0xFFFF7A00
+    ),
+    GABBER_MILLENNIUM(
+        nativeId = 10,
+        code = "GABR",
+        displayName = "Gabber 909",
+        subtitle = "Angerfist / Neophyte Mackie Bark",
+        accentHex = 0xFFFF3B5C
+    ),
+    ACID_303_TECHNO(
+        nativeId = 11,
+        code = "ACID",
+        displayName = "Acid 303 Kick",
+        subtitle = "999999999 / Alignment 303 Pocket",
+        accentHex = 0xFF76FF03
     );
 
     companion object {

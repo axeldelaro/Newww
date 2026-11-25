@@ -10,11 +10,13 @@ import com.zaagforge.studio.audio.AudioExporter
 import com.zaagforge.studio.audio.RemixPlayer
 import com.zaagforge.studio.dsp.NativeDspBridge
 import com.zaagforge.studio.model.AudioTrackItem
+import com.zaagforge.studio.model.CustomPresetStore
 import com.zaagforge.studio.model.DeezerSearchTrack
 import com.zaagforge.studio.model.ExportFormat
 import com.zaagforge.studio.model.ExportedRemix
 import com.zaagforge.studio.model.KickType
 import com.zaagforge.studio.model.MeterReading
+import com.zaagforge.studio.model.RemixGenreTheme
 import com.zaagforge.studio.model.RemixParams
 import com.zaagforge.studio.model.RemixPreset
 import com.zaagforge.studio.model.RemixRenderResult
@@ -45,8 +47,10 @@ data class ZaagForgeUiState(
     val activeTab: StudioTab = StudioTab.STUDIO,
     val loadedTrack: AudioTrackItem? = null,
     val analysis: TrackAnalysis? = null,
-    val selectedPreset: RemixPreset = StudioPresets.all.first(),
-    val params: RemixParams = StudioPresets.all.first().params,
+    val selectedGenreFilter: RemixGenreTheme? = null, // null = TOUS
+    val selectedPreset: RemixPreset = StudioPresets.byId("uok_piep_madness"),
+    val customPresets: List<RemixPreset> = emptyList(),
+    val params: RemixParams = StudioPresets.byId("uok_piep_madness").params,
     val remixResult: RemixRenderResult? = null,
     val waveformPeaks: FloatArray = FloatArray(0),
     val sectionMarkers: List<SectionMarker> = emptyList(),
@@ -56,8 +60,8 @@ data class ZaagForgeUiState(
     val statusBanner: String? = null,
     val errorBanner: String? = null,
     val auditioningKick: KickType? = null,
-    val showCutControls: Boolean = true,
-    val showMixControls: Boolean = false,
+    val showCutControls: Boolean = false,
+    val showMixControls: Boolean = true,
     val showProTweaks: Boolean = false,
     // Library & Streaming
     val localTracks: List<AudioTrackItem> = emptyList(),
@@ -86,14 +90,53 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     val uiState: StateFlow<ZaagForgeUiState> = _uiState.asStateFlow()
 
     init {
+        loadCustomPresets()
         refreshExports()
         refreshLocalLibrary()
         loadTrack(LibraryAndStreamingRepository.builtInDemos.first(), autoRemixImmediately = true)
     }
 
+    private fun loadCustomPresets() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val saved = CustomPresetStore.loadAll(appContext)
+            _uiState.update { it.copy(customPresets = saved) }
+        }
+    }
+
     fun selectTab(tab: StudioTab) {
         _uiState.update { it.copy(activeTab = tab) }
         if (tab == StudioTab.EXPORTS) refreshExports()
+    }
+
+    fun selectGenreFilter(theme: RemixGenreTheme?) {
+        _uiState.update { it.copy(selectedGenreFilter = theme) }
+    }
+
+    fun saveCustomPreset(name: String) {
+        val currentParams = _uiState.value.params.sanitized()
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = CustomPresetStore.savePreset(appContext, name, currentParams)
+            val created = updated.firstOrNull()
+            _uiState.update {
+                it.copy(
+                    customPresets = updated,
+                    selectedPreset = created ?: it.selectedPreset,
+                    statusBanner = "Preset perso « ${created?.name ?: name} » sauvegardé !"
+                )
+            }
+        }
+    }
+
+    fun deleteCustomPreset(presetId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = CustomPresetStore.deletePreset(appContext, presetId)
+            _uiState.update {
+                it.copy(
+                    customPresets = updated,
+                    statusBanner = "Preset perso supprimé."
+                )
+            }
+        }
     }
 
     fun refreshLocalLibrary() {
@@ -132,7 +175,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun selectPreset(preset: RemixPreset, renderNow: Boolean = false) {
         _uiState.update { state ->
-            // Preserve user's track-specific drop/grid timing when switching presets!
+            // Preserve user's track-specific drop/grid timing & speed lock when switching presets!
             state.copy(
                 selectedPreset = preset,
                 params = state.params.withPresetStyle(preset.params),
@@ -161,7 +204,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val dur = _uiState.value.analysis?.durationSec ?: 0f
         _uiState.update {
-            it.copy(statusBanner = "DROP 1 calé sur ${formatTimeSec(frac * dur)} · clique AUTO REMIX C++ pour appliquer")
+            it.copy(statusBanner = "DROP 1 calé sur ${formatTimeSec(frac * dur)} · clique RE-CALCULER pour appliquer")
         }
     }
 
@@ -173,7 +216,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val dur = _uiState.value.analysis?.durationSec ?: 0f
         _uiState.update {
-            it.copy(statusBanner = "DROP 2 calé sur ${formatTimeSec(frac * dur)} · clique AUTO REMIX C++ pour appliquer")
+            it.copy(statusBanner = "DROP 2 calé sur ${formatTimeSec(frac * dur)} · clique RE-CALCULER pour appliquer")
         }
     }
 
@@ -200,7 +243,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         val nextBpm = (baseBpm * factor).coerceIn(60f, 240f)
         updateParams { it.copy(sourceBpmOverride = nextBpm) }
         _uiState.update {
-            it.copy(statusBanner = "BPM source corrigé à ${nextBpm.roundToInt()} BPM · clique AUTO REMIX C++")
+            it.copy(statusBanner = "BPM source corrigé à ${nextBpm.roundToInt()} BPM · clique RE-CALCULER")
         }
     }
 
@@ -250,7 +293,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             try {
-                // Streams directly into C++ native heap (ZERO 77 MB Java FloatArray allocation!)
+                // Streams directly into C++ native heap (ZERO Java heap OOM!)
                 val analysis = withContext(Dispatchers.IO) {
                     when (item.sourceType) {
                         TrackSourceType.BUILTIN_DEMO ->
@@ -324,19 +367,23 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update {
                 it.copy(
                     isBusy = true,
-                    busyMessage = "Mixage C++20 ($presetName · ${params.targetBpm.roundToInt()} BPM · ${params.masterMode.label})…",
+                    busyMessage = "Rendu Turbo C++20 ($presetName · ${params.genreTheme.shortLabel} · ${params.targetBpm.roundToInt()} BPM)…",
                     errorBanner = null,
                     statusBanner = null
                 )
             }
             try {
-                // Zero-OOM native render: PCM stays in C++ native heap, Kotlin receives only ~2 KB metadata!
+                // Zero-OOM native render with multi-threaded WSOLA cache: PCM stays in C++ native heap!
                 val rendered = withContext(Dispatchers.Default) {
                     NativeDspBridge.renderSessionRemix(params, analysis)
                 }
 
                 currentRemixFrames = rendered.totalFrames
                 player.setRemixFrameCount(rendered.totalFrames, autoSwitchToRemix = true)
+
+                val secStr = String.format(Locale.US, "%.2fs", rendered.renderTimeMs / 1000f)
+                val spdStr = String.format(Locale.US, "×%.2f", rendered.tempoStretchRatio)
+                val rmsStr = String.format(Locale.US, "%.1f", rendered.rmsDb)
 
                 _uiState.update {
                     it.copy(
@@ -346,7 +393,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                         hasPendingChanges = false,
                         isBusy = false,
                         busyMessage = "",
-                        statusBanner = "REMIX PRÊT · ${rendered.effectiveTargetBpm.roundToInt()} BPM · Clé ${rendered.keyName} · RMS ${String.format(Locale.US, "%.1f", rendered.rmsDb)} dB · ${params.masterMode.label}"
+                        statusBanner = "Rendu en $secStr · ${rendered.effectiveTargetBpm.roundToInt()} BPM (Vitesse $spdStr) · Clé ${rendered.keyName} · RMS $rmsStr dB"
                     )
                 }
             } catch (t: Throwable) {
