@@ -26,11 +26,15 @@ import com.zaagforge.studio.model.StudioPresets
 import com.zaagforge.studio.model.TrackAnalysis
 import com.zaagforge.studio.model.TrackSourceType
 import com.zaagforge.studio.music.LibraryAndStreamingRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -57,6 +61,8 @@ data class ZaagForgeUiState(
     val hasPendingChanges: Boolean = false,
     val isBusy: Boolean = false,
     val busyMessage: String = "",
+    val busyProgress: Float = 0f,
+    val canCancelBusy: Boolean = false,
     val statusBanner: String? = null,
     val errorBanner: String? = null,
     val auditioningKick: KickType? = null,
@@ -86,6 +92,10 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     private var hasOriginalLoaded: Boolean = false
     private var currentRemixFrames: Int = 0
 
+    // Single-flight job serialization prevents concurrent renders from piling up on gSession.mutex!
+    private var activeWorkJob: Job? = null
+    private var workGeneration: Long = 0L
+
     private val _uiState = MutableStateFlow(ZaagForgeUiState())
     val uiState: StateFlow<ZaagForgeUiState> = _uiState.asStateFlow()
 
@@ -104,12 +114,29 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun selectTab(tab: StudioTab) {
+        if (_uiState.value.isBusy) return
         _uiState.update { it.copy(activeTab = tab) }
         if (tab == StudioTab.EXPORTS) refreshExports()
     }
 
     fun selectGenreFilter(theme: RemixGenreTheme?) {
         _uiState.update { it.copy(selectedGenreFilter = theme) }
+    }
+
+    fun cancelActiveWork() {
+        workGeneration++
+        runCatching { NativeDspBridge.nativeSessionRequestCancel() }
+        activeWorkJob?.cancel()
+        activeWorkJob = null
+        _uiState.update {
+            it.copy(
+                isBusy = false,
+                busyMessage = "",
+                busyProgress = 0f,
+                canCancelBusy = false,
+                statusBanner = "Rendu annulé."
+            )
+        }
     }
 
     fun saveCustomPreset(name: String) {
@@ -174,8 +201,8 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun selectPreset(preset: RemixPreset, renderNow: Boolean = false) {
+        if (_uiState.value.isBusy) return
         _uiState.update { state ->
-            // Preserve user's track-specific drop/grid timing & speed lock when switching presets!
             state.copy(
                 selectedPreset = preset,
                 params = state.params.withPresetStyle(preset.params),
@@ -196,7 +223,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         refreshLiveSectionPreview(next)
     }
 
-    /** Instant 1-tap: places DROP 1 exactly on the nearest musical bar at current playhead! */
     fun placeDrop1AtPlayhead() {
         val frac = player.progress.value.coerceIn(0.04f, 0.88f)
         updateParams {
@@ -208,7 +234,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /** Instant 1-tap: places DROP 2 exactly on the nearest musical bar at current playhead! */
     fun placeDrop2AtPlayhead() {
         val frac = player.progress.value.coerceIn(0.12f, 0.95f)
         updateParams {
@@ -220,7 +245,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /** Resets all custom cut/drop/grid overrides back to automatic chorus detection. */
     fun resetTimingToAuto() {
         updateParams {
             it.copy(
@@ -236,7 +260,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(statusBanner = "Calage réinitialisé sur la détection auto du refrain.") }
     }
 
-    /** Half-time / Double-time BPM correction in 1 tap when a track has ambiguous pulse. */
     fun scaleDetectedSourceBpm(factor: Float) {
         val baseBpm = _uiState.value.params.sourceBpmOverride.takeIf { it > 55f }
             ?: _uiState.value.analysis?.bpm ?: 128f
@@ -248,7 +271,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun refreshLiveSectionPreview(params: RemixParams) {
-        if (!hasOriginalLoaded) return
+        if (!hasOriginalLoaded || _uiState.value.isBusy) return
         viewModelScope.launch(Dispatchers.Default) {
             val previewSecs = runCatching { NativeDspBridge.previewSections(params) }.getOrNull()
             if (!previewSecs.isNullOrEmpty()) {
@@ -281,41 +304,63 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun loadTrack(item: AudioTrackItem, autoRemixImmediately: Boolean = true) {
-        viewModelScope.launch {
+        // Cancel any in-flight decode/render immediately so work never piles up!
+        val prevJob = activeWorkJob
+        val gen = ++workGeneration
+        runCatching { NativeDspBridge.nativeSessionRequestCancel() }
+        prevJob?.cancel()
+
+        activeWorkJob = viewModelScope.launch {
+            prevJob?.join()
+            if (gen != workGeneration) return@launch
+
             player.pause()
             _uiState.update {
                 it.copy(
                     activeTab = StudioTab.STUDIO,
                     isBusy = true,
-                    busyMessage = "Décodage streaming C++ & détection refrain / BPM…",
+                    busyMessage = "Décodage rapide & détection refrain / BPM…",
+                    busyProgress = 0.02f,
+                    canCancelBusy = true,
                     errorBanner = null,
                     statusBanner = null
                 )
             }
+            val decodeStartNs = System.nanoTime()
             try {
-                // Streams directly into C++ native heap (ZERO Java heap OOM!)
                 val analysis = withContext(Dispatchers.IO) {
+                    val onProg: (Int) -> Unit = { pct ->
+                        if (gen == workGeneration) {
+                            val stage = if (pct < 78) "Décodage MP3 haute vitesse ($pct %)…" else "Analyse BPM, Clé & Refrains ($pct %)…"
+                            _uiState.update { s ->
+                                s.copy(busyProgress = (pct / 100f).coerceIn(0.02f, 0.99f), busyMessage = stage)
+                            }
+                        }
+                    }
+                    val cancelCheck: () -> Boolean = { gen != workGeneration || !isActive }
+
                     when (item.sourceType) {
                         TrackSourceType.BUILTIN_DEMO ->
                             NativeDspBridge.loadDemoAndAnalyze(item.demoStyleIndex.coerceAtLeast(0), 30f)
                         TrackSourceType.DEEZER_PREVIEW -> {
                             val filePath = item.localFilePath
                                 ?: throw IllegalStateException("Chemin aperçu Deezer manquant.")
-                            AudioDecoder.decodeFileToNativeSession(File(filePath))
+                            AudioDecoder.decodeFileToNativeSession(File(filePath), onProg, cancelCheck)
                         }
                         TrackSourceType.LOCAL_MEDIASTORE, TrackSourceType.SAF_IMPORT -> {
                             val uriStr = item.uriString
                                 ?: throw IllegalStateException("URI audio manquant.")
-                            AudioDecoder.decodeUriToNativeSession(appContext, Uri.parse(uriStr))
+                            AudioDecoder.decodeUriToNativeSession(appContext, Uri.parse(uriStr), onProg, cancelCheck)
                         }
                     }
                 }
+
+                if (gen != workGeneration) return@launch
 
                 hasOriginalLoaded = analysis.totalFrames > 0
                 currentRemixFrames = 0
                 player.setSessionFrameCounts(originalFrames = analysis.totalFrames, remixFrames = 0)
 
-                // Reset track-specific manual drop/BPM overrides cleanly when loading a new song
                 val cleanParams = _uiState.value.params.copy(
                     sourceBpmOverride = 0f,
                     gridPhaseNudgeMs = 0f,
@@ -326,6 +371,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     customDrop2Frac = -1f
                 )
 
+                val decodeSec = (System.nanoTime() - decodeStartNs) / 1_000_000_000.0
                 _uiState.update {
                     it.copy(
                         loadedTrack = item.copy(durationMs = (analysis.durationSec * 1000f).toLong()),
@@ -335,22 +381,34 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                         waveformPeaks = analysis.waveformPeaks,
                         sectionMarkers = analysis.sections,
                         hasPendingChanges = false,
-                        isBusy = false,
-                        busyMessage = "",
-                        statusBanner = "Analysé : ${analysis.bpm.roundToInt()} BPM · Clé ${analysis.keyName} · Refrain 1 @ ${formatTimeSec(analysis.chorus1Sec)} (Mes. ${analysis.chorus1Bar})"
+                        isBusy = autoRemixImmediately,
+                        busyProgress = if (autoRemixImmediately) 0.05f else 0f,
+                        busyMessage = if (autoRemixImmediately) "Lancement du moteur Multi-Cœurs C++20…" else "",
+                        canCancelBusy = autoRemixImmediately,
+                        statusBanner = "Analysé en ${String.format(Locale.US, "%.2fs", decodeSec)} · ${analysis.bpm.roundToInt()} BPM · Clé ${analysis.keyName} · Refrain 1 @ ${formatTimeSec(analysis.chorus1Sec)}"
                     )
                 }
 
                 if (autoRemixImmediately) {
-                    renderCurrentRemix()
+                    runRemixInline(gen, analysis, cleanParams, _uiState.value.selectedPreset.name)
+                }
+            } catch (_: CancellationException) {
+                if (gen == workGeneration) {
+                    _uiState.update {
+                        it.copy(isBusy = false, busyMessage = "", busyProgress = 0f, canCancelBusy = false)
+                    }
                 }
             } catch (t: Throwable) {
-                _uiState.update {
-                    it.copy(
-                        isBusy = false,
-                        busyMessage = "",
-                        errorBanner = "Erreur chargement audio : ${t.message ?: "format non supporté"}"
-                    )
+                if (gen == workGeneration) {
+                    _uiState.update {
+                        it.copy(
+                            isBusy = false,
+                            busyMessage = "",
+                            busyProgress = 0f,
+                            canCancelBusy = false,
+                            errorBanner = "Erreur chargement audio : ${t.message ?: "format non supporté"}"
+                        )
+                    }
                 }
             }
         }
@@ -362,53 +420,106 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         val params = _uiState.value.params
         val presetName = _uiState.value.selectedPreset.name
 
-        viewModelScope.launch {
-            player.pause()
+        val prevJob = activeWorkJob
+        val gen = ++workGeneration
+        runCatching { NativeDspBridge.nativeSessionRequestCancel() }
+        prevJob?.cancel()
+
+        activeWorkJob = viewModelScope.launch {
+            prevJob?.join()
+            if (gen != workGeneration) return@launch
+            runRemixInline(gen, analysis, params, presetName)
+        }
+    }
+
+    private suspend fun runRemixInline(
+        gen: Long,
+        analysis: TrackAnalysis,
+        params: RemixParams,
+        presetName: String
+    ) {
+        player.pause()
+        _uiState.update {
+            it.copy(
+                isBusy = true,
+                busyMessage = "Mixage Multi-Cœurs ($presetName · ${params.targetBpm.roundToInt()} BPM)…",
+                busyProgress = 0.04f,
+                canCancelBusy = true,
+                errorBanner = null
+            )
+        }
+
+        // Poll lock-free native progress atomics every 60 ms for silky smooth live progress bar!
+        val progressPoller = viewModelScope.launch {
+            while (isActive && gen == workGeneration) {
+                delay(60L)
+                val pct = runCatching { NativeDspBridge.nativeSessionGetProgress() }.getOrDefault(0)
+                if (pct > 0 && gen == workGeneration) {
+                    val stage = when {
+                        pct < 38 -> "Recalage tempo multi-cœurs ($pct %)…"
+                        pct < 96 -> "Mixage voix, kicks & mastering ($pct %)…"
+                        else -> "Finalisation forme d'onde ($pct %)…"
+                    }
+                    _uiState.update { s ->
+                        if (s.isBusy) s.copy(busyProgress = (pct / 100f).coerceIn(0.04f, 0.99f), busyMessage = stage) else s
+                    }
+                }
+            }
+        }
+
+        try {
+            val rendered = withContext(Dispatchers.Default) {
+                NativeDspBridge.renderSessionRemix(params, analysis)
+            }
+            if (gen != workGeneration || rendered == null) return
+
+            currentRemixFrames = rendered.totalFrames
+            player.setRemixFrameCount(rendered.totalFrames, autoSwitchToRemix = true)
+
+            val secStr = String.format(Locale.US, "%.2fs", rendered.renderTimeMs / 1000f)
+            val spdStr = String.format(Locale.US, "×%.2f", rendered.tempoStretchRatio)
+            val rmsStr = String.format(Locale.US, "%.1f", rendered.rmsDb)
+
             _uiState.update {
                 it.copy(
-                    isBusy = true,
-                    busyMessage = "Rendu Turbo C++20 ($presetName · ${params.genreTheme.shortLabel} · ${params.targetBpm.roundToInt()} BPM)…",
-                    errorBanner = null,
-                    statusBanner = null
+                    remixResult = rendered,
+                    waveformPeaks = rendered.waveformPeaks,
+                    sectionMarkers = rendered.sections,
+                    hasPendingChanges = false,
+                    isBusy = false,
+                    busyMessage = "",
+                    busyProgress = 1f,
+                    canCancelBusy = false,
+                    statusBanner = "Rendu en $secStr · ${rendered.effectiveTargetBpm.roundToInt()} BPM (Vitesse $spdStr) · Clé ${rendered.keyName} · RMS $rmsStr dB"
                 )
             }
-            try {
-                // Zero-OOM native render with multi-threaded WSOLA cache: PCM stays in C++ native heap!
-                val rendered = withContext(Dispatchers.Default) {
-                    NativeDspBridge.renderSessionRemix(params, analysis)
-                }
-
-                currentRemixFrames = rendered.totalFrames
-                player.setRemixFrameCount(rendered.totalFrames, autoSwitchToRemix = true)
-
-                val secStr = String.format(Locale.US, "%.2fs", rendered.renderTimeMs / 1000f)
-                val spdStr = String.format(Locale.US, "×%.2f", rendered.tempoStretchRatio)
-                val rmsStr = String.format(Locale.US, "%.1f", rendered.rmsDb)
-
-                _uiState.update {
-                    it.copy(
-                        remixResult = rendered,
-                        waveformPeaks = rendered.waveformPeaks,
-                        sectionMarkers = rendered.sections,
-                        hasPendingChanges = false,
-                        isBusy = false,
-                        busyMessage = "",
-                        statusBanner = "Rendu en $secStr · ${rendered.effectiveTargetBpm.roundToInt()} BPM (Vitesse $spdStr) · Clé ${rendered.keyName} · RMS $rmsStr dB"
-                    )
-                }
-            } catch (t: Throwable) {
+        } catch (_: CancellationException) {
+            // Cancelled cleanly
+        } catch (t: Throwable) {
+            if (gen == workGeneration) {
                 _uiState.update {
                     it.copy(
                         isBusy = false,
                         busyMessage = "",
+                        busyProgress = 0f,
+                        canCancelBusy = false,
                         errorBanner = "Erreur rendu C++ : ${t.message}"
                     )
+                }
+            }
+        } finally {
+            progressPoller.cancel()
+            // Guaranteed safety net: NEVER leave the loading overlay stuck!
+            if (gen == workGeneration && _uiState.value.isBusy) {
+                _uiState.update {
+                    it.copy(isBusy = false, busyMessage = "", busyProgress = 0f, canCancelBusy = false)
                 }
             }
         }
     }
 
     fun auditionKick(kick: KickType) {
+        if (_uiState.value.isBusy) return
         val analysis = _uiState.value.analysis
         val params = _uiState.value.params
         val rootHz = analysis?.rootHz ?: 48.99f
@@ -452,6 +563,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun exportCurrentRemix(format: ExportFormat) {
+        if (_uiState.value.isBusy) return
         val track = _uiState.value.loadedTrack ?: return
         val remix = _uiState.value.remixResult
         if (remix == null || currentRemixFrames <= 0) {
@@ -467,6 +579,8 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                 it.copy(
                     isBusy = true,
                     busyMessage = "Export streaming ${format.badge} vers Music/ZaagForge/…",
+                    busyProgress = 0.5f,
+                    canCancelBusy = false,
                     errorBanner = null
                 )
             }
@@ -485,6 +599,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     it.copy(
                         isBusy = false,
                         busyMessage = "",
+                        busyProgress = 0f,
                         lastExportNotice = "Exporté : ${exported.displayName} (Music/ZaagForge/ · prêt dans StrikeCam !)"
                     )
                 }
@@ -493,6 +608,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     it.copy(
                         isBusy = false,
                         busyMessage = "",
+                        busyProgress = 0f,
                         errorBanner = "Échec export : ${t.message}"
                     )
                 }
@@ -535,12 +651,21 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun loadDeezerPreviewTrack(track: DeezerSearchTrack) {
-        viewModelScope.launch {
+        val prevJob = activeWorkJob
+        val gen = ++workGeneration
+        runCatching { NativeDspBridge.nativeSessionRequestCancel() }
+        prevJob?.cancel()
+
+        activeWorkJob = viewModelScope.launch {
+            prevJob?.join()
+            if (gen != workGeneration) return@launch
             _uiState.update {
                 it.copy(
                     activeTab = StudioTab.STUDIO,
                     isBusy = true,
                     busyMessage = "Téléchargement aperçu 30 s Deezer (${track.title})…",
+                    busyProgress = 0.15f,
+                    canCancelBusy = true,
                     errorBanner = null,
                     resolvedLink = null
                 )
@@ -549,6 +674,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                 val cachedFile = withContext(Dispatchers.IO) {
                     LibraryAndStreamingRepository.downloadPreviewToCache(appContext, track.previewUrl, track.id)
                 }
+                if (gen != workGeneration) return@launch
                 val item = AudioTrackItem(
                     id = "dz_${track.id}",
                     title = "${track.title} (Aperçu 30s)",
@@ -560,13 +686,21 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     coverUrl = track.coverUrl
                 )
                 loadTrack(item, autoRemixImmediately = true)
+            } catch (_: CancellationException) {
+                if (gen == workGeneration) {
+                    _uiState.update { it.copy(isBusy = false, busyMessage = "", busyProgress = 0f, canCancelBusy = false) }
+                }
             } catch (t: Throwable) {
-                _uiState.update {
-                    it.copy(
-                        isBusy = false,
-                        busyMessage = "",
-                        errorBanner = "Impossible de récupérer l'aperçu Deezer : ${t.message}"
-                    )
+                if (gen == workGeneration) {
+                    _uiState.update {
+                        it.copy(
+                            isBusy = false,
+                            busyMessage = "",
+                            busyProgress = 0f,
+                            canCancelBusy = false,
+                            errorBanner = "Impossible de récupérer l'aperçu Deezer : ${t.message}"
+                        )
+                    }
                 }
             }
         }
@@ -579,6 +713,8 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                 it.copy(
                     isBusy = true,
                     busyMessage = "Résolution du lien Spotify / SoundCloud / Deezer…",
+                    busyProgress = 0.35f,
+                    canCancelBusy = false,
                     errorBanner = null
                 )
             }
@@ -593,6 +729,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     it.copy(
                         isBusy = false,
                         busyMessage = "",
+                        busyProgress = 0f,
                         errorBanner = "Lien streaming non reconnu ou hors-ligne. Utilise un lien Spotify, SoundCloud ou Deezer."
                     )
                 }
@@ -601,6 +738,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     it.copy(
                         isBusy = false,
                         busyMessage = "",
+                        busyProgress = 0f,
                         localTracks = locals,
                         resolvedLink = resolved,
                         activeTab = StudioTab.LIBRARY
@@ -616,6 +754,9 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         super.onCleared()
+        workGeneration++
+        runCatching { NativeDspBridge.nativeSessionRequestCancel() }
+        activeWorkJob?.cancel()
         player.release()
         runCatching { NativeDspBridge.nativeSessionClear() }
     }

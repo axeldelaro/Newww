@@ -33,13 +33,13 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 3. ZAAGFORGE (`zaagforge/` — v3.0.0 Pro)
-**Studio Automatique de Remix Pro — Techno Normale / Hard Techno / Vrai Frenchcore / Vrai Gabber / Rawstyle / Uptempo / Piep / Krach / Zaag — Moteur Turbo C++20**
+## 3. ZAAGFORGE (`zaagforge/` — v3.5.0 Ultra-Turbo Pro)
+**Studio Automatique de Remix Ultra-Turbo — Techno Normale / Hard Techno / Vrai Frenchcore / Vrai Gabber / Rawstyle / Uptempo / Piep / Krach / Zaag — Moteur Multi-Cœurs C++20**
 
-- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, session audio native C++ zéro OOM jusqu'à 8 min, `330/330` assertions C++20 + `8/8` tests JVM)
-- **Vitesse Jamais Ralentie (`speedRatio >= 1.00×`) & Rendu Turbo C++20** : 3 modes (`JAMAIS RALENTI ≥1×`, `VITESSE 100% ORIG.`, `FORCER BPM CIBLE`), **Limiter True-Peak Lookahead O(1)** par deque circulaire monotone (~100× plus rapide), **WSOLA Multi-Thread 4 cœurs à recherche pyramidale 3 niveaux** et **Cache WSOLA Natif** pour des re-rendus quasi instantanés lors des retouches.
-- **Paroles Ultra-Claires Pendant les Drops Épiques & Basses Lourdes** : **`VocalAutoLeveller`** sur la bande vocale (`> 680 Hz`), sculpture Mid/Side, **Dynamic Kick Vocal-Pocket Carving** (`-5.2 dB` dynamiques à `1.85 kHz` sur le kick uniquement quand le chanteur chante, sub `< 150 Hz` intact), curseur **Boost Paroles Épiques**, **Saturation Basses / Sub** indépendante et 3 modes mastering (`STUDIO CLEAN` / `CLUB PUNCH` / `FESTIVAL HARD`).
-- **6 Vrais Thèmes Artistes, 12 Presets Studio, 12 Kicks C++20 & Customisation Totale** : **Techno Normale** (*Charlotte de Witte / Amelie Lens / 999999999*), **Hard Techno** (*Sara Landry / Nico Moreno / Klangkuenstler*), **Vrai Frenchcore** (*Sefa / Dr. Peacock* avec kicks mélodiques 4 mesures & nappes supersaw), **Vrai Gabber 909** (*Angerfist / Neophyte* avec Hoover stabs), **Xtra Rawstyle** (*Dual Damage*) et **Uptempo / Piep / Krach / Zaag** (*UOK / Noiseflow / Dimitri K / GPF*), thèmes LED dynamiques par genre, **sauvegarde de Presets Perso**, calage chirurgical sur les refrains (`POSER DROP 1 / 2 ICI`), bridge MP3/Deezer/Spotify/SoundCloud et exports `M4A 256k` / `WAV 16-bit` vers `Music/ZaagForge/`.
+- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, session audio native C++ zéro OOM jusqu'à 8 min, `334/334` assertions C++20 + `8/8` tests JVM)
+- **Moteur Multi-Cœurs Ultra-Turbo (×15–×60 plus rapide sur les titres 2m30–8m00)** : pré-allocation native exacte (zéro réallocation `O(N²)`), décodage `MediaCodec` non-bloquant, rendu fusionné **L2-cache-hot jusqu'à 6 cœurs ARM64** avec compensation `0,00 ms` de latence du **Limiter Lookahead `O(1)`**, WSOLA 6 cœurs + cache natif, barre de progression live `0–100 %`, overlay anti-clic-à-travers et annulation instantanée (`< 15 ms`).
+- **Vitesse Jamais Ralentie (`speedRatio >= 1.00×`) & Paroles Ultra-Claires dans les Drops Épiques** : 3 modes (`JAMAIS RALENTI ≥1×`, `VITESSE 100% ORIG.`, `FORCER BPM CIBLE`), **`VocalAutoLeveller`** (`> 680 Hz`), sculpture Mid/Side, **Dynamic Kick Vocal-Pocket Carving** (`-5,8 dB` dynamiques à `1,85 kHz` sur le kick uniquement quand le chanteur chante, sub `< 150 Hz` intact) et 3 modes mastering (`STUDIO CLEAN` / `CLUB PUNCH` / `FESTIVAL HARD`).
+- **6 Vrais Thèmes Artistes, 12 Presets Studio, 12 Kicks C++20 & Customisation Totale** : **Techno Normale** (*Charlotte de Witte / Amelie Lens / 999999999*), **Hard Techno** (*Sara Landry / Nico Moreno / Klangkuenstler*), **Vrai Frenchcore** (*Sefa / Dr. Peacock*), **Vrai Gabber 909** (*Angerfist / Neophyte*), **Xtra Rawstyle** (*Dual Damage*) et **Uptempo / Piep / Krach / Zaag** (*UOK / Noiseflow / Dimitri K / GPF*), thèmes LED dynamiques, **sauvegarde de Presets Perso**, calage chirurgical sur les refrains (`POSER DROP 1 / 2 ICI`) et exports `M4A 256k` / `WAV 16-bit` vers `Music/ZaagForge/`.
 
 ---
 

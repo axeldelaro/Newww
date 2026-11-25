@@ -29,7 +29,13 @@ object NativeDspBridge {
     }
 
     @JvmStatic
-    external fun nativeSessionBeginDecode(srcSampleRate: Int, srcChannels: Int)
+    external fun nativeSessionGetProgress(): Int
+
+    @JvmStatic
+    external fun nativeSessionRequestCancel()
+
+    @JvmStatic
+    external fun nativeSessionBeginDecode(srcSampleRate: Int, srcChannels: Int, estimatedFrames: Int)
 
     @JvmStatic
     external fun nativeSessionUpdateFormat(srcSampleRate: Int, srcChannels: Int)
@@ -155,7 +161,7 @@ object NativeDspBridge {
         return runCatching { parseSections(JSONArray(json)) }.getOrDefault(emptyList())
     }
 
-    fun renderSessionRemix(params: RemixParams, fallbackAnalysis: TrackAnalysis): RemixRenderResult {
+    fun renderSessionRemix(params: RemixParams, fallbackAnalysis: TrackAnalysis): RemixRenderResult? {
         val p = params.sanitized()
         val raw = nativeSessionRenderRemix(
             targetBpm = p.targetBpm,
@@ -191,7 +197,7 @@ object NativeDspBridge {
             drop2BarNudge = p.drop2BarNudge,
             customDrop1Frac = p.customDrop1Frac,
             customDrop2Frac = p.customDrop2Frac
-        ) ?: throw IllegalStateException("Échec du rendu natif C++.")
+        ) ?: return null
 
         val obj = JSONObject(raw.metadataJson)
         val sections = parseSections(obj.optJSONArray("sections"))

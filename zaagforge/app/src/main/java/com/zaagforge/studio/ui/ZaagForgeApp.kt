@@ -53,6 +53,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -159,134 +160,176 @@ fun ZaagForgeApp(viewModel: ZaagForgeViewModel) {
     var showLinkDialog by remember { mutableStateOf(false) }
     var showSavePresetDialog by remember { mutableStateOf(false) }
 
-    Scaffold(
-        containerColor = RackObsidian,
-        bottomBar = {
-            NavigationBar(
-                containerColor = RackCharcoal,
-                tonalElevation = 0.dp
-            ) {
-                val items = listOf(
-                    Triple(StudioTab.STUDIO, "STUDIO", Icons.Filled.GraphicEq),
-                    Triple(StudioTab.LIBRARY, "BIBLIO", Icons.Filled.LibraryMusic),
-                    Triple(StudioTab.EXPORTS, "EXPORTS", Icons.Filled.Download)
-                )
-                items.forEach { (tab, title, icon) ->
-                    val selected = state.activeTab == tab
-                    NavigationBarItem(
-                        selected = selected,
-                        onClick = { viewModel.selectTab(tab) },
-                        icon = { Icon(icon, contentDescription = title) },
-                        label = { Text(title, style = MaterialTheme.typography.labelSmall) },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = themeAccent,
-                            selectedTextColor = themeAccent,
-                            unselectedIconColor = SteelGray,
-                            unselectedTextColor = SteelGray,
-                            indicatorColor = themeDimBg
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = RackObsidian,
+            bottomBar = {
+                NavigationBar(
+                    containerColor = RackCharcoal,
+                    tonalElevation = 0.dp
+                ) {
+                    val items = listOf(
+                        Triple(StudioTab.STUDIO, "STUDIO", Icons.Filled.GraphicEq),
+                        Triple(StudioTab.LIBRARY, "BIBLIO", Icons.Filled.LibraryMusic),
+                        Triple(StudioTab.EXPORTS, "EXPORTS", Icons.Filled.Download)
+                    )
+                    items.forEach { (tab, title, icon) ->
+                        val selected = state.activeTab == tab
+                        NavigationBarItem(
+                            selected = selected,
+                            onClick = { viewModel.selectTab(tab) },
+                            icon = { Icon(icon, contentDescription = title) },
+                            label = { Text(title, style = MaterialTheme.typography.labelSmall) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = themeAccent,
+                                selectedTextColor = themeAccent,
+                                unselectedIconColor = SteelGray,
+                                unselectedTextColor = SteelGray,
+                                indicatorColor = themeDimBg
+                            )
                         )
+                    }
+                }
+            }
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .background(RackObsidian)
+            ) {
+                when (state.activeTab) {
+                    StudioTab.STUDIO -> StudioScreen(
+                        state = state,
+                        themeAccent = themeAccent,
+                        themeDimBg = themeDimBg,
+                        isPlaying = isPlaying,
+                        progress = progress,
+                        isRemixActive = isRemixActive,
+                        meter = meter,
+                        onImportMp3 = { audioPicker.launch(arrayOf("audio/*")) },
+                        onOpenLinkDialog = { showLinkDialog = true },
+                        onOpenSavePresetDialog = { showSavePresetDialog = true },
+                        onSelectGenreFilter = { viewModel.selectGenreFilter(it) },
+                        onSelectPreset = { viewModel.selectPreset(it, renderNow = true) },
+                        onDeleteCustomPreset = { viewModel.deleteCustomPreset(it) },
+                        onRenderRemix = { viewModel.renderCurrentRemix() },
+                        onTogglePlay = { viewModel.togglePlayPause() },
+                        onToggleAb = { viewModel.toggleAbSource() },
+                        onSeek = { viewModel.seekToFraction(it) },
+                        onJumpSection = { viewModel.jumpToSection(it) },
+                        onAuditionKick = { viewModel.auditionKick(it) },
+                        onToggleCutControls = { viewModel.toggleCutControls() },
+                        onToggleMixControls = { viewModel.toggleMixControls() },
+                        onToggleProTweaks = { viewModel.toggleProTweaks() },
+                        onPlaceDrop1Here = { viewModel.placeDrop1AtPlayhead() },
+                        onPlaceDrop2Here = { viewModel.placeDrop2AtPlayhead() },
+                        onResetTimingAuto = { viewModel.resetTimingToAuto() },
+                        onScaleSourceBpm = { viewModel.scaleDetectedSourceBpm(it) },
+                        onUpdateParams = { viewModel.updateParams(it) },
+                        onExport = { viewModel.exportCurrentRemix(it) }
+                    )
+
+                    StudioTab.LIBRARY -> LibraryScreen(
+                        state = state,
+                        themeAccent = themeAccent,
+                        hasAudioPermission = hasAudioPermission,
+                        onRequestPermission = { permLauncher.launch(readPerm) },
+                        onImportSaf = { audioPicker.launch(arrayOf("audio/*")) },
+                        onOpenLinkDialog = { showLinkDialog = true },
+                        onSelectTrack = { viewModel.loadTrack(it, autoRemixImmediately = true) },
+                        onDeezerQueryChange = { viewModel.onDeezerQueryChange(it) },
+                        onSearchDeezer = { viewModel.searchDeezerNow() },
+                        onSelectDeezerTrack = { viewModel.loadDeezerPreviewTrack(it) },
+                        onDismissResolved = { viewModel.dismissResolvedLink() }
+                    )
+
+                    StudioTab.EXPORTS -> ExportsScreen(
+                        exports = state.exportedRemixes,
+                        onRefresh = { viewModel.refreshExports() },
+                        onPlayExport = { viewModel.playExportedFile(it) },
+                        onShareExport = { exp ->
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = exp.format.mimeType
+                                putExtra(Intent.EXTRA_STREAM, Uri.parse(exp.uriString))
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(intent, "Partager ${exp.displayName}"))
+                        }
                     )
                 }
             }
         }
-    ) { innerPadding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .background(RackObsidian)
-        ) {
-            when (state.activeTab) {
-                StudioTab.STUDIO -> StudioScreen(
-                    state = state,
-                    themeAccent = themeAccent,
-                    themeDimBg = themeDimBg,
-                    isPlaying = isPlaying,
-                    progress = progress,
-                    isRemixActive = isRemixActive,
-                    meter = meter,
-                    onImportMp3 = { audioPicker.launch(arrayOf("audio/*")) },
-                    onOpenLinkDialog = { showLinkDialog = true },
-                    onOpenSavePresetDialog = { showSavePresetDialog = true },
-                    onSelectGenreFilter = { viewModel.selectGenreFilter(it) },
-                    onSelectPreset = { viewModel.selectPreset(it, renderNow = true) },
-                    onDeleteCustomPreset = { viewModel.deleteCustomPreset(it) },
-                    onRenderRemix = { viewModel.renderCurrentRemix() },
-                    onTogglePlay = { viewModel.togglePlayPause() },
-                    onToggleAb = { viewModel.toggleAbSource() },
-                    onSeek = { viewModel.seekToFraction(it) },
-                    onJumpSection = { viewModel.jumpToSection(it) },
-                    onAuditionKick = { viewModel.auditionKick(it) },
-                    onToggleCutControls = { viewModel.toggleCutControls() },
-                    onToggleMixControls = { viewModel.toggleMixControls() },
-                    onToggleProTweaks = { viewModel.toggleProTweaks() },
-                    onPlaceDrop1Here = { viewModel.placeDrop1AtPlayhead() },
-                    onPlaceDrop2Here = { viewModel.placeDrop2AtPlayhead() },
-                    onResetTimingAuto = { viewModel.resetTimingToAuto() },
-                    onScaleSourceBpm = { viewModel.scaleDetectedSourceBpm(it) },
-                    onUpdateParams = { viewModel.updateParams(it) },
-                    onExport = { viewModel.exportCurrentRemix(it) }
-                )
 
-                StudioTab.LIBRARY -> LibraryScreen(
-                    state = state,
-                    themeAccent = themeAccent,
-                    hasAudioPermission = hasAudioPermission,
-                    onRequestPermission = { permLauncher.launch(readPerm) },
-                    onImportSaf = { audioPicker.launch(arrayOf("audio/*")) },
-                    onOpenLinkDialog = { showLinkDialog = true },
-                    onSelectTrack = { viewModel.loadTrack(it, autoRemixImmediately = true) },
-                    onDeezerQueryChange = { viewModel.onDeezerQueryChange(it) },
-                    onSearchDeezer = { viewModel.searchDeezerNow() },
-                    onSelectDeezerTrack = { viewModel.loadDeezerPreviewTrack(it) },
-                    onDismissResolved = { viewModel.dismissResolvedLink() }
-                )
-
-                StudioTab.EXPORTS -> ExportsScreen(
-                    exports = state.exportedRemixes,
-                    onRefresh = { viewModel.refreshExports() },
-                    onPlayExport = { viewModel.playExportedFile(it) },
-                    onShareExport = { exp ->
-                        val intent = Intent(Intent.ACTION_SEND).apply {
-                            type = exp.format.mimeType
-                            putExtra(Intent.EXTRA_STREAM, Uri.parse(exp.uriString))
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (state.isBusy) {
+            // Full-screen touch-blocking overlay above Scaffold + bottomBar: ZERO taps leak through!
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(RackObsidian.copy(alpha = 0.88f))
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent().changes.forEach { it.consume() }
+                            }
                         }
-                        context.startActivity(Intent.createChooser(intent, "Partager ${exp.displayName}"))
-                    }
-                )
-            }
-
-            if (state.isBusy) {
-                Box(
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = RackCharcoal,
+                    border = BorderStroke(1.5.dp, themeAccent),
                     modifier = Modifier
-                        .fillMaxSize()
-                        .background(RackObsidian.copy(alpha = 0.84f)),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .padding(horizontal = 28.dp)
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = RackCharcoal,
-                        border = BorderStroke(1.dp, themeAccent)
+                    Column(
+                        modifier = Modifier.padding(horizontal = 22.dp, vertical = 20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            CircularProgressIndicator(color = themeAccent, strokeWidth = 3.dp)
-                            Spacer(Modifier.height(14.dp))
                             Text(
-                                text = "MOTEUR TURBO C++20 ZAAGFORGE v3",
+                                text = "MOTEUR ULTRA-TURBO C++20",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = themeAccent
                             )
-                            Spacer(Modifier.height(4.dp))
                             Text(
-                                text = state.busyMessage,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = CrispWhite,
-                                textAlign = TextAlign.Center
+                                text = "${(state.busyProgress * 100f).roundToInt()} %",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = CrispWhite
                             )
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { state.busyProgress.coerceIn(0.02f, 1f) },
+                            color = themeAccent,
+                            trackColor = RackMetal,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            text = state.busyMessage,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = CrispWhite,
+                            textAlign = TextAlign.Center
+                        )
+                        if (state.canCancelBusy) {
+                            Spacer(Modifier.height(14.dp))
+                            OutlinedButton(
+                                onClick = { viewModel.cancelActiveWork() },
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, RackBorder)
+                            ) {
+                                Text("ANNULER", style = MaterialTheme.typography.labelMedium, color = SteelGray)
+                            }
                         }
                     }
                 }
@@ -364,7 +407,7 @@ private fun StudioScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "ZAAGFORGE // v3 PRO",
+                    text = "ZAAGFORGE // v3.5 TURBO",
                     style = MaterialTheme.typography.headlineMedium,
                     color = CrispWhite
                 )

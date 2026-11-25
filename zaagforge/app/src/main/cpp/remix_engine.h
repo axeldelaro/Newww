@@ -3,6 +3,7 @@
 #include "hardcore_kicks.h"
 #include "music_analyzer.h"
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,7 @@ enum class RemixGenreTheme : int {
 };
 
 struct RemixConfig {
-    float targetBpm = 210.0f;           // 126..240 BPM (now supports 132-145 Normal Techno too!)
+    float targetBpm = 210.0f;           // 124..240 BPM (Techno 124-146 -> Uptempo/Piep 200-240)
     RemixGenreTheme genreTheme = RemixGenreTheme::UPTEMPO_ZAAG;
     TempoSyncMode tempoSyncMode = TempoSyncMode::NEVER_SLOW;
     KickType drop1Kick = KickType::PIEP_UOK;
@@ -34,9 +35,9 @@ struct RemixConfig {
     float bassSaturation = 0.34f;       // 0..1 dedicated sub/bass saturation (clean by default!)
     float originalMix = 0.86f;          // 0..1 original track vocal/melody level in drops
     float vocalClarity = 0.84f;         // 0..1 Mid/Side vocal focus & de-mud presence boost
-    float epicVocalBoost = 0.82f;       // 0..1 dynamic vocal auto-leveller + kick vocal-pocket carving!
-    float vocalSidechain = 0.24f;       // 0..1 gentle sidechain ducking on vocal band (> 650 Hz)
-    float kickLevel = 0.80f;            // 0.4..1.2 kick bus level relative to song
+    float epicVocalBoost = 0.84f;       // 0..1 dynamic vocal auto-leveller + kick vocal-pocket carving!
+    float vocalSidechain = 0.24f;       // 0..1 gentle sidechain ducking on vocal band (> 680 Hz)
+    float kickLevel = 0.80f;            // 0.35..1.25 kick bus level relative to song
     float bassCutHz = 195.0f;           // 110..340 Hz surgical LR4 crossover for original track
     float synthLayerAmount = 0.55f;     // 0..1 Euphoric Frenchcore chords / Acid 303 / Gabber Hoover stabs
     float percGrooveAmount = 0.65f;     // 0..1 909 Claps, 16th Hats, Rides groove level
@@ -80,6 +81,7 @@ struct RemixOutput {
     float peakDb = -0.2f;
     float rmsDb = -8.5f;
     float renderTimeMs = 0.0f;
+    bool cancelled = false;
 };
 
 class RemixEngine {
@@ -98,27 +100,37 @@ public:
     static std::pair<float, float> computeMusicalTempoSync(float sourceBpm, float targetBpm);
 
     /**
-     * High-speed multi-threaded C++20 WSOLA time-stretcher (stereo 44.1 kHz).
+     * High-speed multi-threaded C++20 WSOLA time-stretcher (stereo 44.1 kHz)
+     * with live progress (0..progressSpan) and cooperative cancellation.
      */
     static std::vector<float> wsolaTimeStretch(
         const float* stereoIn,
         size_t inFrames,
-        float timeScale
+        float timeScale,
+        std::atomic<int>* progressPct = nullptr,
+        int progressStart = 0,
+        int progressEnd = 35,
+        const std::atomic<bool>* cancelFlag = nullptr
     );
 
     /**
-     * Combined WSOLA time-stretch + independent pitch shift (semitones in -5..+7).
+     * Combined WSOLA time-stretch + parallel cubic pitch shift (semitones in -5..+7).
      */
     static std::vector<float> timeStretchAndPitchShift(
         const float* stereoIn,
         size_t inFrames,
         float timeScale,
-        float pitchSemitones
+        float pitchSemitones,
+        std::atomic<int>* progressPct = nullptr,
+        int progressStart = 0,
+        int progressEnd = 35,
+        const std::atomic<bool>* cancelFlag = nullptr
     );
 
     /**
-     * Full Studio-Grade Remix Renderer with optional pre-warped cache pointer
-     * (when preWarpedPcm != nullptr, skips WSOLA completely for < 0.25s instant re-renders!).
+     * Ultra-Fast Fused Multi-Threaded L2-Cache-Hot Studio Remix Renderer!
+     * Runs vocal split + dynamic vocal carving + genre kicks/909/303/euphoric + 3-band OTT +
+     * zero-latency-compensated O(1) LookaheadLimiter in ONE fused parallel pass across CPU cores!
      */
     static RemixOutput renderRemix(
         const float* stereoPcm,
@@ -126,7 +138,10 @@ public:
         const AnalysisResult& analysis,
         const RemixConfig& config,
         const float* preWarpedPcm = nullptr,
-        size_t preWarpedFrames = 0
+        size_t preWarpedFrames = 0,
+        std::atomic<int>* progressPct = nullptr,
+        int progressStart = 35,
+        const std::atomic<bool>* cancelFlag = nullptr
     );
 };
 

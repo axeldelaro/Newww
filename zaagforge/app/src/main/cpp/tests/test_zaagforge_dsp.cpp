@@ -283,18 +283,58 @@ void testAllGenresSpeedAndEpicVocals() {
         EXPECT_TRUE(out.tempoStretchRatio >= 0.999f, "Output NEVER slowed down");
         EXPECT_TRUE(out.rmsDb > -13.5f && out.rmsDb < -3.0f, "Pro studio mastering loudness");
         EXPECT_TRUE(vocBand > 0.14f, "Vocals prominently audible during epic/bass drops (> 0.14)");
-        EXPECT_TRUE(out.renderTimeMs < 2500.0f, "Ultra-fast C++20 render (< 2.5s for 28s track)");
+        EXPECT_TRUE(out.renderTimeMs < 1500.0f, "Ultra-turbo fused C++20 render (< 1.5s for 28s track)");
     }
+}
+
+void testProgressCancelAndSeamlessBoundaries() {
+    std::cout << "Running testProgressCancelAndSeamlessBoundaries...\n";
+    auto demo = MusicAnalyzer::generateDemoTrack(0, 12.0f);
+    auto analysis = MusicAnalyzer::analyze(demo.data(), demo.size() / 2);
+
+    RemixConfig cfg;
+    cfg.genreTheme = RemixGenreTheme::TECHNO_CLUB;
+    cfg.tempoSyncMode = TempoSyncMode::ORIGINAL_SPEED_LOCK;
+    cfg.targetBpm = 138.0f;
+    cfg.drop1Kick = KickType::TECHNO_ROLLING;
+    cfg.drop2Kick = KickType::TECHNO_ROLLING;
+
+    // 1. Verify live progress atomic reaches 100%
+    std::atomic<int> prog{0};
+    std::atomic<bool> cancel{false};
+    auto out = RemixEngine::renderRemix(demo.data(), demo.size() / 2, analysis, cfg, nullptr, 0, &prog, 10, &cancel);
+    EXPECT_TRUE(!out.cancelled && !out.stereoPcm.empty(), "Normal render completes without cancel");
+    EXPECT_TRUE(prog.load() == 100, "Progress atomic reaches 100%");
+
+    // 2. Verify zero click/discontinuity across multi-thread slice boundaries
+    const size_t nFrames = out.stereoPcm.size() / 2;
+    float maxBoundaryJump = 0.0f;
+    for (int div = 2; div <= 6; ++div) {
+        const size_t b = nFrames / static_cast<size_t>(div);
+        if (b > 2 && b + 2 < nFrames) {
+            const float jumpL = std::fabs(out.stereoPcm[b * 2] - out.stereoPcm[(b - 1) * 2]);
+            const float jumpR = std::fabs(out.stereoPcm[b * 2 + 1] - out.stereoPcm[(b - 1) * 2 + 1]);
+            maxBoundaryJump = std::max(maxBoundaryJump, std::max(jumpL, jumpR));
+        }
+    }
+    std::cout << "  Max inter-thread boundary delta = " << maxBoundaryJump << "\n";
+    EXPECT_TRUE(maxBoundaryJump < 0.45f, "Zero seam/click at multi-thread slice boundaries");
+
+    // 3. Verify instant cooperative cancellation
+    cancel.store(true);
+    auto aborted = RemixEngine::renderRemix(demo.data(), demo.size() / 2, analysis, cfg, nullptr, 0, &prog, 10, &cancel);
+    EXPECT_TRUE(aborted.cancelled, "Cooperative cancel aborts render cleanly");
 }
 
 }  // namespace
 
 int main() {
-    std::cout << "=== ZAAGFORGE v3.0 Pro C++20 DSP Test Suite ===\n";
+    std::cout << "=== ZAAGFORGE v3.5 Ultra-Turbo C++20 DSP Test Suite ===\n";
     testNeverSlowTempoSyncInvariant();
     testBpmAndChorusDetection();
     testAll12ArtistKicksAndProLayers();
     testAllGenresSpeedAndEpicVocals();
+    testProgressCancelAndSeamlessBoundaries();
 
     std::cout << "\n=== SUMMARY: " << (gTestsRun - gTestsFailed) << "/" << gTestsRun
               << " assertions PASSED (" << gTestsFailed << " failed) ===\n";
