@@ -3,7 +3,9 @@ package com.zaagforge.studio
 import com.zaagforge.studio.audio.AudioDecoder
 import com.zaagforge.studio.audio.AudioExporter
 import com.zaagforge.studio.model.AudioTrackItem
+import com.zaagforge.studio.model.DropAlignmentMode
 import com.zaagforge.studio.model.KickType
+import com.zaagforge.studio.model.MasterMode
 import com.zaagforge.studio.model.RemixParams
 import com.zaagforge.studio.model.StreamingProvider
 import com.zaagforge.studio.model.StudioPresets
@@ -20,17 +22,20 @@ import java.nio.ByteOrder
 class ZaagForgeUnitTest {
 
     @Test
-    fun presets_allEightPresetsValidAndDistinct() {
+    fun presets_allEightPresetsValidWithCleanSubAndVocalClarityDefaults() {
         assertEquals(8, StudioPresets.all.size)
         val ids = StudioPresets.all.map { it.id }.toSet()
         assertEquals(8, ids.size)
         StudioPresets.all.forEach { preset ->
             assertTrue("${preset.id} BPM out of bounds", preset.params.targetBpm in 150f..240f)
             assertTrue("${preset.id} drive out of bounds", preset.params.drive in 0f..1f)
-            assertTrue("${preset.id} kickSwitchBars invalid", preset.params.kickSwitchBars in listOf(4, 8))
+            assertTrue("${preset.id} bassSaturation clean default", preset.params.bassSaturation in 0.20f..0.55f)
+            assertTrue("${preset.id} vocalClarity high default", preset.params.vocalClarity in 0.70f..0.95f)
+            assertTrue("${preset.id} kickSwitchBars invalid", preset.params.kickSwitchBars in listOf(4, 8, 16))
         }
         val uok = StudioPresets.byId("uok_piep_madness")
         assertEquals(KickType.PIEP_UOK, uok.params.drop1Kick)
+        assertEquals(MasterMode.STUDIO_CLEAN, uok.params.masterMode)
         assertTrue(uok.params.enableFakeDrop)
         assertEquals(5, uok.params.vocalPitchSemitones)
 
@@ -40,23 +45,63 @@ class ZaagForgeUnitTest {
     }
 
     @Test
-    fun remixParams_sanitizedClampsExtremeValues() {
+    fun remixParams_sanitizedClampsAllMixAndTimingControls() {
         val raw = RemixParams(
             targetBpm = 999f,
             drive = 2.5f,
             zaagAggression = -1f,
+            bassSaturation = 3.0f,
             originalMix = 3f,
+            vocalClarity = -0.5f,
+            vocalSidechain = 2.0f,
+            kickLevel = 4.0f,
+            bassCutHz = 50f,
             vocalPitchSemitones = 20,
             stutterAmount = -0.4f,
-            kickSwitchBars = 3
+            kickSwitchBars = 3,
+            gridPhaseNudgeMs = 600f,
+            gridBeatShift = 5,
+            buildupBars = 7,
+            drop1BarNudge = 50,
+            drop2BarNudge = -50
         ).sanitized()
         assertEquals(240f, raw.targetBpm, 0.01f)
         assertEquals(1f, raw.drive, 0.01f)
         assertEquals(0f, raw.zaagAggression, 0.01f)
+        assertEquals(1f, raw.bassSaturation, 0.01f)
         assertEquals(1f, raw.originalMix, 0.01f)
+        assertEquals(0f, raw.vocalClarity, 0.01f)
+        assertEquals(0.85f, raw.vocalSidechain, 0.01f)
+        assertEquals(1.2f, raw.kickLevel, 0.01f)
+        assertEquals(110f, raw.bassCutHz, 0.01f)
         assertEquals(7, raw.vocalPitchSemitones)
         assertEquals(0f, raw.stutterAmount, 0.01f)
         assertEquals(4, raw.kickSwitchBars)
+        assertEquals(250f, raw.gridPhaseNudgeMs, 0.01f)
+        assertEquals(1, raw.gridBeatShift)
+        assertEquals(4, raw.buildupBars)
+        assertEquals(16, raw.drop1BarNudge)
+        assertEquals(-16, raw.drop2BarNudge)
+    }
+
+    @Test
+    fun remixParams_withPresetStylePreservesSurgicalTrackAlignment() {
+        val calibrated = RemixParams(
+            dropMode = DropAlignmentMode.DOUBLE_DROP,
+            buildupBars = 8,
+            drop1BarNudge = 4,
+            customDrop1Frac = 0.36f,
+            gridBeatShift = 2,
+            gridPhaseNudgeMs = -35f
+        )
+        val switched = calibrated.withPresetStyle(StudioPresets.byId("noiseflow_krach").params)
+        assertEquals(KickType.KRACH_NOISEFLOW, switched.drop1Kick)
+        assertEquals(DropAlignmentMode.DOUBLE_DROP, switched.dropMode)
+        assertEquals(8, switched.buildupBars)
+        assertEquals(4, switched.drop1BarNudge)
+        assertEquals(0.36f, switched.customDrop1Frac, 0.001f)
+        assertEquals(2, switched.gridBeatShift)
+        assertEquals(-35f, switched.gridPhaseNudgeMs, 0.01f)
     }
 
     @Test
@@ -104,7 +149,7 @@ class ZaagForgeUnitTest {
 
     @Test
     fun wavBuilder_writesValidRiffHeaderAndPcm16Payload() {
-        val pcm = floatArrayOf(0f, 0f, 0.5f, -0.5f, 1.0f, -1.0f) // 3 stereo frames
+        val pcm = floatArrayOf(0f, 0f, 0.5f, -0.5f, 1.0f, -1.0f)
         val bytes = AudioExporter.buildWavBytes(pcm, 44100)
         assertEquals(44 + 6 * 2, bytes.size)
 

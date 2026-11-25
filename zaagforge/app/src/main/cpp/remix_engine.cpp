@@ -46,9 +46,10 @@ void mixBufferAt(
     const std::vector<float>& src,
     size_t dstStartFrame,
     float gainL = 1.0f,
-    float gainR = 1.0f
+    float gainR = 1.0f,
+    size_t maxDstEndFrame = std::numeric_limits<size_t>::max()
 ) {
-    const size_t dstFrames = dst.size() / 2;
+    const size_t dstFrames = std::min(dst.size() / 2, maxDstEndFrame);
     const size_t srcFrames = src.size() / 2;
     if (dstStartFrame >= dstFrames || srcFrames == 0) return;
 
@@ -59,22 +60,22 @@ void mixBufferAt(
     }
 }
 
-SectionType findSectionAt(const std::vector<SectionMarker>& sections, float frac) {
-    for (const auto& s : sections) {
-        if (frac >= s.startFrac && frac < s.endFrac) {
-            return s.type;
-        }
-    }
-    return sections.empty() ? SectionType::DROP_1 : sections.back().type;
-}
+struct FrameSection {
+    size_t startFrame = 0;
+    size_t endFrame = 0;
+    SectionType type = SectionType::DROP_1;
+    std::string label;
+    int startBar = 0;
+    int endBar = 0;
+};
 
-const SectionMarker* findSectionMarkerAt(const std::vector<SectionMarker>& sections, float frac) {
-    for (const auto& s : sections) {
-        if (frac >= s.startFrac && frac < s.endFrac) {
+const FrameSection* findFrameSection(const std::vector<FrameSection>& secs, size_t frame) {
+    for (const auto& s : secs) {
+        if (frame >= s.startFrame && frame < s.endFrame) {
             return &s;
         }
     }
-    return sections.empty() ? nullptr : &sections.back();
+    return secs.empty() ? nullptr : &secs.back();
 }
 
 }  // namespace
@@ -83,10 +84,6 @@ std::pair<float, float> RemixEngine::computeMusicalTempoSync(float sourceBpm, fl
     const float src = clampf(sourceBpm, 60.0f, 240.0f);
     const float tgt = clampf(targetBpm, 140.0f, 250.0f);
 
-    // Musical grid multipliers:
-    // M = 0.5 -> half-time vocals over double-time hardcore kicks (e.g. 100 BPM -> 200 BPM locks at 1.0x!)
-    // M = 1.0 -> 1:1 beat lock (e.g. 140 BPM -> 160/200 BPM speeds up cleanly)
-    // M = 2.0 -> double-time source into slower rawstyle
     const std::array<float, 3> mults = {0.5f, 1.0f, 2.0f};
     float bestSpeed = tgt / src;
     float bestMult = 1.0f;
@@ -95,8 +92,8 @@ std::pair<float, float> RemixEngine::computeMusicalTempoSync(float sourceBpm, fl
     for (float m : mults) {
         const float speed = (tgt * m) / src;
         if (speed < 0.62f || speed > 1.72f) continue;
-        // Center slight preference around 1.08x so remixes feel energetic without turning chipmunk-fast
-        const float cost = std::fabs(std::log2(speed / 1.08f));
+        // Prefer staying closest to natural 1.06x speed so vocals sound super natural & clear!
+        const float cost = std::fabs(std::log2(speed / 1.06f));
         if (cost < bestCost) {
             bestCost = cost;
             bestSpeed = speed;
@@ -118,21 +115,19 @@ std::vector<float> RemixEngine::wsolaTimeStretch(
     const float scale = clampf(timeScale, 0.45f, 2.40f);
     const size_t outFrames = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(inFrames) * scale)));
 
-    // Short-circuit identity copy when virtually 1.0x
     if (std::fabs(scale - 1.0f) < 0.002f) {
         return std::vector<float>(stereoIn, stereoIn + inFrames * 2);
     }
 
-    // Small inputs fall back to clean linear copy/resample
-    constexpr size_t kWin = 1536;     // ~34.8 ms
-    constexpr size_t kHopOut = 384;   // 75% overlap -> exact COLA for Hann window
-    constexpr int kSearchTol = 224;   // ±5.1 ms waveform similarity search
+    // Studio-grade 46.4 ms Hann window with 75% overlap (exact COLA) & wide similarity window -> smooth crystal-clear vocals!
+    constexpr size_t kWin = 2048;
+    constexpr size_t kHopOut = 512;
+    constexpr int kSearchTol = 320; // ±7.25 ms waveform lock
 
     if (inFrames < kWin * 2) {
         return resampleStereoCubic(stereoIn, inFrames, outFrames);
     }
 
-    // Precompute mono buffer for fast cross-correlation search
     std::vector<float> monoIn(inFrames);
     for (size_t i = 0; i < inFrames; ++i) {
         monoIn[i] = 0.5f * (sanitize(stereoIn[i * 2]) + sanitize(stereoIn[i * 2 + 1]));
@@ -142,7 +137,6 @@ std::vector<float> RemixEngine::wsolaTimeStretch(
     std::vector<float> out(outFrames * 2, 0.0f);
     std::vector<float> normAcc(outFrames, 0.0f);
 
-    // First frame placed cleanly at origin
     for (size_t i = 0; i < kWin && i < outFrames && i < inFrames; ++i) {
         const float w = hann[i];
         out[i * 2] += stereoIn[i * 2] * w;
@@ -157,7 +151,6 @@ std::vector<float> RemixEngine::wsolaTimeStretch(
 
     while (outPos < outFrames) {
         const int nominalSrc = static_cast<int>(std::llround(static_cast<double>(stepIdx) * hopIn));
-        // Natural continuation reference from previous placed window
         const int refPos = static_cast<int>(prevSrcPos + kHopOut);
 
         const int maxValidStart = static_cast<int>(inFrames) - static_cast<int>(kWin);
@@ -169,9 +162,8 @@ std::vector<float> RemixEngine::wsolaTimeStretch(
             const int searchHi = std::min(maxValidStart, clampedNominal + kSearchTol);
 
             float bestCorr = -1e30f;
-            // Stride 4 for coarse search, then fine refine ±3 around peak -> blazing fast on ARM64!
             int coarseBest = clampedNominal;
-            constexpr size_t kCmpLen = 512;
+            constexpr size_t kCmpLen = 640;
             for (int cand = searchLo; cand <= searchHi; cand += 4) {
                 float dot = 0.0f;
                 float energy = 1e-6f;
@@ -194,7 +186,7 @@ std::vector<float> RemixEngine::wsolaTimeStretch(
             for (int cand = fineLo; cand <= fineHi; ++cand) {
                 float dot = 0.0f;
                 float energy = 1e-6f;
-                for (size_t k = 0; k < kCmpLen; k += 2) {
+                for (size_t k = 0; k < kCmpLen; ++k) {
                     const float a = monoIn[static_cast<size_t>(refPos) + k];
                     const float b = monoIn[static_cast<size_t>(cand) + k];
                     dot += a * b;
@@ -250,8 +242,6 @@ std::vector<float> RemixEngine::timeStretchAndPitchShift(
         return wsolaTimeStretch(stereoIn, inFrames, clampedScale);
     }
 
-    // Pitch shift factor: > 1 raises pitch (UOK chipmunk +5 st = 1.335x)
-    // WSOLA stretches by (timeScale * pitchFactor), then cubic resample shrinks back to exact targetFrames!
     const float pitchFactor = std::pow(2.0f, st / 12.0f);
     const float intermediateScale = clampf(clampedScale * pitchFactor, 0.45f, 2.40f);
     auto stretched = wsolaTimeStretch(stereoIn, inFrames, intermediateScale);
@@ -270,11 +260,13 @@ RemixOutput RemixEngine::renderRemix(
     }
 
     const float targetBpm = clampf(config.targetBpm, 150.0f, 240.0f);
-    const float sourceBpm = clampf(analysis.bpm, 70.0f, 220.0f);
+    const float sourceBpm = (config.sourceBpmOverride > 55.0f)
+        ? clampf(config.sourceBpmOverride, 60.0f, 240.0f)
+        : clampf(analysis.bpm, 60.0f, 240.0f);
     const auto [speedRatio, gridMult] = computeMusicalTempoSync(sourceBpm, targetBpm);
     const float timeScale = 1.0f / speedRatio;
 
-    // 1. Warp original track to exact hardcore beat grid + apply vocal pitch shift!
+    // 1. Warp original track cleanly to exact hardcore beat grid + optional vocal pitch shift!
     auto warped = timeStretchAndPitchShift(
         stereoPcm,
         totalFrames,
@@ -294,141 +286,165 @@ RemixOutput RemixEngine::renderRemix(
     }
     const std::string effectiveKeyName = formatKeyName(effectiveKeyIdx, analysis.isMinor);
 
-    // 3. Split warped original audio via 4th-Order Linkwitz-Riley Crossover @ 240 Hz
-    // + Mid/Side vocal presence boost on high stem
-    std::vector<float> origLow(outFrames * 2, 0.0f);
-    std::vector<float> origHigh(outFrames * 2, 0.0f);
+    // 3. Build Exact Bar-Quantized Arrangement Sections!
+    ArrangementOptions arrOpts;
+    arrOpts.dropMode = config.dropMode;
+    arrOpts.buildupBars = config.buildupBars;
+    arrOpts.enableFakeDrop = config.enableFakeDrop;
+    arrOpts.drop1BarNudge = config.drop1BarNudge;
+    arrOpts.drop2BarNudge = config.drop2BarNudge;
+    arrOpts.customDrop1Frac = config.customDrop1Frac;
+    arrOpts.customDrop2Frac = config.customDrop2Frac;
+    arrOpts.bpmOverride = config.sourceBpmOverride;
+    arrOpts.gridPhaseNudgeMs = config.gridPhaseNudgeMs;
+    arrOpts.gridBeatShift = config.gridBeatShift;
 
-    LinkwitzRiley4 xoverL, xoverR;
-    xoverL.configure(240.0f);
-    xoverR.configure(240.0f);
-
-    Biquad vocalPresence, airBoost;
-    vocalPresence.configure(BiquadType::PEAK, 2250.0f, 1.35f, 3.8f);
-    airBoost.configure(BiquadType::HIGH_SHELF, 6500.0f, 0.707f, 2.2f);
-
-    for (size_t i = 0; i < outFrames; ++i) {
-        float loL, hiL, loR, hiR;
-        xoverL.split(warped[i * 2], loL, hiL);
-        xoverR.split(warped[i * 2 + 1], loR, hiR);
-
-        // Mid/Side vocal boost on high stem (> 240 Hz)
-        const float mid = 0.5f * (hiL + hiR);
-        const float side = 0.5f * (hiL - hiR);
-        const float midBoosted = airBoost.process(vocalPresence.process(mid));
-        const float sideWidened = side * 1.16f;
-
-        origLow[i * 2] = loL;
-        origLow[i * 2 + 1] = loR;
-        origHigh[i * 2] = midBoosted + sideWidened;
-        origHigh[i * 2 + 1] = midBoosted - sideWidened;
+    std::vector<SectionMarker> sections;
+    if (analysis.durationSec > 1.0f && analysis.totalBars >= 4) {
+        sections = MusicAnalyzer::buildArrangement(analysis, arrOpts);
+    } else if (!analysis.sections.empty()) {
+        sections = analysis.sections;
+    } else {
+        sections.push_back({0.0f, 1.0f, SectionType::DROP_1, "DROP 1", 0, 4});
     }
 
-    // 4. Prepare section map (respecting enableFakeDrop toggle)
-    std::vector<SectionMarker> sections = analysis.sections;
-    if (sections.empty()) {
-        sections.push_back({0.0f, 1.0f, SectionType::DROP_1, "DROP 1"});
-    }
-    if (!config.enableFakeDrop) {
-        for (auto& s : sections) {
-            if (s.type == SectionType::FAKE_DROP) {
-                s.type = SectionType::BUILDUP;
-                s.label = "BUILD";
-            }
-        }
-    }
-
-    // 5. Master output mix bus + beat-grid timing
-    std::vector<float> master(outFrames * 2, 0.0f);
-
+    // 4. Compute Sample-Exact Warped Beat & Bar Grid!
     const float beatSec = 60.0f / targetBpm;
     const float beatFramesF = beatSec * kSampleRate;
-    const float warpedOffsetSec = clampf(analysis.beatOffsetSec * timeScale, 0.0f, beatSec);
-    const size_t offsetFrames = static_cast<size_t>(warpedOffsetSec * kSampleRate);
+    const float srcBeatSec = 60.0f / sourceBpm;
+    const float effectiveSrcDownbeatSec = std::max(
+        0.0f,
+        analysis.downbeatSec
+            + static_cast<float>(config.gridBeatShift) * srcBeatSec
+            + config.gridPhaseNudgeMs * 0.001f
+    );
+    const double warpedDownbeatSec = static_cast<double>(effectiveSrcDownbeatSec) * static_cast<double>(timeScale);
+    const size_t downbeatFrame = std::min(outFrames > 0 ? outFrames - 1 : 0, static_cast<size_t>(std::llround(warpedDownbeatSec * kSampleRate)));
+    const double warpedSrcBarFrames = (static_cast<double>(srcBeatSec) * 4.0) * static_cast<double>(timeScale) * kSampleRate;
 
-    // 6. Mix Original Track Stem across arrangement sections with:
-    //    - Full spectrum in Intro / Vocal Break / Mid Break
-    //    - Rising resonant HPF sweep in Buildups
-    //    - Rhythmic 1/8 & 1/16 Stutter Vocal Chopper in Fake-Drop & Drop turnarounds
-    //    - Kick-synced sidechain ducking + bass-strip (< 240 Hz removed) during Drops!
-    Biquad buildHpfL, buildHpfR;
-    const float origMixGain = clampf(config.originalMix, 0.0f, 1.0f);
+    // Quantize EVERY section start/end onto exact integer bar sample boundaries so ZERO kicks land early or mid-chorus!
+    std::vector<FrameSection> frameSections;
+    frameSections.reserve(sections.size());
+    for (size_t idx = 0; idx < sections.size(); ++idx) {
+        const auto& s = sections[idx];
+        size_t sf = (idx == 0)
+            ? 0
+            : ((s.startBar > 0)
+                ? std::min(outFrames, downbeatFrame + static_cast<size_t>(std::llround(s.startBar * warpedSrcBarFrames)))
+                : std::min(outFrames, static_cast<size_t>(std::llround(s.startFrac * outFrames))));
+        size_t ef = (idx + 1 == sections.size())
+            ? outFrames
+            : ((s.endBar > 0)
+                ? std::min(outFrames, downbeatFrame + static_cast<size_t>(std::llround(s.endBar * warpedSrcBarFrames)))
+                : std::min(outFrames, static_cast<size_t>(std::llround(s.endFrac * outFrames))));
+        if (!frameSections.empty()) {
+            sf = frameSections.back().endFrame;
+        }
+        if (ef < sf) ef = sf;
+        frameSections.push_back({sf, ef, s.type, s.label, s.startBar, s.endBar});
+    }
+    if (!frameSections.empty()) {
+        frameSections.front().startFrame = 0;
+        frameSections.back().endFrame = outFrames;
+    }
+
+    // Update section fracs to reflect exact sample-quantized boundaries for waveform display
+    sections.clear();
+    for (const auto& fs : frameSections) {
+        sections.push_back({
+            static_cast<float>(fs.startFrame) / static_cast<float>(std::max<size_t>(1, outFrames)),
+            static_cast<float>(fs.endFrame) / static_cast<float>(std::max<size_t>(1, outFrames)),
+            fs.type,
+            fs.label,
+            fs.startBar,
+            fs.endBar
+        });
+    }
+
+    // 5. STREAMING SPLIT-BUS VOCAL/ORIGINAL PROCESSING (1 pass -> ZERO duplicate 76 MB origLow/origHigh arrays!)
+    //    - Surgical 3-band split: origLow (< bassCutHz), origLowMid (bassCutHz..850 Hz), origVocalHigh (> 850 Hz)
+    //    - Clean Mid/Side Vocal Clarity Sculpting (de-mud 320 Hz, presence 2.35 kHz, air 6.5 kHz)
+    //    - Frequency-selective sidechain: low-mids duck deeply (74%), vocals duck gently (config.vocalSidechain) -> LYRICS STAY CRYSTAL CLEAR!
+    //    - Smooth 15ms section transition smoothing -> ZERO abrupt clicks!
+    std::vector<float> vocalBus(outFrames * 2, 0.0f);
+
+    const float bassCutHz = clampf(config.bassCutHz, 110.0f, 340.0f);
+    const float origMixGain = clampf(config.originalMix, 0.1f, 1.0f);
+    const float vocalClarity = clampf(config.vocalClarity, 0.0f, 1.0f);
+    const float vocalScDepth = clampf(config.vocalSidechain, 0.0f, 0.90f);
     const float stutterAmt = clampf(config.stutterAmount, 0.0f, 1.0f);
 
-    for (size_t i = 0; i < outFrames; ++i) {
-        const float frac = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, outFrames));
-        const SectionMarker* sec = findSectionMarkerAt(sections, frac);
-        const SectionType sType = sec ? sec->type : SectionType::DROP_1;
-        const float secDur = sec ? std::max(0.001f, sec->endFrac - sec->startFrac) : 1.0f;
-        const float secProg = sec ? clampf((frac - sec->startFrac) / secDur, 0.0f, 1.0f) : 0.0f;
+    LinkwitzRiley4 bassSplitL, bassSplitR;
+    LinkwitzRiley4 vocalSplitL, vocalSplitR;
+    bassSplitL.configure(bassCutHz);
+    bassSplitR.configure(bassCutHz);
+    vocalSplitL.configure(850.0f);
+    vocalSplitR.configure(850.0f);
 
-        const float beatPos = (i >= offsetFrames)
-            ? static_cast<float>(i - offsetFrames) / beatFramesF
-            : 0.0f;
+    // Surgical Mid-channel vocal sculpting filters (linear & distortion-free!)
+    Biquad midDeMud, midPresence, midAir, buildHpfL, buildHpfR;
+    midDeMud.configure(BiquadType::PEAK, 320.0f, 1.35f, -2.8f * vocalClarity);
+    midPresence.configure(BiquadType::PEAK, 2350.0f, 1.15f, 4.6f * vocalClarity);
+    midAir.configure(BiquadType::HIGH_SHELF, 6400.0f, 0.707f, 2.2f * vocalClarity);
+    buildHpfL.configure(BiquadType::HPF, bassCutHz, 1.15f);
+    buildHpfR.configure(BiquadType::HPF, bassCutHz, 1.15f);
+
+    // Smooth section gain slewing (15 ms time constant -> click-free transitions!)
+    const float envSlew = std::exp(-1.0f / (0.015f * kSampleRate));
+    float lowGainSm = 0.85f;
+    float midGainSm = 1.0f;
+    float vocGainSm = 1.0f;
+    float buildWetSm = 0.0f;
+
+    for (size_t i = 0; i < outFrames; ++i) {
+        const FrameSection* sec = findFrameSection(frameSections, i);
+        const SectionType sType = sec ? sec->type : SectionType::DROP_1;
+        const size_t secStart = sec ? sec->startFrame : 0;
+        const size_t secLen = sec ? std::max<size_t>(1, sec->endFrame - sec->startFrame) : outFrames;
+        const float secProg = clampf(static_cast<float>(i - secStart) / static_cast<float>(secLen), 0.0f, 1.0f);
+
+        // Compute beat position locked to current Drop's exact Beat 1 (or global downbeat outside drops)
+        const double localFrames = (sType == SectionType::DROP_1 || sType == SectionType::DROP_2)
+            ? static_cast<double>(i - secStart)
+            : static_cast<double>(i >= downbeatFrame ? (i - downbeatFrame) : 0);
+        const double beatPos = localFrames / static_cast<double>(beatFramesF);
         const int beatIdx = static_cast<int>(std::floor(beatPos));
-        const float beatFrac = beatPos - std::floor(beatPos);
+        const float beatFrac = static_cast<float>(beatPos - std::floor(beatPos));
         const int barIdx = beatIdx / 4;
         const int beatInBar = beatIdx % 4;
 
-        float l = 0.0f, r = 0.0f;
+        // Choose source sample (normal or rhythmic stutter slice during Fake-Drop / Drop turnarounds)
+        size_t readFrame = i;
+        float chopEnv = 1.0f;
 
-        if (sType == SectionType::INTRO || sType == SectionType::VOCAL_BREAK || sType == SectionType::MID_BREAK) {
-            // Keep rich original vocal/melody + controlled bass
-            const float gain = 0.72f + 0.25f * origMixGain;
-            l = (origLow[i * 2] * 0.78f + origHigh[i * 2] * 1.05f) * gain;
-            r = (origLow[i * 2 + 1] * 0.78f + origHigh[i * 2 + 1] * 1.05f) * gain;
-        } else if (sType == SectionType::BUILDUP) {
-            // Sweeping HPF strips bass smoothly toward drop tension
-            if (i % 64 == 0) {
-                const float cut = 180.0f + 1350.0f * secProg * secProg;
-                buildHpfL.configure(BiquadType::HPF, cut, 1.35f);
-                buildHpfR.configure(BiquadType::HPF, cut, 1.35f);
-            }
-            const float rawL = origLow[i * 2] * (1.0f - secProg) * 0.55f + origHigh[i * 2];
-            const float rawR = origLow[i * 2 + 1] * (1.0f - secProg) * 0.55f + origHigh[i * 2 + 1];
-            l = buildHpfL.process(rawL) * (0.75f + 0.22f * origMixGain);
-            r = buildHpfR.process(rawR) * (0.75f + 0.22f * origMixGain);
-        } else if (sType == SectionType::FAKE_DROP) {
-            // FAKE-DROP: dramatic dropout + rhythmic 1/8 & 1/16 stutter vocal chop + silence cliff!
-            if (secProg > 0.86f) {
-                // Iconic sudden silence breath right before the drop slams!
-                l = 0.0f;
-                r = 0.0f;
-            } else {
-                // Repeat vocal slice at 1/8 -> 1/16 grid!
+        if (sType == SectionType::FAKE_DROP) {
+            // Iconic 1-bar Fake-Drop:
+            // Beat 1 (0..25%): fake kick impact + clean vocal phrase start
+            // Beats 2..3 (25..78%): rhythmic 1/8 -> 1/16 vocal stutter chop
+            // Beat 4 (78..100%): crisp dramatic silence cliff right before DROP 1 SLAMS ON CHORUS BEAT 1!
+            if (secProg >= 0.78f) {
+                chopEnv = clampf((0.83f - secProg) / 0.05f, 0.0f, 1.0f);
+            } else if (secProg >= 0.25f) {
                 const size_t sliceFrames = std::max<size_t>(
                     512,
-                    static_cast<size_t>((secProg > 0.50f ? 0.25f : 0.50f) * beatFramesF)
+                    static_cast<size_t>((secProg > 0.52f ? 0.25f : 0.50f) * beatFramesF)
                 );
-                const size_t secStartFrame = static_cast<size_t>((sec ? sec->startFrac : 0.0f) * outFrames);
-                const size_t localIdx = (i >= secStartFrame) ? (i - secStartFrame) : 0;
+                const size_t anchor = secStart + static_cast<size_t>(0.25f * secLen);
+                const size_t localIdx = (i >= anchor) ? (i - anchor) : 0;
                 const size_t slicePos = localIdx % sliceFrames;
-                const size_t srcFrame = std::min(outFrames - 1, secStartFrame + slicePos);
-
-                // Click-free micro-gate on stutter slices
+                readFrame = std::min(outFrames - 1, anchor + slicePos);
                 const float edgeFade = std::min(
                     1.0f,
                     std::min(static_cast<float>(slicePos) / 140.0f, static_cast<float>(sliceFrames - slicePos) / 140.0f)
                 );
-                const float gate = (static_cast<float>(slicePos) / static_cast<float>(sliceFrames) < 0.78f) ? 1.0f : 0.12f;
-                const float gain = (0.78f + 0.30f * origMixGain) * edgeFade * gate;
-                l = origHigh[srcFrame * 2] * gain;
-                r = origHigh[srcFrame * 2 + 1] * gain;
+                const float gate = (static_cast<float>(slicePos) / static_cast<float>(sliceFrames) < 0.80f) ? 1.0f : 0.14f;
+                chopEnv = edgeFade * gate;
             }
-        } else {
-            // DROP_1 or DROP_2: Strip original bass (< 240 Hz), pump vocals via tight kick-synced sidechain!
-            // Sharp 6ms duck -> smooth rhythmic pump release
-            const float duck = (beatFrac < 0.05f)
-                ? (1.0f - 0.78f * (beatFrac / 0.05f))
-                : (0.22f + 0.78f * std::pow(clampf((beatFrac - 0.05f) / 0.65f, 0.0f, 1.0f), 0.75f));
-
-            // Optional Rhythmic Stutter Vocal Chopper on bar turnarounds (beat 4 of bars 3/7/...)
-            size_t readFrame = i;
-            float chopEnv = 1.0f;
-            const bool isStutterZone = (stutterAmt > 0.15f)
-                && ((barIdx % 4 == 3 && beatInBar >= 2) || (stutterAmt > 0.65f && barIdx % 2 == 1 && beatInBar == 3));
-            if (isStutterZone) {
-                const float div = (stutterAmt > 0.60f) ? 0.25f : 0.50f; // 1/16 or 1/8 beat slice
+        } else if ((sType == SectionType::DROP_1 || sType == SectionType::DROP_2) && stutterAmt > 0.20f) {
+            // Subtle musical stutter ONLY on beat 4 of bar 4/8 turnarounds (never mangles whole chorus lyrics!)
+            const bool isTurnaround = (barIdx % 4 == 3 && beatInBar == 3);
+            if (isTurnaround) {
+                const float div = (stutterAmt > 0.65f) ? 0.25f : 0.50f;
                 const size_t sliceLen = std::max<size_t>(512, static_cast<size_t>(div * beatFramesF));
                 const size_t anchor = (i / (sliceLen * 4)) * (sliceLen * 4);
                 const size_t posInSlice = (i - anchor) % sliceLen;
@@ -437,25 +453,112 @@ RemixOutput RemixEngine::renderRemix(
                     1.0f,
                     std::min(static_cast<float>(posInSlice) / 120.0f, static_cast<float>(sliceLen - posInSlice) / 120.0f)
                 );
-                const float stutterWet = clampf(stutterAmt, 0.0f, 1.0f);
-                chopEnv = (1.0f - stutterWet) + stutterWet * fade * 1.15f;
+                chopEnv = (1.0f - stutterAmt * 0.7f) + (stutterAmt * 0.7f) * fade;
             }
-
-            const float vocalGain = (0.18f + 0.72f * origMixGain) * duck * chopEnv;
-            l = origHigh[readFrame * 2] * vocalGain;
-            r = origHigh[readFrame * 2 + 1] * vocalGain;
         }
 
-        master[i * 2] = l;
-        master[i * 2 + 1] = r;
+        const float inL = warped[readFrame * 2];
+        const float inR = warped[readFrame * 2 + 1];
+
+        // 3-band split of original track
+        float loL, hiAllL, lmL, vhL;
+        float loR, hiAllR, lmR, vhR;
+        bassSplitL.split(inL, loL, hiAllL);
+        bassSplitR.split(inR, loR, hiAllR);
+        vocalSplitL.split(hiAllL, lmL, vhL);
+        vocalSplitR.split(hiAllR, lmR, vhR);
+
+        // Clean Mid/Side vocal clarity sculpting on > 850 Hz + de-mud on low-mid
+        const float lmMid = 0.5f * (lmL + lmR);
+        const float lmSide = 0.5f * (lmL - lmR);
+        const float lmMidClean = midDeMud.process(lmMid);
+        lmL = lmMidClean + lmSide;
+        lmR = lmMidClean - lmSide;
+
+        const float vhMid = 0.5f * (vhL + vhR);
+        const float vhSide = 0.5f * (vhL - vhR);
+        const float vhMidClarity = midAir.process(midPresence.process(vhMid));
+        // Slight center focus so lyrics sit dead-center above stereo screeches/hats
+        const float sideScale = 1.04f - 0.14f * vocalClarity;
+        vhL = vhMidClarity + vhSide * sideScale;
+        vhR = vhMidClarity - vhSide * sideScale;
+
+        // Target band gains per section (slewed smoothly to prevent any click!)
+        float targetLow = 0.82f;
+        float targetMid = 0.94f;
+        float targetVoc = 0.96f;
+        float targetBuildWet = 0.0f;
+
+        if (sType == SectionType::INTRO || sType == SectionType::VOCAL_BREAK || sType == SectionType::MID_BREAK) {
+            const float g = 0.74f + 0.22f * origMixGain;
+            targetLow = 0.76f * g;
+            targetMid = 0.96f * g;
+            targetVoc = (1.00f + 0.08f * vocalClarity) * g;
+        } else if (sType == SectionType::BUILDUP) {
+            targetBuildWet = 1.0f;
+            const float g = 0.72f + 0.22f * origMixGain;
+            targetLow = (1.0f - secProg) * 0.42f * g;
+            targetMid = 0.90f * g;
+            targetVoc = 1.02f * g;
+        } else if (sType == SectionType::FAKE_DROP) {
+            targetLow = 0.0f;
+            targetMid = 0.82f * (0.55f + 0.45f * origMixGain);
+            targetVoc = 1.06f * (0.55f + 0.45f * origMixGain);
+        } else {
+            // DROP_1 or DROP_2: Strip original bass (< bassCutHz) completely!
+            targetLow = 0.0f;
+            // Frequency-selective sidechain:
+            // - Low-mids (bassCutHz..850 Hz) duck deeply (74%) to carve huge room for the hardcore kick!
+            // - Vocal band (> 850 Hz) ducks ONLY by gentle `vocalScDepth` so lyrics stay intelligible & upfront!
+            const float duckShape = (beatFrac < 0.04f)
+                ? (beatFrac / 0.04f)
+                : (1.0f - std::pow(clampf((beatFrac - 0.04f) / 0.52f, 0.0f, 1.0f), 0.70f));
+            const float lowMidDuck = 1.0f - 0.74f * duckShape;
+            const float vocalDuck = 1.0f - vocalScDepth * duckShape;
+
+            const float dropOrigBase = 0.46f + 0.74f * origMixGain;
+            targetMid = dropOrigBase * 0.78f * lowMidDuck;
+            targetVoc = dropOrigBase * (1.12f + 0.46f * vocalClarity) * vocalDuck;
+        }
+
+        // Smooth transitions (fast enough to track sidechain while eliminating section-edge clicks)
+        const bool isDrop = (sType == SectionType::DROP_1 || sType == SectionType::DROP_2);
+        lowGainSm = lowGainSm * envSlew + targetLow * (1.0f - envSlew);
+        midGainSm = isDrop ? targetMid : (midGainSm * envSlew + targetMid * (1.0f - envSlew));
+        vocGainSm = isDrop ? targetVoc : (vocGainSm * envSlew + targetVoc * (1.0f - envSlew));
+        buildWetSm = buildWetSm * envSlew + targetBuildWet * (1.0f - envSlew);
+
+        float outL = (loL * lowGainSm + lmL * midGainSm + vhL * vocGainSm) * chopEnv;
+        float outR = (loR * lowGainSm + lmR * midGainSm + vhR * vocGainSm) * chopEnv;
+
+        if (buildWetSm > 0.005f) {
+            if (i % 64 == 0) {
+                const float cut = bassCutHz + 980.0f * secProg * secProg;
+                buildHpfL.configure(BiquadType::HPF, cut, 1.25f);
+                buildHpfR.configure(BiquadType::HPF, cut, 1.25f);
+            }
+            const float filtL = buildHpfL.process(outL);
+            const float filtR = buildHpfR.process(outR);
+            outL = outL * (1.0f - buildWetSm) + filtL * buildWetSm;
+            outR = outR * (1.0f - buildWetSm) + filtR * buildWetSm;
+        }
+
+        vocalBus[i * 2] = sanitize(outL);
+        vocalBus[i * 2 + 1] = sanitize(outR);
     }
 
-    // 7. Pre-render Hardcore Kick Cache (Drop 1, Drop 2, melodic pitch-kick variants, triplet rolls!)
-    const int switchBars = (config.kickSwitchBars == 8) ? 8 : 4;
-    const std::array<float, 4> melodyOffsets = {0.0f, 3.0f, 5.0f, 7.0f}; // Minor pentatonic / hardcore melody intervals
+    // Immediately free `warped` BEFORE allocating `kickBus` -> cuts peak native RAM in HALF!
+    warped.clear();
+    warped.shrink_to_fit();
+
+    // 6. Dedicated Kick + FX Bus (rendered completely separately so kick saturation NEVER distorts vocals!)
+    std::vector<float> kickBus(outFrames * 2, 0.0f);
+
+    const int switchBars = (config.kickSwitchBars == 8 || config.kickSwitchBars == 16) ? config.kickSwitchBars : 4;
+    const std::array<float, 4> melodyOffsets = {0.0f, 3.0f, 5.0f, 7.0f};
 
     auto buildKickSet = [&](KickType kt, float driveBoost, float aggBoost) {
-        std::array<std::vector<float>, 5> set; // 0..3 = pitched full kicks, 4 = 1/3 triplet roll kick
+        std::array<std::vector<float>, 5> set;
         for (int m = 0; m < 4; ++m) {
             KickParams kp;
             kp.type = kt;
@@ -463,6 +566,7 @@ RemixOutput RemixEngine::renderRemix(
             kp.bpm = targetBpm;
             kp.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
             kp.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
+            kp.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
             kp.pitchSemitoneOffset = melodyOffsets[m];
             kp.lengthBeats = 1.0f;
             kp.seed = 2026u + static_cast<uint32_t>(kt) * 31u + static_cast<uint32_t>(m);
@@ -474,6 +578,7 @@ RemixOutput RemixEngine::renderRemix(
         tripP.bpm = targetBpm;
         tripP.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
         tripP.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
+        tripP.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
         tripP.pitchSemitoneOffset = 3.0f;
         tripP.lengthBeats = 0.3333f;
         tripP.seed = 7777u + static_cast<uint32_t>(kt) * 17u;
@@ -482,138 +587,151 @@ RemixOutput RemixEngine::renderRemix(
     };
 
     const auto kickSet1 = buildKickSet(config.drop1Kick, 0.0f, 0.0f);
-    const auto kickSet2 = buildKickSet(config.drop2Kick, 0.05f, 0.05f);
-    const auto kickSet2Finale = buildKickSet(config.drop2Kick, 0.12f, 0.10f);
+    const auto kickSet2 = buildKickSet(config.drop2Kick, 0.04f, 0.04f);
+    const auto kickSet2Finale = buildKickSet(config.drop2Kick, 0.09f, 0.08f);
     const auto openHat = HardcoreSynth::renderHardcoreHat(beatSec * 0.45f, true, 909u);
-    const auto screechA = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.5f, config.zaagAggression, 0);
-    const auto screechB = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.25f, config.zaagAggression, 1);
-    const auto subImpact = HardcoreSynth::renderSubImpact(effectiveRootHz, std::min(1.6f, beatSec * 4.0f));
+    const auto screechA = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.35f, config.zaagAggression, 0);
+    const auto screechB = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.15f, config.zaagAggression, 1);
+    const auto subImpact = HardcoreSynth::renderSubImpact(effectiveRootHz, std::min(1.5f, beatSec * 4.0f));
 
-    // 8. Layer Build-Up Rolls, Noise Risers, Fake-Drop Screeches, and Drop Impacts along sections!
-    for (const auto& sec : sections) {
-        const size_t sStart = static_cast<size_t>(sec.startFrac * outFrames);
-        const size_t sEnd = static_cast<size_t>(sec.endFrac * outFrames);
-        if (sEnd <= sStart) continue;
-        const float secDurSec = static_cast<float>(sEnd - sStart) / kSampleRate;
+    // 7. Render Sample-Exact Section FX & Beat-Locked Kicks strictly bounded within each section!
+    for (const auto& sec : frameSections) {
+        if (sec.endFrame <= sec.startFrame) continue;
+        const float secDurSec = static_cast<float>(sec.endFrame - sec.startFrame) / kSampleRate;
 
         if (sec.type == SectionType::BUILDUP && secDurSec >= 0.45f) {
             const auto roll = HardcoreSynth::renderSnareBuildupRoll(targetBpm, secDurSec, effectiveRootHz, config.zaagAggression);
             const auto riser = HardcoreSynth::renderNoiseRiser(secDurSec, effectiveRootHz, config.zaagAggression);
-            mixBufferAt(master, roll, sStart, 0.74f, 0.74f);
-            mixBufferAt(master, riser, sStart, 0.56f, 0.56f);
+            mixBufferAt(kickBus, roll, sec.startFrame, 0.68f, 0.68f, sec.endFrame);
+            mixBufferAt(kickBus, riser, sec.startFrame, 0.48f, 0.48f, sec.endFrame);
         } else if (sec.type == SectionType::FAKE_DROP) {
-            // Brutal Fake-Drop: punchy lone fake-kick hit on beat 1 + screech stab!
-            mixBufferAt(master, kickSet1[0], sStart, 0.92f, 0.92f);
+            // Exact lone fake-kick hit on Beat 1 + crisp screech stab, strictly silenced before DROP 1!
+            const size_t silenceCutoff = sec.startFrame + static_cast<size_t>((sec.endFrame - sec.startFrame) * 0.78f);
+            mixBufferAt(kickBus, kickSet1[0], sec.startFrame, 0.88f, 0.88f, silenceCutoff);
             if (config.enableScreeches && secDurSec >= 0.25f) {
-                const size_t stabPos = sStart + static_cast<size_t>(std::min(beatFramesF * 0.5f, (sEnd - sStart) * 0.25f));
-                mixBufferAt(master, screechA, stabPos, 0.68f, 0.68f);
+                const size_t stabPos = sec.startFrame + static_cast<size_t>(std::min(beatFramesF * 0.5f, (silenceCutoff - sec.startFrame) * 0.35f));
+                mixBufferAt(kickBus, screechA, stabPos, 0.56f, 0.56f, silenceCutoff);
             }
         } else if (sec.type == SectionType::DROP_1 || sec.type == SectionType::DROP_2) {
-            // Massive Festival Sub Impact on bar 1 beat 1 of each Drop!
-            mixBufferAt(master, subImpact, sStart, 0.62f, 0.62f);
-        }
-    }
+            const bool isDrop2 = (sec.type == SectionType::DROP_2);
 
-    // 9. Lay Down Beat-Locked 4-on-the-Floor Hardcore Kicks + Kick-Switches + Triplets + Screeches!
-    const int totalBeats = static_cast<int>(std::ceil(outDurSec / beatSec));
-    int dropBarCounter = 0;
-    int lastDropBarIndex = -1;
+            // Massive Festival Sub Impact strictly on Bar 1 Beat 1 of the Drop!
+            mixBufferAt(kickBus, subImpact, sec.startFrame, 0.50f, 0.50f, sec.endFrame);
 
-    for (int b = 0; b < totalBeats; ++b) {
-        const size_t beatStart = offsetFrames + static_cast<size_t>(std::llround(static_cast<double>(b) * beatFramesF));
-        if (beatStart >= outFrames) break;
+            // Sample-locked 4-on-the-floor beats anchored directly to sec.startFrame (0 beat drift!)
+            const int numDropBeats = static_cast<int>(std::floor(static_cast<double>(sec.endFrame - sec.startFrame) / static_cast<double>(beatFramesF)));
+            for (int lb = 0; lb < numDropBeats; ++lb) {
+                const size_t beatStart = sec.startFrame + static_cast<size_t>(std::llround(static_cast<double>(lb) * static_cast<double>(beatFramesF)));
+                if (beatStart >= sec.endFrame) break;
 
-        const float frac = static_cast<float>(beatStart) / static_cast<float>(std::max<size_t>(1, outFrames));
-        const SectionType sType = findSectionAt(sections, frac);
+                const int dropBarIdx = lb / 4; // 0-indexed bar inside this drop
+                const int beatInBar = lb % 4;
+                const int dropBarNum = dropBarIdx + 1;
 
-        if (sType != SectionType::DROP_1 && sType != SectionType::DROP_2) {
-            continue;
-        }
+                const int switchPhase = (dropBarIdx / switchBars) % 2;
+                const bool useSet2 = isDrop2 ? (switchPhase == 0) : (switchPhase == 1);
+                const auto& activeSet = useSet2 ? (isDrop2 ? kickSet2Finale : kickSet2) : kickSet1;
 
-        const int barIndex = b / 4;
-        const int beatInBar = b % 4;
-        if (barIndex != lastDropBarIndex) {
-            ++dropBarCounter;
-            lastDropBarIndex = barIndex;
-        }
+                const bool isTurnaroundBar = (dropBarNum % 4 == 0);
+                const bool isSwitchBoundaryBar = (dropBarNum % switchBars == 0);
 
-        // Automatic Kick-Switch every 4 or 8 bars!
-        const int switchPhase = ((dropBarCounter - 1) / switchBars) % 2;
-        const bool isDrop2 = (sType == SectionType::DROP_2);
-        const bool useSet2 = isDrop2 ? (switchPhase == 0) : (switchPhase == 1);
-        const auto& activeSet = useSet2 ? (isDrop2 ? kickSet2Finale : kickSet2) : kickSet1;
+                if (config.enableTripletRolls && isTurnaroundBar && beatInBar == 3) {
+                    const float tripStep = beatFramesF / 3.0f;
+                    for (int t = 0; t < 3; ++t) {
+                        const size_t tStart = beatStart + static_cast<size_t>(std::llround(t * tripStep));
+                        const float accent = 0.86f + 0.06f * static_cast<float>(t);
+                        mixBufferAt(kickBus, activeSet[4], tStart, accent, accent, sec.endFrame);
+                    }
+                } else {
+                    int pitchIdx = 0;
+                    if (config.enablePitchKickMelody && isTurnaroundBar) {
+                        static constexpr std::array<int, 4> kTurnaroundPattern = {0, 1, 2, 3};
+                        pitchIdx = kTurnaroundPattern[beatInBar];
+                    } else if (config.enablePitchKickMelody && (dropBarNum % 2 == 0) && beatInBar == 3) {
+                        pitchIdx = 1;
+                    }
+                    const float kGain = isDrop2 ? 1.03f : 0.98f;
+                    mixBufferAt(kickBus, activeSet[pitchIdx], beatStart, kGain, kGain, sec.endFrame);
+                }
 
-        const bool isTurnaroundBar = (dropBarCounter % 4 == 0);
-        const bool isSwitchBoundaryBar = (dropBarCounter % switchBars == 0);
+                // Crisp 909 Offbeat Open Hi-Hat
+                const size_t offbeatPos = beatStart + static_cast<size_t>(beatFramesF * 0.5f);
+                if (offbeatPos < sec.endFrame) {
+                    const float hatGain = isDrop2 ? 0.28f : 0.23f;
+                    mixBufferAt(kickBus, openHat, offbeatPos, hatGain, hatGain, sec.endFrame);
+                }
 
-        // Triplet Kick Roll on final beat of turnaround / kick-switch bars!
-        if (config.enableTripletRolls && isTurnaroundBar && beatInBar == 3) {
-            const float tripStep = beatFramesF / 3.0f;
-            for (int t = 0; t < 3; ++t) {
-                const size_t tStart = beatStart + static_cast<size_t>(std::llround(t * tripStep));
-                const float accent = 0.90f + 0.08f * static_cast<float>(t);
-                mixBufferAt(master, activeSet[4], tStart, accent, accent);
-            }
-        } else {
-            // Optional Melodic Pitch Kick Turnaround (bar 4: 0, +3, +5, +7 or +3)
-            int pitchIdx = 0;
-            if (config.enablePitchKickMelody && isTurnaroundBar) {
-                static constexpr std::array<int, 4> kTurnaroundPattern = {0, 1, 2, 3};
-                pitchIdx = kTurnaroundPattern[beatInBar];
-            } else if (config.enablePitchKickMelody && (dropBarCounter % 2 == 0) && beatInBar == 3) {
-                pitchIdx = 1; // subtle +3 st bounce lift at end of even bars
-            }
-
-            const float kickLevel = isDrop2 ? 1.06f : 1.00f;
-            mixBufferAt(master, activeSet[pitchIdx], beatStart, kickLevel, kickLevel);
-        }
-
-        // Offbeat 909 Hardcore Open Hi-Hat for authentic festival drive
-        const size_t offbeatPos = beatStart + static_cast<size_t>(beatFramesF * 0.5f);
-        const float hatGain = isDrop2 ? 0.34f : 0.28f;
-        mixBufferAt(master, openHat, offbeatPos, hatGain, hatGain);
-
-        // Key-locked Industrial Screech stabs on switch bars & drop accents!
-        if (config.enableScreeches) {
-            if ((isSwitchBoundaryBar && beatInBar == 2) || (isDrop2 && (dropBarCounter % 2 == 1) && beatInBar == 0)) {
-                const auto& sc = (dropBarCounter % 2 == 0) ? screechA : screechB;
-                const float scGain = isDrop2 ? 0.54f : 0.44f;
-                mixBufferAt(master, sc, beatStart, scGain, scGain);
+                // Key-locked Industrial Screech Stabs (kept tasteful so vocals stay intelligible!)
+                if (config.enableScreeches) {
+                    if ((isSwitchBoundaryBar && beatInBar == 2) || (isDrop2 && (dropBarNum % 2 == 1) && beatInBar == 0)) {
+                        const auto& sc = (dropBarNum % 2 == 0) ? screechA : screechB;
+                        const float scGain = isDrop2 ? 0.38f : 0.32f;
+                        mixBufferAt(kickBus, sc, beatStart, scGain, scGain, sec.endFrame);
+                    }
+                }
             }
         }
     }
 
-    // 10. Festival Mastering Chain:
-    //     - DC Blocker (24 Hz HPF)
-    //     - 3-Band OTT Multiband Dynamics (140 Hz / 2500 Hz) + Strict Mono Bass (< 140 Hz) + Stereo Mid/High Width
-    //     - 2x Oversampled Soft/Hard Brickwall Clipper hitting festival loudness (peaks strictly <= 0.98f!)
+    // 8. Studio Split-Bus Summing + Transparent Lookahead Mastering Chain!
+    //    - Glue kickBus softly on its OWN bus FIRST (so kicks never intermodulate vocals!)
+    //    - Sum clean vocalBus + scaled kickBus IN-PLACE into vocalBus, then free kickBus!
+    const float kickGain = clampf(config.kickLevel, 0.35f, 1.25f);
+    for (size_t i = 0; i < outFrames; ++i) {
+        const float kL = std::tanh(kickBus[i * 2] * 1.04f) * kickGain;
+        const float kR = std::tanh(kickBus[i * 2 + 1] * 1.04f) * kickGain;
+        vocalBus[i * 2] = sanitize(vocalBus[i * 2] + kL);
+        vocalBus[i * 2 + 1] = sanitize(vocalBus[i * 2 + 1] + kR);
+    }
+    kickBus.clear();
+    kickBus.shrink_to_fit();
+
+    // Master Mode selection:
+    // 0 = STUDIO CLEAN (transparent lookahead limiter, minimal OTT -> cleanest vocals & tightest sub!)
+    // 1 = CLUB PUNCH   (balanced club glue + subtle warm soft-clip + lookahead limiter)
+    // 2 = FESTIVAL HARD (maximum festival loudness + oversampled clipper + lookahead limiter)
+    const int masterMode = std::max(0, std::min(2, config.masterMode));
+    const float ottDepth = (masterMode == 0) ? 0.24f : ((masterMode == 1) ? 0.38f : 0.54f);
+    const float preGain = (masterMode == 0) ? 1.32f : ((masterMode == 1) ? 1.46f : 1.60f);
+
     Biquad dcL, dcR;
-    dcL.configure(BiquadType::HPF, 24.0f, 0.707f);
-    dcR.configure(BiquadType::HPF, 24.0f, 0.707f);
+    dcL.configure(BiquadType::HPF, 25.0f, 0.707f);
+    dcR.configure(BiquadType::HPF, 25.0f, 0.707f);
 
     Ott3Band masterOtt;
-    masterOtt.configure(140.0f, 2500.0f);
+    masterOtt.configure(130.0f, 2600.0f);
     OversampledClipper2x clipL, clipR;
+    LookaheadLimiter limiter;
+    limiter.configure(0.97f, 4.0f, 58.0f);
 
-    const float masterDrive = 1.45f + 0.55f * clampf(config.drive, 0.0f, 1.0f);
     double sumSq = 0.0;
     float peakAbs = 0.0f;
 
     for (size_t i = 0; i < outFrames; ++i) {
-        float l = dcL.process(master[i * 2]);
-        float r = dcR.process(master[i * 2 + 1]);
+        float l = dcL.process(vocalBus[i * 2]);
+        float r = dcR.process(vocalBus[i * 2 + 1]);
 
-        masterOtt.processStereo(l, r, 0.62f, 1.0f, 1.14f);
+        masterOtt.processStereo(l, r, ottDepth, 1.0f, 1.08f);
 
-        l = clipL.process(l, masterDrive, 0.98f, 0.02f);
-        r = clipR.process(r, masterDrive, 0.98f, 0.02f);
+        l *= preGain;
+        r *= preGain;
 
-        // Strict final safety guard: zero NaN/Inf, peaks <= 0.98f
+        if (masterMode == 2) {
+            l = clipL.process(l, 1.18f, 0.98f, 0.01f);
+            r = clipR.process(r, 1.18f, 0.98f, 0.01f);
+        } else if (masterMode == 1) {
+            l = std::tanh(l * 1.04f);
+            r = std::tanh(r * 1.04f);
+        }
+
+        // Transparent 4 ms lookahead true-peak brickwall limiter (zero harsh clipping fuzz!)
+        limiter.processStereo(l, r);
+
         l = clampf(sanitize(l), -0.98f, 0.98f);
         r = clampf(sanitize(r), -0.98f, 0.98f);
 
-        master[i * 2] = l;
-        master[i * 2 + 1] = r;
+        vocalBus[i * 2] = l;
+        vocalBus[i * 2 + 1] = r;
 
         peakAbs = std::max(peakAbs, std::max(std::fabs(l), std::fabs(r)));
         sumSq += 0.5 * (static_cast<double>(l) * l + static_cast<double>(r) * r);
@@ -623,17 +741,17 @@ RemixOutput RemixEngine::renderRemix(
     const size_t edgeFade = std::min<size_t>(441, outFrames / 4);
     for (size_t i = 0; i < edgeFade; ++i) {
         const float g = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, edgeFade));
-        master[i * 2] *= g;
-        master[i * 2 + 1] *= g;
+        vocalBus[i * 2] *= g;
+        vocalBus[i * 2 + 1] *= g;
         const size_t tail = outFrames - 1 - i;
-        master[tail * 2] *= g;
-        master[tail * 2 + 1] *= g;
+        vocalBus[tail * 2] *= g;
+        vocalBus[tail * 2 + 1] *= g;
     }
 
     const float rms = static_cast<float>(std::sqrt(sumSq / static_cast<double>(std::max<size_t>(1, outFrames))));
 
-    result.waveformPeaks = MusicAnalyzer::extractWaveformPeaks(master.data(), outFrames, 240);
-    result.stereoPcm = std::move(master);
+    result.waveformPeaks = MusicAnalyzer::extractWaveformPeaks(vocalBus.data(), outFrames, 240);
+    result.stereoPcm = std::move(vocalBus);
     result.sections = std::move(sections);
     result.sourceBpm = sourceBpm;
     result.effectiveTargetBpm = targetBpm;

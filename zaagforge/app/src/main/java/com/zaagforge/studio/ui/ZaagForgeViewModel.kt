@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import kotlin.math.roundToInt
 
 enum class StudioTab(val label: String) {
@@ -49,11 +50,14 @@ data class ZaagForgeUiState(
     val remixResult: RemixRenderResult? = null,
     val waveformPeaks: FloatArray = FloatArray(0),
     val sectionMarkers: List<SectionMarker> = emptyList(),
+    val hasPendingChanges: Boolean = false,
     val isBusy: Boolean = false,
     val busyMessage: String = "",
     val statusBanner: String? = null,
     val errorBanner: String? = null,
     val auditioningKick: KickType? = null,
+    val showCutControls: Boolean = true,
+    val showMixControls: Boolean = false,
     val showProTweaks: Boolean = false,
     // Library & Streaming
     val localTracks: List<AudioTrackItem> = emptyList(),
@@ -75,8 +79,8 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     val isRemixActive: StateFlow<Boolean> = player.isRemixActive
     val meterReading: StateFlow<MeterReading> = player.meter
 
-    private var currentOriginalPcm: FloatArray = FloatArray(0)
-    private var currentRemixPcm: FloatArray = FloatArray(0)
+    private var hasOriginalLoaded: Boolean = false
+    private var currentRemixFrames: Int = 0
 
     private val _uiState = MutableStateFlow(ZaagForgeUiState())
     val uiState: StateFlow<ZaagForgeUiState> = _uiState.asStateFlow()
@@ -84,7 +88,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         refreshExports()
         refreshLocalLibrary()
-        // Auto-load Built-In Demo 0 on first launch so the user can audition & remix immediately
         loadTrack(LibraryAndStreamingRepository.builtInDemos.first(), autoRemixImmediately = true)
     }
 
@@ -115,26 +118,99 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(resolvedLink = null) }
     }
 
+    fun toggleCutControls() {
+        _uiState.update { it.copy(showCutControls = !it.showCutControls) }
+    }
+
+    fun toggleMixControls() {
+        _uiState.update { it.copy(showMixControls = !it.showMixControls) }
+    }
+
     fun toggleProTweaks() {
         _uiState.update { it.copy(showProTweaks = !it.showProTweaks) }
     }
 
     fun selectPreset(preset: RemixPreset, renderNow: Boolean = false) {
-        _uiState.update {
-            it.copy(
+        _uiState.update { state ->
+            // Preserve user's track-specific drop/grid timing when switching presets!
+            state.copy(
                 selectedPreset = preset,
-                params = preset.params,
-                errorBanner = null
+                params = state.params.withPresetStyle(preset.params),
+                errorBanner = null,
+                hasPendingChanges = true
             )
         }
-        if (renderNow && currentOriginalPcm.isNotEmpty() && _uiState.value.analysis != null) {
+        if (renderNow && hasOriginalLoaded && _uiState.value.analysis != null) {
             renderCurrentRemix()
         }
     }
 
     fun updateParams(transform: (RemixParams) -> RemixParams) {
+        val next = transform(_uiState.value.params).sanitized()
         _uiState.update { state ->
-            state.copy(params = transform(state.params).sanitized())
+            state.copy(params = next, hasPendingChanges = true)
+        }
+        refreshLiveSectionPreview(next)
+    }
+
+    /** Instant 1-tap: places DROP 1 exactly on the nearest musical bar at current playhead! */
+    fun placeDrop1AtPlayhead() {
+        val frac = player.progress.value.coerceIn(0.04f, 0.88f)
+        updateParams {
+            it.copy(customDrop1Frac = frac, drop1BarNudge = 0)
+        }
+        val dur = _uiState.value.analysis?.durationSec ?: 0f
+        _uiState.update {
+            it.copy(statusBanner = "DROP 1 calé sur ${formatTimeSec(frac * dur)} · clique AUTO REMIX C++ pour appliquer")
+        }
+    }
+
+    /** Instant 1-tap: places DROP 2 exactly on the nearest musical bar at current playhead! */
+    fun placeDrop2AtPlayhead() {
+        val frac = player.progress.value.coerceIn(0.12f, 0.95f)
+        updateParams {
+            it.copy(customDrop2Frac = frac, drop2BarNudge = 0)
+        }
+        val dur = _uiState.value.analysis?.durationSec ?: 0f
+        _uiState.update {
+            it.copy(statusBanner = "DROP 2 calé sur ${formatTimeSec(frac * dur)} · clique AUTO REMIX C++ pour appliquer")
+        }
+    }
+
+    /** Resets all custom cut/drop/grid overrides back to automatic chorus detection. */
+    fun resetTimingToAuto() {
+        updateParams {
+            it.copy(
+                sourceBpmOverride = 0f,
+                gridPhaseNudgeMs = 0f,
+                gridBeatShift = 0,
+                drop1BarNudge = 0,
+                drop2BarNudge = 0,
+                customDrop1Frac = -1f,
+                customDrop2Frac = -1f
+            )
+        }
+        _uiState.update { it.copy(statusBanner = "Calage réinitialisé sur la détection auto du refrain.") }
+    }
+
+    /** Half-time / Double-time BPM correction in 1 tap when a track has ambiguous pulse. */
+    fun scaleDetectedSourceBpm(factor: Float) {
+        val baseBpm = _uiState.value.params.sourceBpmOverride.takeIf { it > 55f }
+            ?: _uiState.value.analysis?.bpm ?: 128f
+        val nextBpm = (baseBpm * factor).coerceIn(60f, 240f)
+        updateParams { it.copy(sourceBpmOverride = nextBpm) }
+        _uiState.update {
+            it.copy(statusBanner = "BPM source corrigé à ${nextBpm.roundToInt()} BPM · clique AUTO REMIX C++")
+        }
+    }
+
+    private fun refreshLiveSectionPreview(params: RemixParams) {
+        if (!hasOriginalLoaded) return
+        viewModelScope.launch(Dispatchers.Default) {
+            val previewSecs = runCatching { NativeDspBridge.previewSections(params) }.getOrNull()
+            if (!previewSecs.isNullOrEmpty()) {
+                _uiState.update { it.copy(sectionMarkers = previewSecs) }
+            }
         }
     }
 
@@ -168,47 +244,57 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                 it.copy(
                     activeTab = StudioTab.STUDIO,
                     isBusy = true,
-                    busyMessage = "Décodage & analyse BPM / tonalité…",
+                    busyMessage = "Décodage streaming C++ & détection refrain / BPM…",
                     errorBanner = null,
                     statusBanner = null
                 )
             }
             try {
-                val decodedPcm = withContext(Dispatchers.IO) {
+                // Streams directly into C++ native heap (ZERO 77 MB Java FloatArray allocation!)
+                val analysis = withContext(Dispatchers.IO) {
                     when (item.sourceType) {
                         TrackSourceType.BUILTIN_DEMO ->
-                            NativeDspBridge.generateDemoTrack(item.demoStyleIndex.coerceAtLeast(0), 30f)
+                            NativeDspBridge.loadDemoAndAnalyze(item.demoStyleIndex.coerceAtLeast(0), 30f)
                         TrackSourceType.DEEZER_PREVIEW -> {
                             val filePath = item.localFilePath
                                 ?: throw IllegalStateException("Chemin aperçu Deezer manquant.")
-                            AudioDecoder.decodeFile(File(filePath)).stereoPcm
+                            AudioDecoder.decodeFileToNativeSession(File(filePath))
                         }
                         TrackSourceType.LOCAL_MEDIASTORE, TrackSourceType.SAF_IMPORT -> {
                             val uriStr = item.uriString
                                 ?: throw IllegalStateException("URI audio manquant.")
-                            AudioDecoder.decodeUri(appContext, Uri.parse(uriStr)).stereoPcm
+                            AudioDecoder.decodeUriToNativeSession(appContext, Uri.parse(uriStr))
                         }
                     }
                 }
 
-                val analysis = withContext(Dispatchers.Default) {
-                    NativeDspBridge.analyzeTrack(decodedPcm, AudioDecoder.TARGET_SAMPLE_RATE)
-                }
+                hasOriginalLoaded = analysis.totalFrames > 0
+                currentRemixFrames = 0
+                player.setSessionFrameCounts(originalFrames = analysis.totalFrames, remixFrames = 0)
 
-                currentOriginalPcm = decodedPcm
-                currentRemixPcm = FloatArray(0)
-                player.loadBuffers(original = decodedPcm, remix = null)
+                // Reset track-specific manual drop/BPM overrides cleanly when loading a new song
+                val cleanParams = _uiState.value.params.copy(
+                    sourceBpmOverride = 0f,
+                    gridPhaseNudgeMs = 0f,
+                    gridBeatShift = 0,
+                    drop1BarNudge = 0,
+                    drop2BarNudge = 0,
+                    customDrop1Frac = -1f,
+                    customDrop2Frac = -1f
+                )
 
                 _uiState.update {
                     it.copy(
                         loadedTrack = item.copy(durationMs = (analysis.durationSec * 1000f).toLong()),
                         analysis = analysis,
+                        params = cleanParams,
                         remixResult = null,
                         waveformPeaks = analysis.waveformPeaks,
                         sectionMarkers = analysis.sections,
+                        hasPendingChanges = false,
                         isBusy = false,
                         busyMessage = "",
-                        statusBanner = "Analysé : ${analysis.bpm.roundToInt()} BPM · Clé ${analysis.keyName} (${analysis.rootHz.roundToInt()} Hz)"
+                        statusBanner = "Analysé : ${analysis.bpm.roundToInt()} BPM · Clé ${analysis.keyName} · Refrain 1 @ ${formatTimeSec(analysis.chorus1Sec)} (Mes. ${analysis.chorus1Bar})"
                     )
                 }
 
@@ -229,7 +315,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun renderCurrentRemix() {
         val analysis = _uiState.value.analysis ?: return
-        if (currentOriginalPcm.isEmpty()) return
+        if (!hasOriginalLoaded) return
         val params = _uiState.value.params
         val presetName = _uiState.value.selectedPreset.name
 
@@ -238,32 +324,29 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update {
                 it.copy(
                     isBusy = true,
-                    busyMessage = "Synthèse C++20 ($presetName · ${params.targetBpm.roundToInt()} BPM)…",
+                    busyMessage = "Mixage C++20 ($presetName · ${params.targetBpm.roundToInt()} BPM · ${params.masterMode.label})…",
                     errorBanner = null,
                     statusBanner = null
                 )
             }
             try {
+                // Zero-OOM native render: PCM stays in C++ native heap, Kotlin receives only ~2 KB metadata!
                 val rendered = withContext(Dispatchers.Default) {
-                    NativeDspBridge.renderRemix(
-                        stereoPcm = currentOriginalPcm,
-                        analysis = analysis,
-                        params = params,
-                        sampleRate = AudioDecoder.TARGET_SAMPLE_RATE
-                    )
+                    NativeDspBridge.renderSessionRemix(params, analysis)
                 }
 
-                currentRemixPcm = rendered.stereoPcm
-                player.setRemixBuffer(rendered.stereoPcm, autoSwitchToRemix = true)
+                currentRemixFrames = rendered.totalFrames
+                player.setRemixFrameCount(rendered.totalFrames, autoSwitchToRemix = true)
 
                 _uiState.update {
                     it.copy(
                         remixResult = rendered,
                         waveformPeaks = rendered.waveformPeaks,
                         sectionMarkers = rendered.sections,
+                        hasPendingChanges = false,
                         isBusy = false,
                         busyMessage = "",
-                        statusBanner = "REMIX PRÊT · ${rendered.effectiveTargetBpm.roundToInt()} BPM · Clé ${rendered.keyName} · RMS ${String.format("%.1f", rendered.rmsDb)} dB"
+                        statusBanner = "REMIX PRÊT · ${rendered.effectiveTargetBpm.roundToInt()} BPM · Clé ${rendered.keyName} · RMS ${String.format(Locale.US, "%.1f", rendered.rmsDb)} dB · ${params.masterMode.label}"
                     )
                 }
             } catch (t: Throwable) {
@@ -290,7 +373,8 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
                     rootHz = rootHz,
                     bpm = params.targetBpm,
                     drive = params.drive,
-                    aggression = params.zaagAggression
+                    aggression = params.zaagAggression,
+                    bassSaturation = params.bassSaturation
                 )
                 player.playAuditionLoop(loop)
             }
@@ -308,12 +392,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         } else {
             state.analysis?.waveformPeaks ?: FloatArray(0)
         }
-        val sections = if (playingRemixNow) {
-            state.remixResult?.sections ?: state.analysis?.sections.orEmpty()
-        } else {
-            state.analysis?.sections.orEmpty()
-        }
-        _uiState.update { it.copy(waveformPeaks = peaks, sectionMarkers = sections) }
+        _uiState.update { it.copy(waveformPeaks = peaks) }
     }
 
     fun seekToFraction(frac: Float) = player.seekToFraction(frac)
@@ -328,7 +407,7 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     fun exportCurrentRemix(format: ExportFormat) {
         val track = _uiState.value.loadedTrack ?: return
         val remix = _uiState.value.remixResult
-        if (remix == null || currentRemixPcm.isEmpty()) {
+        if (remix == null || currentRemixFrames <= 0) {
             _uiState.update { it.copy(errorBanner = "Lance d'abord AUTO REMIX avant d'exporter.") }
             return
         }
@@ -340,15 +419,15 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update {
                 it.copy(
                     isBusy = true,
-                    busyMessage = "Export ${format.badge} vers Music/ZaagForge/…",
+                    busyMessage = "Export streaming ${format.badge} vers Music/ZaagForge/…",
                     errorBanner = null
                 )
             }
             try {
                 val exported = withContext(Dispatchers.IO) {
-                    AudioExporter.exportRemix(
+                    AudioExporter.exportSessionRemix(
                         context = appContext,
-                        stereoPcm = currentRemixPcm,
+                        totalRemixFrames = currentRemixFrames,
                         sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
                         baseName = baseName,
                         format = format
@@ -385,10 +464,6 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
         )
         loadTrack(item, autoRemixImmediately = false)
     }
-
-    // -------------------------------------------------------------------------
-    // Deezer Public Search + Spotify / SoundCloud / Deezer Share-Link Bridge
-    // -------------------------------------------------------------------------
 
     fun onDeezerQueryChange(q: String) {
         _uiState.update { it.copy(deezerQuery = q) }
@@ -495,5 +570,11 @@ class ZaagForgeViewModel(application: Application) : AndroidViewModel(applicatio
     override fun onCleared() {
         super.onCleared()
         player.release()
+        runCatching { NativeDspBridge.nativeSessionClear() }
+    }
+
+    private fun formatTimeSec(sec: Float): String {
+        val total = sec.coerceAtLeast(0f).roundToInt()
+        return String.format(Locale.US, "%d:%02d", total / 60, total % 60)
     }
 }

@@ -5,38 +5,33 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import com.zaagforge.studio.dsp.NativeDspBridge
+import com.zaagforge.studio.model.TrackAnalysis
 import java.io.File
 import java.nio.ByteOrder
-import kotlin.math.min
-
-data class DecodedAudio(
-    val stereoPcm: FloatArray,
-    val sampleRate: Int,
-    val durationSec: Float
-)
 
 /**
- * Decodes local MP3, WAV, FLAC, M4A, or OGG files (or cached Deezer previews) via Android
- * MediaExtractor + MediaCodec into interleaved Stereo Float32 PCM at 44,100 Hz.
+ * Zero-OOM streaming audio decoder for MP3, WAV, FLAC, M4A, and OGG files:
+ * Streams small 16-bit PCM chunks directly from Android MediaCodec into C++ native RAM
+ * (`NativeDspBridge.nativeSessionAppendPcm16`), never allocating a giant FloatArray on ART's
+ * 256 MB Java heap! Supports full 5–8 minute tracks smoothly without OOM.
  */
 object AudioDecoder {
     const val TARGET_SAMPLE_RATE = 44100
-    // Cap at 5 minutes (44100 * 2 * 300 = ~26.4M floats) so Snapdragon RAM stays crisp & snappy
-    private const val MAX_DURATION_SEC = 300
 
-    fun decodeUri(context: Context, uri: Uri): DecodedAudio {
+    fun decodeUriToNativeSession(context: Context, uri: Uri): TrackAnalysis {
         val extractor = MediaExtractor()
         extractor.setDataSource(context, uri, null)
-        return decodeExtractor(extractor)
+        return decodeExtractorToSession(extractor)
     }
 
-    fun decodeFile(file: File): DecodedAudio {
+    fun decodeFileToNativeSession(file: File): TrackAnalysis {
         val extractor = MediaExtractor()
         extractor.setDataSource(file.absolutePath)
-        return decodeExtractor(extractor)
+        return decodeExtractorToSession(extractor)
     }
 
-    private fun decodeExtractor(extractor: MediaExtractor): DecodedAudio {
+    private fun decodeExtractorToSession(extractor: MediaExtractor): TrackAnalysis {
         var codec: MediaCodec? = null
         try {
             var trackIndex = -1
@@ -59,18 +54,20 @@ object AudioDecoder {
             var srcSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             var srcChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceAtLeast(1)
 
+            NativeDspBridge.nativeSessionBeginDecode(srcSampleRate, srcChannels)
+
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
             codec.start()
-
-            val maxSrcFrames = srcSampleRate.toLong() * MAX_DURATION_SEC
-            val chunks = ArrayList<ShortArray>(256)
-            var totalSrcSamples = 0L
 
             val bufferInfo = MediaCodec.BufferInfo()
             var sawInputEos = false
             var sawOutputEos = false
             val timeoutUs = 10_000L
+
+            // Tiny reusable scratch ShortArray (never allocates > 64 KB on Java heap!)
+            var scratch = ShortArray(16384)
+            var totalAppended = 0L
 
             while (!sawOutputEos) {
                 if (!sawInputEos) {
@@ -78,7 +75,7 @@ object AudioDecoder {
                     if (inIdx >= 0) {
                         val inBuf = codec.getInputBuffer(inIdx)!!
                         val sampleSize = extractor.readSampleData(inBuf, 0)
-                        if (sampleSize < 0 || (totalSrcSamples / srcChannels) >= maxSrcFrames) {
+                        if (sampleSize < 0) {
                             codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             sawInputEos = true
                         } else {
@@ -99,10 +96,16 @@ object AudioDecoder {
                             val shortBuf = outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
                             val count = shortBuf.remaining()
                             if (count > 0) {
-                                val arr = ShortArray(count)
-                                shortBuf.get(arr)
-                                chunks.add(arr)
-                                totalSrcSamples += count
+                                if (scratch.size < count) {
+                                    scratch = ShortArray(count)
+                                }
+                                shortBuf.get(scratch, 0, count)
+                                totalAppended += count
+                                val keepGoing = NativeDspBridge.nativeSessionAppendPcm16(scratch, count)
+                                if (!keepGoing) {
+                                    sawInputEos = true
+                                    sawOutputEos = true
+                                }
                             }
                         }
                         codec.releaseOutputBuffer(outIdx, false)
@@ -118,52 +121,16 @@ object AudioDecoder {
                         if (newFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                             srcChannels = newFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceAtLeast(1)
                         }
+                        NativeDspBridge.nativeSessionUpdateFormat(srcSampleRate, srcChannels)
                     }
                 }
             }
 
-            if (totalSrcSamples <= 0L) {
+            if (totalAppended <= 0L) {
                 throw IllegalStateException("Décodage audio vide.")
             }
 
-            val srcFrames = min(totalSrcSamples / srcChannels, maxSrcFrames).toInt()
-            val rawStereo = FloatArray(srcFrames * 2)
-            var frameCursor = 0
-            var chCursor = 0
-            var accL = 0f
-            var accR = 0f
-            val invScale = 1f / 32768f
-
-            for (chunk in chunks) {
-                for (s in chunk) {
-                    if (frameCursor >= srcFrames) break
-                    val v = s * invScale
-                    if (srcChannels == 1) {
-                        rawStereo[frameCursor * 2] = v
-                        rawStereo[frameCursor * 2 + 1] = v
-                        frameCursor++
-                    } else {
-                        if (chCursor == 0) accL = v
-                        else if (chCursor == 1) accR = v
-                        chCursor++
-                        if (chCursor >= srcChannels) {
-                            rawStereo[frameCursor * 2] = accL
-                            rawStereo[frameCursor * 2 + 1] = accR
-                            frameCursor++
-                            chCursor = 0
-                        }
-                    }
-                }
-                if (frameCursor >= srcFrames) break
-            }
-
-            val finalPcm = if (srcSampleRate == TARGET_SAMPLE_RATE) {
-                rawStereo
-            } else {
-                resampleStereoLinear(rawStereo, srcSampleRate, TARGET_SAMPLE_RATE)
-            }
-            val durationSec = finalPcm.size / 2f / TARGET_SAMPLE_RATE
-            return DecodedAudio(finalPcm, TARGET_SAMPLE_RATE, durationSec)
+            return NativeDspBridge.finalizeDecodeAndAnalyze()
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
@@ -171,6 +138,7 @@ object AudioDecoder {
         }
     }
 
+    /** Pure-Kotlin stereo linear resampler kept for JVM unit verification. */
     internal fun resampleStereoLinear(src: FloatArray, srcRate: Int, dstRate: Int): FloatArray {
         val srcFrames = src.size / 2
         if (srcFrames <= 1 || srcRate <= 0 || srcRate == dstRate) return src

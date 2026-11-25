@@ -14,17 +14,47 @@ enum class SectionKind(val nativeId: Int, val shortLabel: String) {
     }
 }
 
+enum class MasterMode(val nativeId: Int, val label: String, val subtitle: String) {
+    STUDIO_CLEAN(0, "STUDIO CLEAN", "Voix limpides & basses nettes"),
+    CLUB_PUNCH(1, "CLUB PUNCH", "Glue club & punch maîtrisé"),
+    FESTIVAL_HARD(2, "FESTIVAL HARD", "Loudness max & clipper 2×");
+
+    companion object {
+        fun fromNativeId(id: Int): MasterMode = entries.firstOrNull { it.nativeId == id } ?: STUDIO_CLEAN
+    }
+}
+
+enum class DropAlignmentMode(val nativeId: Int, val label: String) {
+    AUTO_CHORUS(0, "AUTO REFRAIN"),
+    DIRECT_DROP(1, "DROP DIRECT"),
+    VOCALS_FIRST(2, "PAROLES D'ABORD"),
+    DOUBLE_DROP(3, "DOUBLE DROP");
+
+    companion object {
+        fun fromNativeId(id: Int): DropAlignmentMode = entries.firstOrNull { it.nativeId == id } ?: AUTO_CHORUS
+    }
+}
+
 data class SectionMarker(
     val startFrac: Float,
     val endFrac: Float,
     val kind: SectionKind,
-    val label: String = kind.shortLabel
+    val label: String = kind.shortLabel,
+    val startBar: Int = 0,
+    val endBar: Int = 0
 )
 
 data class TrackAnalysis(
     val bpm: Float,
     val bpmConfidence: Float,
     val beatOffsetSec: Float,
+    val downbeatBeatIndex: Int = 0,
+    val downbeatSec: Float = 0f,
+    val totalBars: Int = 8,
+    val chorus1Bar: Int = 4,
+    val chorus2Bar: Int = 8,
+    val chorus1Sec: Float = 0f,
+    val chorus2Sec: Float = 0f,
     val keyIndex: Int,
     val isMinor: Boolean,
     val rootMidi: Int,
@@ -32,12 +62,16 @@ data class TrackAnalysis(
     val keyName: String,
     val durationSec: Float,
     val avgRmsDb: Float,
+    val totalFrames: Int = 0,
     val sections: List<SectionMarker>,
     val waveformPeaks: FloatArray
 )
 
+/**
+ * Lightweight metadata returned from native C++ render (actual PCM stays in C++ native heap -> ZERO OOM!).
+ */
 data class RemixRenderResult(
-    val stereoPcm: FloatArray,
+    val totalFrames: Int,
     val waveformPeaks: FloatArray,
     val sections: List<SectionMarker>,
     val sourceBpm: Float,

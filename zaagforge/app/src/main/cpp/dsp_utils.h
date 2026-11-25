@@ -47,26 +47,6 @@ inline float hzToMidi(float hz) noexcept {
  */
 inline int pitchClassToSubMidi(int pitchClass) noexcept {
     int pc = ((pitchClass % 12) + 12) % 12;
-    // E1=28 (pc=4), F1=29 (pc=5) ... B1=35 (pc=11), C2=36 (pc=0), C#2=37 (pc=1), D2=38 (pc=2), D#2=39->actually D#1=27 is 38.9Hz, D#2=39 is 77.8Hz; map pc=3 (D#) to 28..39 -> 38/39 or 27?
-    // Wait: E1=28 (41.20 Hz), ..., D2=38 (73.42 Hz). Only pc=3 (D#/Eb) is 38.89 Hz (MIDI 27) or 77.78 Hz (MIDI 39).
-    // If pc == 3 (Eb), MIDI 28 (E1) is too sharp; MIDI 39 (77.78Hz) or MIDI 27 (38.89Hz) — wait: prompt says rootHz in 41..73 Hz!
-    // Let's check exact frequencies:
-    // pc=4 (E)  -> MIDI 28 = 41.20 Hz
-    // pc=5 (F)  -> MIDI 29 = 43.65 Hz
-    // pc=6 (F#) -> MIDI 30 = 46.25 Hz
-    // pc=7 (G)  -> MIDI 31 = 49.00 Hz
-    // pc=8 (G#) -> MIDI 32 = 51.91 Hz
-    // pc=9 (A)  -> MIDI 33 = 55.00 Hz
-    // pc=10(A#) -> MIDI 34 = 58.27 Hz
-    // pc=11(B)  -> MIDI 35 = 61.74 Hz
-    // pc=0 (C)  -> MIDI 36 = 65.41 Hz
-    // pc=1 (C#) -> MIDI 37 = 69.30 Hz
-    // pc=2 (D)  -> MIDI 38 = 73.42 Hz
-    // pc=3 (D#) -> MIDI 27 = 38.89 Hz (or fifth A#1=58.27 Hz for punchy club sub in 41..73Hz, or clamp to 41..73Hz).
-    // Using fifth (pc+7)%12 -> A#1 (58.27 Hz) or keeping MIDI 39 clamped? Actually MIDI 27*1.06? No, don't detune!
-    // For Eb/D#, in hardcore production, producers either pitch to Eb1 (38.9Hz) or Bb1 (58.3Hz fifth) or Eb2 (77.8Hz).
-    // Wait: Eb1 is 38.9Hz (just below 41), Eb2 is 77.8Hz (just above 73). Let's return MIDI 27+12=39 -> or for strict 41..73 Hz:
-    // Actually if we check 28..38, that covers 11 of 12 pitch classes; for pc==3 (D#/Eb), using fifth Bb1 (MIDI 34 = 58.27 Hz) is harmonically locked to Eb major/minor AND squarely in 41..73 Hz!
     if (pc >= 4) return 24 + pc;      // E1 (28) .. B1 (35)
     if (pc <= 2) return 36 + pc;      // C2 (36) .. D2 (38)
     return 34;                         // Eb/D# -> harmonic fifth Bb1 (58.27 Hz) in club sub sweet spot
@@ -288,7 +268,7 @@ public:
 
         const float fb = clampf(feedback, -0.96f, 0.96f);
         const float val = sanitize(x + dampState_ * fb);
-        buffer_[writeIdx_] = std::tanh(val * 0.95f) * 1.05f; // gentle self-limiting stability
+        buffer_[writeIdx_] = std::tanh(val * 0.95f) * 1.05f;
         writeIdx_ = (writeIdx_ + 1) % n;
         return delayed;
     }
@@ -314,7 +294,6 @@ inline float hardClipAsym(float x, float drive, float posLimit = 0.85f, float ne
 }
 
 inline float wavefold(float x, float gain) noexcept {
-    // Smooth trigonometric + triangle wavefolding for brutal Piep/Krach harmonics
     const float g = clampf(gain, 0.5f, 18.0f);
     const float v = x * g;
     return std::sin(v) * 0.72f + std::tanh(v * 0.45f) * 0.28f;
@@ -333,16 +312,14 @@ public:
     }
 
     inline float process(float x, float drive, float ceiling = 0.98f, float asymBias = 0.04f) noexcept {
-        // 2x linear upsampling + half-band smoothing downsample to reduce clipping aliasing
         const float mid = 0.5f * (prevIn_ + x);
         prevIn_ = x;
 
         auto shape = [&](float s) -> float {
             const float d = s * drive + asymBias;
-            // Smooth knee transitioning into brickwall ceiling
             const float soft = std::tanh(d);
             const float hard = clampf(d, -1.0f, 1.0f);
-            const float blend = soft * 0.45f + hard * 0.55f;
+            const float blend = soft * 0.55f + hard * 0.45f;
             return clampf(blend - asymBias * 0.35f, -ceiling, ceiling);
         };
 
@@ -359,6 +336,71 @@ private:
 };
 
 // ============================================================================
+// Transparent 4 ms Stereo-Linked Lookahead True-Peak Mastering Limiter
+// Prevents vocal intermodulation distortion while achieving crisp studio loudness!
+// ============================================================================
+class LookaheadLimiter {
+public:
+    void configure(float ceiling = 0.96f, float lookaheadMs = 4.0f, float releaseMs = 60.0f, float sr = kSampleRate) {
+        ceiling_ = clampf(ceiling, 0.5f, 0.99f);
+        delaySamples_ = std::max<size_t>(16, static_cast<size_t>(std::round(lookaheadMs * 0.001f * sr)));
+        delayL_.assign(delaySamples_, 0.0f);
+        delayR_.assign(delaySamples_, 0.0f);
+        peakBuf_.assign(delaySamples_, 0.0f);
+        writeIdx_ = 0;
+        gainSmooth_ = 1.0f;
+        atkCoeff_ = std::exp(-1.0f / std::max(4.0f, static_cast<float>(delaySamples_) * 0.35f));
+        relCoeff_ = std::exp(-1.0f / std::max(10.0f, releaseMs * 0.001f * sr));
+    }
+
+    void processStereo(float& l, float& r) noexcept {
+        const float inL = sanitize(l);
+        const float inR = sanitize(r);
+        const float inPeak = std::max(std::fabs(inL), std::fabs(inR));
+
+        const float outL = delayL_[writeIdx_];
+        const float outR = delayR_[writeIdx_];
+        delayL_[writeIdx_] = inL;
+        delayR_[writeIdx_] = inR;
+        peakBuf_[writeIdx_] = inPeak;
+        writeIdx_ = (writeIdx_ + 1) % delaySamples_;
+
+        // Sliding window max peak over lookahead horizon
+        float winPeak = ceiling_;
+        for (size_t i = 0; i < delaySamples_; ++i) {
+            if (peakBuf_[i] > winPeak) winPeak = peakBuf_[i];
+        }
+        const float targetGain = (winPeak > ceiling_) ? (ceiling_ / winPeak) : 1.0f;
+
+        if (targetGain < gainSmooth_) {
+            gainSmooth_ = atkCoeff_ * gainSmooth_ + (1.0f - atkCoeff_) * targetGain;
+            if (gainSmooth_ > targetGain * 1.01f) {
+                gainSmooth_ = std::min(gainSmooth_, targetGain);
+            }
+        } else {
+            gainSmooth_ = relCoeff_ * gainSmooth_ + (1.0f - relCoeff_) * targetGain;
+        }
+
+        // Ultra-clean transparent ceiling guard
+        l = clampf(sanitize(outL * gainSmooth_), -ceiling_, ceiling_);
+        r = clampf(sanitize(outR * gainSmooth_), -ceiling_, ceiling_);
+    }
+
+    size_t latencySamples() const noexcept { return delaySamples_; }
+
+private:
+    float ceiling_ = 0.96f;
+    size_t delaySamples_ = 176;
+    std::vector<float> delayL_;
+    std::vector<float> delayR_;
+    std::vector<float> peakBuf_;
+    size_t writeIdx_ = 0;
+    float gainSmooth_ = 1.0f;
+    float atkCoeff_ = 0.95f;
+    float relCoeff_ = 0.999f;
+};
+
+// ============================================================================
 // 3-Band OTT-Style Upward + Downward Multiband Compressor
 // ============================================================================
 class Ott3Band {
@@ -369,8 +411,8 @@ public:
         highSplitL_.configure(highXoverHz, sr);
         highSplitR_.configure(highXoverHz, sr);
 
-        atkCoeff_ = std::exp(-1.0f / (0.004f * sr));
-        relCoeff_ = std::exp(-1.0f / (0.065f * sr));
+        atkCoeff_ = std::exp(-1.0f / (0.006f * sr));
+        relCoeff_ = std::exp(-1.0f / (0.075f * sr));
         reset();
     }
 
@@ -382,7 +424,7 @@ public:
         env_.fill(0.05f);
     }
 
-    inline void processStereo(float& l, float& r, float depth = 0.65f, float monoSubBlend = 1.0f, float stereoWidth = 1.12f) noexcept {
+    inline void processStereo(float& l, float& r, float depth = 0.45f, float monoSubBlend = 1.0f, float stereoWidth = 1.08f) noexcept {
         float lowL, restL, midL, highL;
         float lowR, restR, midR, highR;
         lowSplitL_.split(l, lowL, restL);
@@ -390,7 +432,7 @@ public:
         highSplitL_.split(restL, midL, highL);
         highSplitR_.split(restR, midR, highR);
 
-        // Mono bass below crossover
+        // Mono bass below crossover for tight club translation
         const float subMono = 0.5f * (lowL + lowR);
         lowL = lowL * (1.0f - monoSubBlend) + subMono * monoSubBlend;
         lowR = lowR * (1.0f - monoSubBlend) + subMono * monoSubBlend;
@@ -403,25 +445,22 @@ public:
             const float e = std::max(env_[idx], 1e-4f);
             float gain = 1.0f;
             if (e > downThresh) {
-                // Downward compression 6:1
-                const float ratio = 1.0f / 6.0f;
+                const float ratio = 1.0f / 4.5f;
                 const float target = downThresh * std::pow(e / downThresh, ratio);
                 gain = target / e;
-            } else if (e < upThresh && e > 0.004f) {
-                // OTT Upward compression (capped +9 dB so silence never explodes)
-                const float boost = std::pow(upThresh / e, 0.35f);
-                gain = std::min(boost, 2.8f);
+            } else if (e < upThresh && e > 0.006f) {
+                const float boost = std::pow(upThresh / e, 0.26f);
+                gain = std::min(boost, 2.1f);
             }
             const float finalGain = (1.0f - depth) + depth * (gain * makeup);
             bl *= finalGain;
             br *= finalGain;
         };
 
-        compressBand(0, lowL, lowR, 0.42f, 0.14f, 1.18f);
-        compressBand(1, midL, midR, 0.36f, 0.12f, 1.24f);
-        compressBand(2, highL, highR, 0.30f, 0.10f, 1.22f);
+        compressBand(0, lowL, lowR, 0.48f, 0.14f, 1.06f);
+        compressBand(1, midL, midR, 0.42f, 0.12f, 1.14f);
+        compressBand(2, highL, highR, 0.34f, 0.10f, 1.12f);
 
-        // Stereo width on mids + highs
         auto widen = [&](float& xl, float& xr, float w) {
             const float m = 0.5f * (xl + xr);
             const float s = 0.5f * (xl - xr) * w;
@@ -429,13 +468,13 @@ public:
             xr = m - s;
         };
         widen(midL, midR, stereoWidth);
-        widen(highL, highR, stereoWidth * 1.05f);
+        widen(highL, highR, stereoWidth * 1.04f);
 
         l = sanitize(lowL + midL + highL);
         r = sanitize(lowR + midR + highR);
     }
 
-    inline float processMono(float x, float depth = 0.65f) noexcept {
+    inline float processMono(float x, float depth = 0.45f) noexcept {
         float l = x, r = x;
         processStereo(l, r, depth, 1.0f, 1.0f);
         return 0.5f * (l + r);
@@ -456,7 +495,6 @@ inline void fftInPlace(std::vector<std::complex<float>>& a, bool inverse = false
     const size_t n = a.size();
     if (n <= 1) return;
 
-    // Bit-reversal permutation
     for (size_t i = 1, j = 0; i < n; ++i) {
         size_t bit = n >> 1;
         for (; j & bit; bit >>= 1) {

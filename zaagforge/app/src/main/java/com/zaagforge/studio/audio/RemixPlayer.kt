@@ -3,6 +3,7 @@ package com.zaagforge.studio.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import com.zaagforge.studio.dsp.NativeDspBridge
 import com.zaagforge.studio.model.MeterReading
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -12,11 +13,9 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Low-latency real-time Stereo PCM player featuring:
- * - Instant zero-glitch A/B comparison toggle between ORIGINAL and REMIX buffers (synced by progress %)
- * - Interactive waveform seeking and section jumping
- * - Live L/R peak + peak-hold VU meter telemetry
- * - One-shot Kick Audition Pad playback
+ * Zero-OOM low-latency Stereo PCM player:
+ * Streams tiny 1024-frame (8 KB) chunks directly from the C++ native audio session store
+ * with instant zero-glitch A/B comparison toggle between ORIGINAL and REMIX buffers!
  */
 class RemixPlayer(
     private val sampleRate: Int = AudioDecoder.TARGET_SAMPLE_RATE
@@ -24,10 +23,10 @@ class RemixPlayer(
     private val lock = Any()
 
     @Volatile
-    private var originalPcm: FloatArray = FloatArray(0)
+    private var originalTotalFrames: Int = 0
 
     @Volatile
-    private var remixPcm: FloatArray = FloatArray(0)
+    private var remixTotalFrames: Int = 0
 
     @Volatile
     private var auditionPcm: FloatArray? = null
@@ -62,21 +61,21 @@ class RemixPlayer(
     private val _meter = MutableStateFlow(MeterReading())
     val meter: StateFlow<MeterReading> = _meter.asStateFlow()
 
-    fun loadBuffers(original: FloatArray, remix: FloatArray? = null) {
+    fun setSessionFrameCounts(originalFrames: Int, remixFrames: Int = 0) {
         synchronized(lock) {
-            originalPcm = original
-            remixPcm = remix ?: FloatArray(0)
-            playingRemix = remix != null && remix.isNotEmpty()
+            originalTotalFrames = originalFrames.coerceAtLeast(0)
+            remixTotalFrames = remixFrames.coerceAtLeast(0)
+            playingRemix = remixTotalFrames > 0
             _isRemixActive.value = playingRemix
             positionFraction = 0f
             _progress.value = 0f
         }
     }
 
-    fun setRemixBuffer(remix: FloatArray, autoSwitchToRemix: Boolean = true) {
+    fun setRemixFrameCount(remixFrames: Int, autoSwitchToRemix: Boolean = true) {
         synchronized(lock) {
-            remixPcm = remix
-            if (autoSwitchToRemix && remix.isNotEmpty()) {
+            remixTotalFrames = remixFrames.coerceAtLeast(0)
+            if (autoSwitchToRemix && remixTotalFrames > 0) {
                 playingRemix = true
                 _isRemixActive.value = true
             }
@@ -85,9 +84,7 @@ class RemixPlayer(
 
     fun toggleAbSource() {
         synchronized(lock) {
-            val hasRemix = remixPcm.isNotEmpty()
-            val hasOrig = originalPcm.isNotEmpty()
-            if (!hasRemix || !hasOrig) return
+            if (remixTotalFrames <= 0 || originalTotalFrames <= 0) return
             playingRemix = !playingRemix
             _isRemixActive.value = playingRemix
         }
@@ -95,8 +92,8 @@ class RemixPlayer(
 
     fun setPlayRemix(useRemix: Boolean) {
         synchronized(lock) {
-            if (useRemix && remixPcm.isEmpty()) return
-            if (!useRemix && originalPcm.isEmpty()) return
+            if (useRemix && remixTotalFrames <= 0) return
+            if (!useRemix && originalTotalFrames <= 0) return
             playingRemix = useRemix
             _isRemixActive.value = useRemix
         }
@@ -124,8 +121,7 @@ class RemixPlayer(
     }
 
     fun play() {
-        val active = currentActiveBuffer()
-        if (active.isEmpty()) return
+        if (currentActiveFrameCount() <= 0) return
         auditionPcm = null
         isPlayingFlag = true
         _isPlaying.value = true
@@ -154,11 +150,10 @@ class RemixPlayer(
         _meter.value = MeterReading()
     }
 
-    private fun currentActiveBuffer(): FloatArray {
-        val r = remixPcm
-        val o = originalPcm
-        return if (playingRemix && r.isNotEmpty()) r else o
-    }
+    private fun isCurrentlyReadingRemix(): Boolean = playingRemix && remixTotalFrames > 0
+
+    private fun currentActiveFrameCount(): Int =
+        if (isCurrentlyReadingRemix()) remixTotalFrames else originalTotalFrames
 
     private fun ensureWorkerRunning() {
         synchronized(lock) {
@@ -212,9 +207,7 @@ class RemixPlayer(
                     val startFrame = auditionCursorFrame
                     if (startFrame >= totalAudFrames) {
                         auditionPcm = null
-                        if (!isPlayingFlag) {
-                            _meter.value = MeterReading()
-                        }
+                        if (!isPlayingFlag) _meter.value = MeterReading()
                         continue
                     }
                     val count = minOf(chunkFrames, totalAudFrames - startFrame)
@@ -240,35 +233,41 @@ class RemixPlayer(
                     continue
                 }
 
-                val buf = currentActiveBuffer()
-                val totalFrames = buf.size / 2
+                val useRemix = isCurrentlyReadingRemix()
+                val totalFrames = if (useRemix) remixTotalFrames else originalTotalFrames
                 if (totalFrames <= 0) {
                     isPlayingFlag = false
                     _isPlaying.value = false
                     continue
                 }
 
-                var framePos = (positionFraction * totalFrames).toInt().coerceIn(0, totalFrames - 1)
-                val count = minOf(chunkFrames, totalFrames - framePos)
-                System.arraycopy(buf, framePos * 2, chunk, 0, count * 2)
-                framePos += count
+                val framePos = (positionFraction * totalFrames).toInt().coerceIn(0, totalFrames - 1)
+                val readFrames = NativeDspBridge.nativeSessionReadFloatChunk(useRemix, framePos, chunkFrames, chunk)
+                if (readFrames <= 0) {
+                    positionFraction = 0f
+                    _progress.value = 0f
+                    isPlayingFlag = false
+                    _isPlaying.value = false
+                    continue
+                }
 
-                track.write(chunk, 0, count * 2, AudioTrack.WRITE_BLOCKING)
+                track.write(chunk, 0, readFrames * 2, AudioTrack.WRITE_BLOCKING)
 
-                if (framePos >= totalFrames) {
+                val nextFrame = framePos + readFrames
+                if (nextFrame >= totalFrames) {
                     positionFraction = 0f
                     _progress.value = 0f
                     isPlayingFlag = false
                     _isPlaying.value = false
                 } else {
-                    val nextFrac = framePos.toFloat() / totalFrames.toFloat()
+                    val nextFrac = nextFrame.toFloat() / totalFrames.toFloat()
                     positionFraction = nextFrac
                     if (meterTick % 2 == 0) {
                         _progress.value = nextFrac
                     }
                 }
                 meterTick++
-                val (hl, hr) = updateMeter(chunk, count, holdL, holdR)
+                val (hl, hr) = updateMeter(chunk, readFrames, holdL, holdR)
                 holdL = hl
                 holdR = hr
             }

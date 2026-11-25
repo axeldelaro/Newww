@@ -7,8 +7,8 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
-import android.os.Environment
 import android.provider.MediaStore
+import com.zaagforge.studio.dsp.NativeDspBridge
 import com.zaagforge.studio.model.ExportFormat
 import com.zaagforge.studio.model.ExportedRemix
 import java.io.ByteArrayOutputStream
@@ -20,9 +20,9 @@ import java.nio.ByteOrder
 import kotlin.math.roundToInt
 
 /**
- * Exports rendered ZAAGFORGE remixes directly into public `Music/ZaagForge/` via Scoped Storage
+ * Zero-OOM streaming exporter for ZAAGFORGE remixes into public `Music/ZaagForge/` via Scoped Storage
  * (`MediaStore.Audio`) as M4A (AAC 256 kbps hardware MediaCodec + MediaMuxer) or 16-bit 44.1 kHz WAV.
- * Files saved here are automatically discovered by StrikeCam Arcade!
+ * Pulls small 32 KB chunks directly from the C++ native remix buffer -> zero Java heap spike!
  */
 object AudioExporter {
     const val EXPORT_RELATIVE_DIR = "Music/ZaagForge/"
@@ -35,13 +35,16 @@ object AudioExporter {
         return cleaned.ifBlank { "ZaagForge_Remix" }
     }
 
-    fun exportRemix(
+    fun exportSessionRemix(
         context: Context,
-        stereoPcm: FloatArray,
+        totalRemixFrames: Int,
         sampleRate: Int,
         baseName: String,
         format: ExportFormat
     ): ExportedRemix {
+        if (totalRemixFrames <= 0) {
+            throw IllegalStateException("Aucun remix rendu en mémoire.")
+        }
         val safeBase = sanitizeFileName(baseName)
         val displayName = "${safeBase}.${format.extension}"
 
@@ -63,13 +66,13 @@ object AudioExporter {
             when (format) {
                 ExportFormat.WAV -> {
                     resolver.openOutputStream(itemUri)?.use { out ->
-                        bytesWritten = writeWavStream(stereoPcm, sampleRate, out)
+                        bytesWritten = writeNativeWavStream(totalRemixFrames, sampleRate, out)
                     } ?: throw IllegalStateException("Flux de sortie WAV indisponible.")
                 }
                 ExportFormat.M4A -> {
                     val tempM4a = File(context.cacheDir, "export_${System.currentTimeMillis()}.m4a")
                     try {
-                        encodeAacM4a(stereoPcm, sampleRate, tempM4a)
+                        encodeNativeAacM4a(totalRemixFrames, sampleRate, tempM4a)
                         bytesWritten = tempM4a.length()
                         resolver.openOutputStream(itemUri)?.use { out ->
                             FileInputStream(tempM4a).use { inp -> inp.copyTo(out) }
@@ -156,8 +159,8 @@ object AudioExporter {
         buf.putInt(riffChunkSize)
         buf.put("WAVE".toByteArray(Charsets.US_ASCII))
         buf.put("fmt ".toByteArray(Charsets.US_ASCII))
-        buf.putInt(16) // PCM fmt chunk size
-        buf.putShort(1) // AudioFormat = PCM
+        buf.putInt(16)
+        buf.putShort(1)
         buf.putShort(channels.toShort())
         buf.putInt(sampleRate)
         buf.putInt(byteRate)
@@ -170,21 +173,13 @@ object AudioExporter {
 
     fun buildWavBytes(stereoPcm: FloatArray, sampleRate: Int): ByteArray {
         val out = ByteArrayOutputStream(44 + stereoPcm.size * 2)
-        writeWavStream(stereoPcm, sampleRate, out)
-        return out.toByteArray()
-    }
-
-    private fun writeWavStream(stereoPcm: FloatArray, sampleRate: Int, out: OutputStream): Long {
         val frames = stereoPcm.size / 2
-        val header = buildWavHeader(frames, sampleRate)
-        out.write(header)
-
-        val chunkSamples = 16384
-        val byteBuf = ByteArray(chunkSamples * 2)
+        out.write(buildWavHeader(frames, sampleRate))
+        val byteBuf = ByteArray(16384 * 2)
         var idx = 0
         val totalSamples = frames * 2
         while (idx < totalSamples) {
-            val count = minOf(chunkSamples, totalSamples - idx)
+            val count = minOf(16384, totalSamples - idx)
             var b = 0
             for (i in 0 until count) {
                 val clamped = stereoPcm[idx + i].coerceIn(-1f, 1f)
@@ -195,11 +190,37 @@ object AudioExporter {
             out.write(byteBuf, 0, b)
             idx += count
         }
-        out.flush()
-        return 44L + totalSamples.toLong() * 2L
+        return out.toByteArray()
     }
 
-    private fun encodeAacM4a(stereoPcm: FloatArray, sampleRate: Int, outFile: File) {
+    private fun writeNativeWavStream(totalFrames: Int, sampleRate: Int, out: OutputStream): Long {
+        out.write(buildWavHeader(totalFrames, sampleRate))
+
+        val chunkFrames = 8192
+        val shortBuf = ShortArray(chunkFrames * 2)
+        val byteBuf = ByteArray(chunkFrames * 4)
+        var frameCursor = 0
+        var writtenFrames = 0L
+
+        while (frameCursor < totalFrames) {
+            val req = minOf(chunkFrames, totalFrames - frameCursor)
+            val got = NativeDspBridge.nativeSessionReadPcm16Chunk(true, frameCursor, req, shortBuf)
+            if (got <= 0) break
+            var b = 0
+            for (i in 0 until got * 2) {
+                val s = shortBuf[i].toInt()
+                byteBuf[b++] = (s and 0xFF).toByte()
+                byteBuf[b++] = ((s ushr 8) and 0xFF).toByte()
+            }
+            out.write(byteBuf, 0, b)
+            frameCursor += got
+            writtenFrames += got
+        }
+        out.flush()
+        return 44L + writtenFrames * 4L
+    }
+
+    private fun encodeNativeAacM4a(totalFrames: Int, sampleRate: Int, outFile: File) {
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, 256_000)
@@ -215,11 +236,11 @@ object AudioExporter {
             codec.start()
 
             val info = MediaCodec.BufferInfo()
-            var sampleCursor = 0
-            val totalSamples = (stereoPcm.size / 2) * 2
+            var frameCursor = 0
             var inputDone = false
             var outputDone = false
             val timeoutUs = 10_000L
+            var scratch = ShortArray(8192)
 
             while (!outputDone) {
                 if (!inputDone) {
@@ -227,22 +248,29 @@ object AudioExporter {
                     if (inIdx >= 0) {
                         val inBuf = codec.getInputBuffer(inIdx)!!
                         inBuf.clear()
-                        val maxShorts = inBuf.capacity() / 2
-                        val remaining = totalSamples - sampleCursor
+                        val maxFrames = inBuf.capacity() / 4
+                        val remaining = totalFrames - frameCursor
                         if (remaining <= 0) {
-                            val eosPtsUs = (sampleCursor / 2L) * 1_000_000L / sampleRate
+                            val eosPtsUs = frameCursor.toLong() * 1_000_000L / sampleRate
                             codec.queueInputBuffer(inIdx, 0, 0, eosPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputDone = true
                         } else {
-                            val toWrite = minOf(maxShorts, remaining)
-                            val ptsUs = (sampleCursor / 2L) * 1_000_000L / sampleRate
-                            val shortBuf = inBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-                            for (i in 0 until toWrite) {
-                                val v = stereoPcm[sampleCursor + i].coerceIn(-1f, 1f)
-                                shortBuf.put((v * 32767f).roundToInt().coerceIn(-32768, 32767).toShort())
+                            val reqFrames = minOf(maxFrames, remaining)
+                            if (scratch.size < reqFrames * 2) {
+                                scratch = ShortArray(reqFrames * 2)
                             }
-                            sampleCursor += toWrite
-                            codec.queueInputBuffer(inIdx, 0, toWrite * 2, ptsUs, 0)
+                            val gotFrames = NativeDspBridge.nativeSessionReadPcm16Chunk(true, frameCursor, reqFrames, scratch)
+                            if (gotFrames <= 0) {
+                                val eosPtsUs = frameCursor.toLong() * 1_000_000L / sampleRate
+                                codec.queueInputBuffer(inIdx, 0, 0, eosPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                val ptsUs = frameCursor.toLong() * 1_000_000L / sampleRate
+                                val shortBuf = inBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                                shortBuf.put(scratch, 0, gotFrames * 2)
+                                frameCursor += gotFrames
+                                codec.queueInputBuffer(inIdx, 0, gotFrames * 4, ptsUs, 0)
+                            }
                         }
                     }
                 }

@@ -20,8 +20,9 @@ struct KickParams {
     KickType type = KickType::ZAAG_CHAINSAW;
     float rootHz = 55.0f;           // Key-locked sub root (41..73 Hz)
     float bpm = 200.0f;             // Tempo for exact beat-length envelope
-    float drive = 0.85f;            // 0..1 distortion intensity
+    float drive = 0.85f;            // 0..1 upper kick character distortion intensity
     float aggression = 0.85f;       // 0..1 piep resonance / zaag buzz / krach metallic grit
+    float bassSaturation = 0.35f;   // 0..1 dedicated sub-bass warmth/saturation (0 = clean tight club sub, 1 = dirty rumble)
     float pitchSemitoneOffset = 0.0f; // Melodic kick pitch offset (e.g. 0, +3, +5, +7)
     float lengthBeats = 1.0f;       // 1.0 = full beat, 0.333 = triplet roll, 0.5 = double kick
     uint32_t seed = 1337u;
@@ -31,7 +32,8 @@ class HardcoreSynth {
 public:
     /**
      * Synthesizes a single stereo 44.1 kHz Float32 hardcore kick (interleaved L/R).
-     * Guaranteed finite, DC-free, sub < 140 Hz mono-locked, peaks <= 0.98f.
+     * Splits sub-bass (< 120 Hz) cleanly from upper character distortion so bass
+     * stays tight & controlled per `bassSaturation` without muddy clipping!
      */
     static std::vector<float> renderKick(const KickParams& params);
 
@@ -44,7 +46,8 @@ public:
         float rootHz,
         float bpm,
         float drive,
-        float aggression
+        float aggression,
+        float bassSaturation = 0.35f
     );
 
     /**

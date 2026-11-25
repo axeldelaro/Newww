@@ -161,12 +161,15 @@ jobs:
           ## 2 Nouvelles Applications Android Natives Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
           ### 1. ZAAGFORGE ${VER} (\`ZaagForge-${VER}-arm64.apk\`)
-          **Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20**
-          - **8 Presets Studio Extrêmes** (\`155 → 225 BPM\`) : *UOK Piep Madness*, *Noiseflow Krach*, *Pure Zaag Chainsaw*, *Bounce Uptempo*, *GPF Piep Terror*, *Xtra Rawstyle*, *Frenchcore Euphoric*, *Schranz Industrial*.
-          - **8 Topologies de Kicks Synthétisées en C++20** (0 sample recyclé) : \`PIEP_UOK\` (chirp 1,8→3,4 kHz + waveshaper), \`KRACH_NOISEFLOW\` (bandpass resonant overdrive + crush industriel), \`ZAAG_CHAINSAW\` (saw-sub + tronçonneuse FM/clipping), \`UPTEMPO_BOUNCE\`, \`ZAAG_PIEP_HYBRID\`, \`RAWSTYLE_GATED\`, \`FRENCHCORE_MELODIC\`, \`SCHRANZ_INDUSTRIAL\` + screeches, risers, build-up rolls et stutter vocal chops.
-          - **Arrangement Automatique Complet** : détection BPM/beatgrid + WSOLA time-stretch & pitch-shift vocal + crossover Linkwitz-Riley 4e ordre + sidechain + structure complète (*Intro → Break → Build-Up → Fake-Drop → Drop 1 → Kick Switch → Drop 2*) + master 3-bandes OTT/Hard-Clipper (\`-4.2\` à \`-5.8 dB RMS\`).
-          - **Bridge Hybride MP3 & Streaming** : import local \`MP3/WAV/FLAC/M4A/OGG\`, recherche **Deezer API** (remix instantané d'aperçus officiels 30s), résolution de liens partagés **Spotify / Deezer / SoundCloud** (\`oEmbed\` + matching fuzzy MP3 local), comparaison A/B instantanée + exports \`M4A AAC 256k\` / \`WAV 16-bit\` directement dans \`Music/ZaagForge/\`.
-          - **Tests** : \`157/157\` assertions C++20 + \`6/6\` tests JVM.
+          **Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20 v2 Pro**
+          - **Zéro Crash OOM (Architecture Session Native C++)** : fini l'erreur \`Failed to allocate 76 MB\` sur les morceaux longs ! Les pistes complètes (jusqu'à 8 minutes) restent en RAM native C++ hors heap Java (\`< 3 Mo\` heap ART), streamées par blocs de \`8–32 Ko\` pour le décodage, la lecture A/B et l'export + \`android:largeHeap="true"\`.
+          - **Qualité Audio Studio, Paroles Limpides & Basses Non-Saturées** :
+            - Séparation stricte **Bus Voix/Original** vs **Bus Kicks** (zéro intermodulation sur les paroles !), **Sculpture Vocale Mid/Side** (de-mud \`320 Hz\`, présence \`2.35 kHz\`, air \`6.4 kHz\`), **Sidechain sélectif par fréquence** (grave coupé net, voix préservées) et **Limiter True-Peak Lookahead \`4 ms\`** (3 modes : \`STUDIO CLEAN\`, \`CLUB PUNCH\`, \`FESTIVAL HARD\`).
+            - Séparation Sub/Top sur les **8 topologies de kicks C++20** (\`PIEP_UOK\`, \`KRACH_NOISEFLOW\`, \`ZAAG_CHAINSAW\`, \`UPTEMPO_BOUNCE\`, \`ZAAG_PIEP_HYBRID\`, \`RAWSTYLE_GATED\`, \`FRENCHCORE_MELODIC\`, \`SCHRANZ_INDUSTRIAL\`) avec curseur indépendant **Saturation Basses / Sub** (sub pur et tendu par défaut), **Clarté Paroles**, **Niveau Kicks**, **Sidechain Voix** et **Coupe-Bas HPF**.
+            - **WSOLA Haute Précision** (\`2048 pts\`, 75 % overlap) pour des voix fluides et naturelles au tempo Uptempo.
+          - **Découpe & Calage Chirurgical sur les Refrains** :
+            - Détection automatique du **Temps 1 de mesure (\`4/4\` Downbeat)** et détection acoustique des **vrais Refrains 1 & 2** par courbe d'énergie + présence vocale + contraste 4 mesures — le *Build-Up* + *Fake-Drop* (1 mesure exacte) se terminent pile avant le refrain pour que **DROP 1 claque sur le Temps 1 du refrain**.
+            - Rack **CALAGE & DÉCOUPE PRÉCISE** : boutons 1-tap **\`POSER DROP 1 ICI\` / \`POSER DROP 2 ICI\`** au curseur de lecture, décalage \`-4 / -1 / +1 / +4 mesures\`, durée *Build-Up* (\`4 / 8 / 12 mes.\`), 4 structures (*Auto Refrain*, *Drop Direct*, *Paroles d'abord*, *Double Drop*), correction \`BPM ÷2 / ×2\`, \`Temps +1 (1/4)\` et micro-calage phase \`±250 ms\` avec aperçu live sur la forme d'onde.
           - **SHA-256** : \`$SHA_Z\`
 
           ### 2. StrikeCam Arcade ${VER} (\`StrikeCam-Arcade-${VER}-arm64.apk\`)

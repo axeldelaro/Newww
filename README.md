@@ -33,13 +33,13 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## 3. ZAAGFORGE (`zaagforge/` — v1.0.0)
-**Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20**
+## 3. ZAAGFORGE (`zaagforge/` — v2.0.0)
+**Studio Automatique de Remix Hardcore / Uptempo / Unicorn On Ketamine (Piep) / Noiseflow (Krach) / Zaag — Moteur DSP C++20 Pro**
 
-- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, `157/157` assertions C++20 + JVM tests)
-- **8 Presets Studio Extrêmes (`155 → 225 BPM`)** : *UOK Piep Madness*, *Noiseflow Krach*, *Pure Zaag Chainsaw*, *Bounce Uptempo*, *GPF Piep Terror*, *Xtra Rawstyle*, *Frenchcore Euphoric*, *Schranz Industrial*.
-- **8 Topologies de Kicks Synthétisées en C++20** : `PIEP_UOK`, `KRACH_NOISEFLOW`, `ZAAG_CHAINSAW`, `UPTEMPO_BOUNCE`, `ZAAG_PIEP_HYBRID`, `RAWSTYLE_GATED`, `FRENCHCORE_MELODIC`, `SCHRANZ_INDUSTRIAL`, avec screeches, risers, build-up rolls, stutter vocal chops, WSOLA time-stretch/pitch-shift, crossover Linkwitz-Riley 4e ordre, sidechain, structure complète (*Intro → Break → Build-Up → Fake-Drop → Drop 1 → Kick Switch → Drop 2*) et master 3-bandes OTT/Hard-Clipper.
-- **Bridge Hybride MP3 & Streaming** : import local `MP3/WAV/FLAC/M4A/OGG`, recherche API publique **Deezer** (aperçus officiels 30s remixables immédiatement), résolution de liens partagés **Spotify / Deezer / SoundCloud** (`oEmbed` + matching fuzzy MP3 local), écoute A/B instantanée et exports `M4A AAC 256k` / `WAV 16-bit` dans `Music/ZaagForge/`.
+- **Package** : `com.zaagforge.studio` (`arm64-v8a`, Android 10+, session audio native C++ zéro OOM jusqu'à 8 min, `141/141` assertions C++20 + `7/7` tests JVM)
+- **Qualité Audio Studio, Paroles Limpides & Basses Contrôlées** : séparation bus Voix vs bus Kicks (zéro intermodulation sur les paroles), sculpture vocale Mid/Side + sidechain sélectif par bande, **Limiter True-Peak Lookahead `4 ms`** (`STUDIO CLEAN` / `CLUB PUNCH` / `FESTIVAL HARD`), WSOLA haute précision `2048 pts` et réglage indépendant **Saturation Basses / Sub**, **Clarté Paroles**, **Niveau Kicks**, **Sidechain Voix** et **Coupe-Bas HPF (`110–340 Hz`)**.
+- **Découpe & Calage Chirurgical** : détection automatique du **Temps 1 de mesure (`4/4`)** et des **vrais Refrains 1 & 2** par analyse acoustique + rack **CALAGE & DÉCOUPE PRÉCISE** (`POSER DROP 1 / 2 ICI` au curseur, décalage `-4 / -1 / +1 / +4 mes.`, durée Build-Up `4 / 8 / 12 mes.`, `BPM ÷2 / ×2`, `Temps +1`, micro-calage `±250 ms` avec aperçu live).
+- **8 Presets Extrêmes (`155 → 225 BPM`) & 8 Topologies de Kicks C++20** + **Bridge Hybride MP3 / Deezer / Spotify / SoundCloud** + exports streaming `M4A 256k` / `WAV 16-bit` dans `Music/ZaagForge/`.
 
 ---
 
