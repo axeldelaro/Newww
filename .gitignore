@@ -22,6 +22,12 @@ captures/
 aura-companion/app/libs/*.aar
 aura-companion/app/src/main/assets/voice/
 
+# .NET / Windows build artifacts
+**/bin/
+**/obj/
+out_win64/
+*.exe
+
 # OS & Python cache
 .DS_Store
 __pycache__/

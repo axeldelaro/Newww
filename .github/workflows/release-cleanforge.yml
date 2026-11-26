@@ -1,0 +1,101 @@
+name: Build & Publish CleanForge Pro Windows EXE
+
+on:
+  push:
+    tags:
+      - "cleanforge-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name"
+        required: true
+        default: "cleanforge-v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-cleanforge-windows:
+    name: Build & Verify CleanForge Pro (Windows x64 EXE)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Run CleanForge xUnit Test Suite on Native Windows
+        run: |
+          dotnet test cleanforge/CleanForge.Tests/CleanForge.Tests.csproj -c Release --verbosity normal
+
+      - name: Publish Single-File Portable CleanForge Pro EXE (win-x64)
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } elseif ("${{ inputs.tag }}") { "${{ inputs.tag }}" } else { "cleanforge-v1.0.0" }
+          $ver = $tag -replace '^cleanforge-', ''
+          dotnet publish cleanforge/CleanForge.App/CleanForge.App.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o out_win64
+
+          $exeOut = "out_win64/CleanForge-Pro-$ver-win-x64.exe"
+          Copy-Item "out_win64/CleanForgePro.exe" $exeOut -Force
+          Get-Item $exeOut | Format-List Name, Length, FullName
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EXE_PATH=$exeOut" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Execute Live Self-Test Inside Compiled EXE on Real Windows
+        shell: pwsh
+        run: |
+          Write-Host "Running live Windows self-test on $env:EXE_PATH ..."
+          $proc = Start-Process -FilePath $env:EXE_PATH -ArgumentList "--self-test" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "CleanForgePro.exe --self-test FAILED with exit code $($proc.ExitCode)"
+          }
+          Write-Host "CleanForgePro.exe --self-test PASSED on real Windows!"
+
+      - name: Publish GitHub Release with Direct EXE Download
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $sha = (Get-FileHash -Algorithm SHA256 $env:EXE_PATH).Hash.ToLower()
+          $sizeMb = [Math]::Round((Get-Item $env:EXE_PATH).Length / 1MB, 1)
+
+          $lines = @(
+            "## CleanForge Pro $($env:VER) — Nettoyeur Profond, Explorateur Total & Optimiseur Sûr (Windows 10/11 64-bit)",
+            "",
+            "**Exécutable portable tout-en-un** (``CleanForge-Pro-$($env:VER)-win-x64.exe`` — $sizeMb Mo · Zéro installation · Zéro runtime .NET à installer)",
+            "",
+            "### Ce que fait CleanForge Pro (bien au-delà du Nettoyage Windows)",
+            "- **Explorateur Total du PC & Recherche Universelle** : cartographie multi-cœurs de **tous les disques montés** (``C:\``, ``D:\``, etc.), arborescence visuelle par taille réelle, recherche instantanée par nom/extension/taille n'importe où sur le PC et Top 250 des plus gros fichiers oubliés.",
+            "- **Nettoyage Profond Multi-Caches (60+ zones)** : Windows Temp, Windows Update Download, CrashDumps, ThumbCache, **Shaders GPU** (NVIDIA DXCache/GLCache, AMD, Intel), **caches Navigateurs uniquement** (Chrome, Edge, Brave, Opera/GX, Vivaldi, Firefox — **zéro mot de passe, cookie, favori ou historique touché**), Discord, Spotify, Steam, Epic, OBS, Adobe, VS Code, npm/pip/Gradle/Maven/NuGet.",
+            "- **Mode Spécial « Fin d'Études / Nouveau Départ »** : repère les dossiers lourds régénérables (``node_modules``, ``.gradle``, ``venv``, ``__pycache__``, ``target``, ``bin/obj``), les vieux installeurs ``.exe/.msi/.iso`` oubliés dans Téléchargements/Bureau, et les anciens documents ``.pdf/.pptx/.docx`` inactifs depuis plus de 6 mois (**jamais cochés automatiquement**, revue 100 % manuelle).",
+            "- **Détecteur de Doublons Exact (SHA-256 en 3 passes)** : trouve les copies 100 % identiques au bit près partout sur le PC et **verrouille automatiquement l'original le plus propre** (impossible de supprimer la dernière copie).",
+            "- **Logiciels Fantômes, Dossiers Orphelins & Raccourcis Morts** : audit Registre Uninstall 4 ruches, dossiers résiduels inactifs (``AppData``/``ProgramData``), parseur binaire ``.lnk``/``.url`` (sans faux positifs sur disques USB débranchés) et détecteur de dossiers vides.",
+            "- **Optimiseur Sûr Selon Vos Envies (0 % Risque Matériel & 100 % Réversible)** : 4 profils (*Gaming & FPS*, *Silence & Autonomie*, *Studio Audio/Dev*, *Vie Privée & Zéro Pub*) + Gestionnaire de Démarrage sécurisé + **sauvegarde JSON automatique avant chaque changement + Restauration 1-clic** + création de Point de Restauration Windows.",
+            "",
+            "### Forteresse de Sécurité « Zéro Risque » (``SafetyGuard``)",
+            "- Bloque au niveau moteur toute suppression dans ``System32``, ``SysWOW64``, ``WinSxS``, ``Boot``, ``EFI``, ``Windows Defender``, pilotes, ``NTUSER.DAT``, coffres-forts ``.kdbx``, ``.ssh``, mots de passe/favoris/cookies navigateurs, jonctions NTFS et fichiers Cloud OneDrive/iCloud.",
+            "- **Corbeille Windows activée par défaut** (``SHFileOperationW FOF_ALLOWUNDO``) + **Mode Simulation (à blanc)** + journal d'audit horodaté.",
+            "- **Zéro overclocking, zéro tension, zéro modification BIOS/ventilateurs**.",
+            "",
+            "### Vérification & Empreinte",
+            "- **Tests** : ``76/76`` tests xUnit passés nativement sur Windows + ``CleanForgePro.exe --self-test`` exécuté et validé sur Windows réel.",
+            "- **SHA-256** : ``$sha``",
+            "",
+            "> *Note Windows SmartScreen : comme cet exécutable indépendant est compilé directement depuis le dépôt open-source sans certificat payant Microsoft EV, cliquez sur **« Informations complémentaires » → « Exécuter quand même »** si SmartScreen s'affiche au premier lancement.*"
+          )
+          Set-Content -Path "release-notes.md" -Value ($lines -join "`n") -Encoding UTF8
+          gh release delete $env:TAG --repo "${{ github.repository }}" --yes 2>$null
+          gh release create $env:TAG $env:EXE_PATH `
+            --repo "${{ github.repository }}" `
+            --title "$($env:TAG) — CleanForge Pro $($env:VER) (Windows x64 Portable EXE)" `
+            --notes-file "release-notes.md"

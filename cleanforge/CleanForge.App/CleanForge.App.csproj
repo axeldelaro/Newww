@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <LangVersion>12.0</LangVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <AssemblyName>CleanForgePro</AssemblyName>
+    <RootNamespace>CleanForge.App</RootNamespace>
+    <ApplicationIcon>Assets\cleanforge.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>CleanForge Pro — Nettoyeur Profond &amp; Optimiseur Sûr</Product>
+    <Company>Newww Studio</Company>
+    <Description>Scanner complet du PC, nettoyage profond multi-caches, mode Fin d'Études, doublons SHA-256, logiciels fantômes et optimiseur Windows 100% sûr et réversible.</Description>
+
+    <!-- Single-file portable win-x64 release packaging -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CleanForge.Core\CleanForge.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\cleanforge.ico" />
+  </ItemGroup>
+</Project>

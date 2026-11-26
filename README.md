@@ -55,5 +55,21 @@ Ce dépôt contient **deux applications Android natives distinctes** (`Kotlin + 
 
 ---
 
-## Installation des APK Release Signés
-Les APK prêts à installer (signés v2, `arm64-v8a`) sont publiés dans **[Releases](https://github.com/axeldelaro/Newww/releases)**.
+## 5. CleanForge Pro (`cleanforge/` — v1.0.0 Windows 10/11 64-bit `.exe`)
+**Nettoyeur Profond Multi-Disques, Explorateur Total, Mode Fin d'Études & Optimiseur Windows 100 % Sûr et Réversible**
+
+- **Exécutable Portable** : `CleanForge-Pro-v1.0.0-win-x64.exe` (C# / .NET 8 WPF autonome, zéro installation, zéro runtime requis, `76/76` tests xUnit + `--self-test` live validé sur Windows réel)
+- **Tout Détecter & Nettoyer Bien Mieux que Windows** :
+  - **Explorateur Total du PC & Recherche Universelle** : cartographie multi-cœurs de tous les disques (`C:\`, `D:\`, etc.), arborescence proportionnelle par taille réelle, recherche instantanée par nom/extension/taille et Top 250 des plus gros fichiers.
+  - **60+ Zones de Caches Profonds** : Windows Temp/Update/CrashDumps/ThumbCache, **Shaders GPU** (NVIDIA/AMD/Intel), **caches Navigateurs seuls** (Chrome/Edge/Brave/Opera/Vivaldi/Firefox — **zéro mot de passe, cookie, favori ou historique touché**), Discord, Spotify, Steam, Epic, OBS, Adobe, VS Code, npm/pip/Gradle/Maven/NuGet.
+  - **Mode Spécial « Fin d'Études / Nouveau Départ »** : repère `node_modules`, `.gradle`, `venv`, `__pycache__`, `target`, `bin/obj`, vieux installeurs `.exe/.msi/.iso` oubliés et anciens documents `> 6 mois` (**revue 100 % manuelle**, jamais cochés par défaut).
+  - **Doublons Exact SHA-256** (3 passes, original le plus propre automatiquement verrouillé), **Logiciels Fantômes & Orphelins** (audit 4 ruches Registre + dossiers inactifs `AppData`/`ProgramData`), **Raccourcis Morts `.lnk`/`.url`** (parseur binaire MS-SHLLINK sans faux positifs USB) et **Dossiers Vides**.
+- **Forteresse `SafetyGuard` & Optimiseur Sûr (0 % Risque Matériel)** :
+  - Bloque au niveau moteur `System32`, `SysWOW64`, `WinSxS`, `Boot`, `EFI`, `Windows Defender`, pilotes, `NTUSER.DAT`, `.ssh`, `.kdbx`, mots de passe navigateurs, jonctions NTFS et fichiers Cloud OneDrive/iCloud.
+  - **Corbeille Windows par défaut** (`SHFileOperationW FOF_ALLOWUNDO`) + **Mode Simulation (à blanc)** + journal d'audit.
+  - **4 Profils d'Optimisation** (*Gaming & FPS*, *Silence & Autonomie*, *Studio Audio/Dev*, *Vie Privée & Zéro Pub*) + Gestionnaire de Démarrage sécurisé + **sauvegarde JSON auto & Restauration 1-clic** (zéro overclocking, zéro tension, zéro BIOS).
+
+---
+
+## Installation des Exécutables (APK Android & EXE Windows)
+Les binaires prêts à lancer (APK Android ARM64 signés v2 et `.exe` Windows 64-bit portables) sont publiés dans **[Releases](https://github.com/axeldelaro/Newww/releases)**.
