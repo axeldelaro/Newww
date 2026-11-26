@@ -35,18 +35,34 @@ enum class RemixGenreTheme(
     UPTEMPO_ZAAG(
         nativeId = 0,
         shortLabel = "UPTEMPO",
-        displayName = "Uptempo / Piep / Krach / Zaag",
-        artistInspo = "Unicorn On Ketamine · Noiseflow · Dimitri K · GPF",
+        displayName = "Uptempo / Piep / Cosy / Zaag",
+        artistInspo = "Unicorn On Ketamine · Cosy Nightmare · Noiseflow · Dimitri K",
         accentHex = 0xFFFF2E1F,
         dimBgHex = 0xFF3A1012
     ),
-    TECHNO_CLUB(
-        nativeId = 1,
-        shortLabel = "TECHNO",
-        displayName = "Techno Normale (Club / Hypnotic)",
-        artistInspo = "Charlotte de Witte · Amelie Lens · Adam Beyer",
-        accentHex = 0xFF00E5FF,
-        dimBgHex = 0xFF0C2A33
+    HARDTEK_TRIBECORE(
+        nativeId = 6,
+        shortLabel = "HARDTEK",
+        displayName = "Hardtek / Tribecore Bounce",
+        artistInspo = "Darktek · Maissouille · Billx",
+        accentHex = 0xFFD500F9,
+        dimBgHex = 0xFF2B0E36
+    ),
+    FRENCHCORE(
+        nativeId = 3,
+        shortLabel = "FRENCHCORE",
+        displayName = "Vrai Frenchcore Euphorique",
+        artistInspo = "Dr. Peacock · Sefa",
+        accentHex = 0xFF1ED760,
+        dimBgHex = 0xFF0E2B1A
+    ),
+    RAWSTYLE(
+        nativeId = 5,
+        shortLabel = "RAWSTYLE",
+        displayName = "Overdose Raw / PVC-Zaag",
+        artistInspo = "Rebelion · Dual Damage · Warface",
+        accentHex = 0xFFFFB800,
+        dimBgHex = 0xFF30240A
     ),
     HARD_TECHNO(
         nativeId = 2,
@@ -56,13 +72,13 @@ enum class RemixGenreTheme(
         accentHex = 0xFFFF7A00,
         dimBgHex = 0xFF331C0B
     ),
-    FRENCHCORE(
-        nativeId = 3,
-        shortLabel = "FRENCHCORE",
-        displayName = "Vrai Frenchcore Euphorique",
-        artistInspo = "Sefa · Dr. Peacock · Billx",
-        accentHex = 0xFF1ED760,
-        dimBgHex = 0xFF0E2B1A
+    TECHNO_CLUB(
+        nativeId = 1,
+        shortLabel = "TECHNO",
+        displayName = "Techno Normale (Club / Hypnotic)",
+        artistInspo = "Charlotte de Witte · Amelie Lens · Adam Beyer",
+        accentHex = 0xFF00E5FF,
+        dimBgHex = 0xFF0C2A33
     ),
     GABBER(
         nativeId = 4,
@@ -71,14 +87,6 @@ enum class RemixGenreTheme(
         artistInspo = "Angerfist · Neophyte · Tha Playah",
         accentHex = 0xFFFF3B5C,
         dimBgHex = 0xFF33111C
-    ),
-    RAWSTYLE(
-        nativeId = 5,
-        shortLabel = "RAWSTYLE",
-        displayName = "Xtra Rawstyle / Klaplong",
-        artistInspo = "Dual Damage · Warface · Kruelty",
-        accentHex = 0xFFFFB800,
-        dimBgHex = 0xFF30240A
     );
 
     companion object {

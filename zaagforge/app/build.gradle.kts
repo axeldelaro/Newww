@@ -13,8 +13,8 @@ android {
         applicationId = "com.zaagforge.studio"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "3.5.0"
+        versionCode = 5
+        versionName = "4.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

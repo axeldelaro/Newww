@@ -26,14 +26,14 @@ import java.nio.ByteOrder
 class ZaagForgeUnitTest {
 
     @Test
-    fun presets_allTwelveArtistPresetsValidAcrossAllSixGenres() {
-        assertEquals(12, StudioPresets.all.size)
-        assertEquals(12, KickType.entries.size)
-        assertEquals(6, RemixGenreTheme.entries.size)
+    fun presets_allSixteenArtistPresetsValidAcrossAllSevenGenres() {
+        assertEquals(16, StudioPresets.all.size)
+        assertEquals(15, KickType.entries.size)
+        assertEquals(7, RemixGenreTheme.entries.size)
         assertEquals(3, TempoSyncMode.entries.size)
 
         val ids = StudioPresets.all.map { it.id }.toSet()
-        assertEquals(12, ids.size)
+        assertEquals(16, ids.size)
 
         val coveredGenres = StudioPresets.all.map { it.params.genreTheme }.toSet()
         assertEquals(RemixGenreTheme.entries.toSet(), coveredGenres)
@@ -44,9 +44,27 @@ class ZaagForgeUnitTest {
             assertTrue("${preset.id} bassSaturation clean default", preset.params.bassSaturation in 0.20f..0.55f)
             assertTrue("${preset.id} vocalClarity high default", preset.params.vocalClarity in 0.78f..0.95f)
             assertTrue("${preset.id} epicVocalBoost high default", preset.params.epicVocalBoost in 0.80f..0.96f)
+            assertTrue("${preset.id} vocalIsolation anti-mud default", preset.params.vocalIsolation in 0.70f..0.95f)
             assertEquals("${preset.id} never slows down by default", TempoSyncMode.NEVER_SLOW, preset.params.tempoSyncMode)
             assertTrue("${preset.id} kickSwitchBars invalid", preset.params.kickSwitchBars in listOf(4, 8, 16))
         }
+
+        val darktek = StudioPresets.byId("darktek_bounce")
+        assertEquals(RemixGenreTheme.HARDTEK_TRIBECORE, darktek.params.genreTheme)
+        assertEquals(KickType.HARDTEK_BOUNCE, darktek.params.drop1Kick)
+        assertEquals(196f, darktek.params.targetBpm, 0.1f)
+
+        val maissouille = StudioPresets.byId("maissouille_frappadingue")
+        assertEquals(RemixGenreTheme.HARDTEK_TRIBECORE, maissouille.params.genreTheme)
+        assertEquals(KickType.HARDTEK_BOUNCE, maissouille.params.drop1Kick)
+
+        val rebelion = StudioPresets.byId("rebelion_overdose")
+        assertEquals(RemixGenreTheme.RAWSTYLE, rebelion.params.genreTheme)
+        assertEquals(KickType.REBELION_PVC_ZAAG, rebelion.params.drop1Kick)
+
+        val cosy = StudioPresets.byId("cosy_nightmare")
+        assertEquals(RemixGenreTheme.UPTEMPO_ZAAG, cosy.params.genreTheme)
+        assertEquals(KickType.COSY_UPTEMPO, cosy.params.drop1Kick)
 
         val techno = StudioPresets.byId("techno_club_hypnotic")
         assertEquals(RemixGenreTheme.TECHNO_CLUB, techno.params.genreTheme)
@@ -72,7 +90,7 @@ class ZaagForgeUnitTest {
     }
 
     @Test
-    fun remixParams_sanitizedClampsAllV3MixSynthAndTimingControls() {
+    fun remixParams_sanitizedClampsAllV4MixSynthIsolationAndTimingControls() {
         val raw = RemixParams(
             targetBpm = 999f,
             drive = 2.5f,
@@ -81,6 +99,7 @@ class ZaagForgeUnitTest {
             originalMix = 3f,
             vocalClarity = -0.5f,
             epicVocalBoost = 4.0f,
+            vocalIsolation = 2.4f,
             vocalSidechain = 2.0f,
             kickLevel = 4.0f,
             bassCutHz = 50f,
@@ -102,6 +121,7 @@ class ZaagForgeUnitTest {
         assertEquals(1f, raw.originalMix, 0.01f)
         assertEquals(0f, raw.vocalClarity, 0.01f)
         assertEquals(1f, raw.epicVocalBoost, 0.01f)
+        assertEquals(1f, raw.vocalIsolation, 0.01f)
         assertEquals(0.85f, raw.vocalSidechain, 0.01f)
         assertEquals(1.25f, raw.kickLevel, 0.01f)
         assertEquals(110f, raw.bassCutHz, 0.01f)
@@ -116,8 +136,9 @@ class ZaagForgeUnitTest {
         assertEquals(16, raw.drop1BarNudge)
         assertEquals(-16, raw.drop2BarNudge)
 
-        val lowBpm = RemixParams(targetBpm = 80f).sanitized()
+        val lowBpm = RemixParams(targetBpm = 80f, vocalIsolation = -0.5f).sanitized()
         assertEquals(124f, lowBpm.targetBpm, 0.01f)
+        assertEquals(0f, lowBpm.vocalIsolation, 0.01f)
     }
 
     @Test
@@ -147,33 +168,35 @@ class ZaagForgeUnitTest {
     fun customPresetStore_serializesAndDeserializesRoundTripCleanly() {
         val sample = RemixPreset(
             id = "custom_test_1",
-            name = "Ma Hard Techno Perso",
-            shortCode = "USR-158",
-            genreTag = "PERSO · HARD TECHNO",
+            name = "Mon Darktek Perso",
+            shortCode = "USR-198",
+            genreTag = "PERSO · HARDTEK",
             description = "Custom test",
             params = RemixParams(
-                targetBpm = 158f,
-                genreTheme = RemixGenreTheme.HARD_TECHNO,
+                targetBpm = 198f,
+                genreTheme = RemixGenreTheme.HARDTEK_TRIBECORE,
                 tempoSyncMode = TempoSyncMode.ORIGINAL_SPEED_LOCK,
-                drop1Kick = KickType.HARD_TECHNO_RAVE,
-                drop2Kick = KickType.ACID_303_TECHNO,
+                drop1Kick = KickType.HARDTEK_BOUNCE,
+                drop2Kick = KickType.REBELION_PVC_ZAAG,
                 epicVocalBoost = 0.94f,
+                vocalIsolation = 0.88f,
                 synthLayerAmount = 0.72f,
                 percGrooveAmount = 0.85f,
                 masterMode = MasterMode.CLUB_PUNCH
             ),
             isCustom = true
         )
-        // Note: unit tests use android.jar stub unless pure org.json is available; verify non-crashing behavior
         val json = runCatching { CustomPresetStore.toJsonString(listOf(sample)) }.getOrNull()
         if (json != null && json.startsWith("[")) {
             val restored = CustomPresetStore.fromJsonString(json)
             assertEquals(1, restored.size)
-            assertEquals("Ma Hard Techno Perso", restored[0].name)
-            assertEquals(RemixGenreTheme.HARD_TECHNO, restored[0].params.genreTheme)
+            assertEquals("Mon Darktek Perso", restored[0].name)
+            assertEquals(RemixGenreTheme.HARDTEK_TRIBECORE, restored[0].params.genreTheme)
             assertEquals(TempoSyncMode.ORIGINAL_SPEED_LOCK, restored[0].params.tempoSyncMode)
-            assertEquals(KickType.HARD_TECHNO_RAVE, restored[0].params.drop1Kick)
+            assertEquals(KickType.HARDTEK_BOUNCE, restored[0].params.drop1Kick)
+            assertEquals(KickType.REBELION_PVC_ZAAG, restored[0].params.drop2Kick)
             assertEquals(0.94f, restored[0].params.epicVocalBoost, 0.01f)
+            assertEquals(0.88f, restored[0].params.vocalIsolation, 0.01f)
             assertEquals(0.72f, restored[0].params.synthLayerAmount, 0.01f)
         }
     }

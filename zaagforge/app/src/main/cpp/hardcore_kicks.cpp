@@ -64,7 +64,7 @@ void sanitizeAndFinalizeKick(std::vector<float>& stereo, float targetPeak = 0.94
 }
 
 // ============================================================================
-// 1. PIEP_UOK (Unicorn On Ketamine / GPF)
+// 1. PIEP_UOK (Unicorn On Ketamine / GPF — Surgical Singing Nasal Piep!)
 // ============================================================================
 std::vector<float> synthPiepUok(const KickParams& p, size_t nFrames, float baseHz) {
     std::vector<float> out(nFrames * 2, 0.0f);
@@ -73,16 +73,15 @@ std::vector<float> synthPiepUok(const KickParams& p, size_t nFrames, float baseH
     const float bSat = clampf(p.bassSaturation, 0.0f, 1.0f);
     const float durSec = static_cast<float>(nFrames) / kSampleRate;
 
-    Biquad piepBpf, formant1, formant2, subLpf, topHpf, postPeak, topSafetyHpf;
-    const float piepCenter = 1650.0f + 1100.0f * agg;
-    const float piepQ = 9.0f + 3.0f * agg;
+    Biquad piepBpf, formant1, mudCut, subLpf, topHpf, airLpf;
+    const float piepCenter = 1850.0f + 780.0f * agg;
+    const float piepQ = 7.5f + 2.8f * agg;
     piepBpf.configure(BiquadType::BPF_PEAK, piepCenter, piepQ);
-    formant1.configure(BiquadType::PEAK, 850.0f, 3.8f, 10.0f + 4.5f * agg);
-    formant2.configure(BiquadType::PEAK, 2300.0f, 4.5f, 11.0f + 5.0f * agg);
-    subLpf.configure(BiquadType::LPF, 120.0f, 0.707f);
-    topHpf.configure(BiquadType::HPF, 300.0f, 0.85f);
-    topSafetyHpf.configure(BiquadType::HPF, 155.0f, 0.707f);
-    postPeak.configure(BiquadType::PEAK, piepCenter * 0.95f, 3.2f, 7.5f + 4.0f * agg);
+    formant1.configure(BiquadType::PEAK, 920.0f, 3.2f, 7.5f + 3.0f * agg);
+    mudCut.configure(BiquadType::PEAK, 290.0f, 1.4f, -6.5f);
+    subLpf.configure(BiquadType::LPF, 122.0f, 0.707f);
+    topHpf.configure(BiquadType::HPF, 340.0f, 0.85f);
+    airLpf.configure(BiquadType::LPF, 8200.0f, 0.85f); // trim harsh 10-18 kHz static fizz!
 
     OversampledClipper2x topClipper;
     double piepPhase = 0.0, subPhase = 0.0, chirpPhase = 0.0;
@@ -91,36 +90,33 @@ std::vector<float> synthPiepUok(const KickParams& p, size_t nFrames, float baseH
         const float t = static_cast<float>(i) / kSampleRate;
         const float u = t / std::max(durSec, 0.01f);
 
-        const float sweepFreq = 520.0f + 3680.0f * std::exp(-t * (135.0f + 65.0f * agg));
+        // Surgical UOK nasal scream pitch drop: 3800 Hz -> 560 Hz
+        const float sweepFreq = 560.0f + 3240.0f * std::exp(-t * (145.0f + 55.0f * agg));
         piepPhase += kTwoPi * sweepFreq / kSampleRate;
 
-        const float chirpFreq = piepCenter * (1.0f + 0.35f * std::exp(-t * 90.0f));
+        // Clean resonant singing formant chirp (minimal aliasing, maximum iconic UOK character!)
+        const float chirpFreq = piepCenter * (1.0f + 0.30f * std::exp(-t * 95.0f));
         chirpPhase += kTwoPi * chirpFreq / kSampleRate;
 
-        const float normPhase = static_cast<float>(std::fmod(piepPhase / kTwoPi, 1.0));
-        const float sawPiep = 2.0f * normPhase - 1.0f;
-        const float piepSrc = (std::sin(piepPhase) * 0.65f + sawPiep * 0.45f + std::sin(chirpPhase) * 0.40f)
-                            * std::exp(-u * (1.85f - 0.35f * agg));
+        const float envPiep = std::min(1.0f, t / 0.0015f) * std::exp(-u * (2.15f - 0.35f * agg));
+        const float piepSrc = (std::sin(piepPhase) * 0.72f + std::sin(chirpPhase) * 0.52f + std::sin(piepPhase * 2.0) * 0.22f) * envPiep;
 
-        float body = piepBpf.process(piepSrc) * (4.0f + 2.6f * agg) + piepSrc * 0.50f;
+        float body = piepBpf.process(piepSrc) * (3.6f + 2.2f * agg) + piepSrc * 0.35f;
         body = formant1.process(body);
-        body = formant2.process(body);
+        body = topClipper.process(body, 2.0f + 2.0f * drv, 0.90f, 0.05f);
+        float piepLayer = airLpf.process(topHpf.process(mudCut.process(body)));
 
-        float s1 = wavefold(body, 2.0f + 2.4f * drv);
-        float s2 = hardClipAsym(s1, 2.4f + 2.2f * drv, 0.82f, 0.96f, 0.07f);
-        float s3 = postPeak.process(s2);
-        float piepLayer = topSafetyHpf.process(topClipper.process(topHpf.process(s3), 1.85f + 1.85f * drv, 0.92f, 0.05f));
-
-        const float subFreq = baseHz + (baseHz * 1.40f) * std::exp(-t * 98.0f);
+        // Tight, punchy key-locked sub (zero mud, decays cleanly before next kick!)
+        const float subFreq = baseHz + (baseHz * 1.55f) * std::exp(-t * 105.0f);
         subPhase += kTwoPi * subFreq / kSampleRate;
-        const float subEnv = std::min(1.0f, t / 0.008f) * std::exp(-u * 2.0f);
-        const float subClean = subLpf.process(shapeCleanControlledSub(std::sin(subPhase) * subEnv, bSat)) * 0.86f;
+        const float subEnv = std::min(1.0f, t / 0.005f) * std::exp(-u * 2.1f);
+        const float subClean = subLpf.process(shapeCleanControlledSub(std::sin(subPhase) * subEnv, bSat)) * 0.90f;
 
-        const float stereoDiff = std::sin(chirpPhase * 0.5) * piepLayer * 0.06f;
-        const float monoCore = subClean * 0.72f + piepLayer * (0.64f + 0.22f * agg);
+        const float stereoDiff = std::sin(chirpPhase * 0.5) * piepLayer * 0.05f;
+        const float monoCore = subClean * 0.76f + piepLayer * (0.62f + 0.18f * agg);
 
-        out[i * 2] = std::tanh((monoCore + stereoDiff) * 1.06f);
-        out[i * 2 + 1] = std::tanh((monoCore - stereoDiff) * 1.06f);
+        out[i * 2] = fastTanh((monoCore + stereoDiff) * 1.05f);
+        out[i * 2 + 1] = fastTanh((monoCore - stereoDiff) * 1.05f);
     }
 
     sanitizeAndFinalizeKick(out, 0.94f);
@@ -414,9 +410,10 @@ std::vector<float> synthRawstyleGated(const KickParams& p, size_t nFrames, float
 }
 
 // ============================================================================
-// 7. FRENCHCORE_MELODIC (Sefa / Dr. Peacock / Billx — True Euphoric Frenchcore!)
-// Signature snappy hollow Frenchcore tok + bouncy offbeat reverse-tail swell +
-// crystal-clean pitched harmonic bass with dedicated vocal/melody pocket!
+// 7. FRENCHCORE_MELODIC (Dr. Peacock / Sefa — Authentic 2-Stage Frenchcore!)
+// Stage 1 (0..32%): ultra-tight woody Peacock tok punch + snappy low-end drop
+// Stage 2 (34..96%): clean singing pitched offbeat reverse-tail locked to song chord!
+// Surgical -7 dB mud notch (290 Hz) + -6 dB vocal window (1.7 kHz) = ZERO mud!
 // ============================================================================
 std::vector<float> synthFrenchcoreMelodic(const KickParams& p, size_t nFrames, float baseHz) {
     std::vector<float> out(nFrames * 2, 0.0f);
@@ -425,41 +422,46 @@ std::vector<float> synthFrenchcoreMelodic(const KickParams& p, size_t nFrames, f
     const float bSat = clampf(p.bassSaturation, 0.0f, 1.0f);
     const float durSec = static_cast<float>(nFrames) / kSampleRate;
 
-    Biquad tokBody, vocalPocket, lowPunch, clickAir, subLpf, topHpf;
-    tokBody.configure(BiquadType::PEAK, 420.0f, 2.2f, 6.5f + 2.5f * agg);
-    vocalPocket.configure(BiquadType::PEAK, 1650.0f, 1.1f, -5.5f); // huge clean window for vocals & violins!
-    lowPunch.configure(BiquadType::PEAK, std::max(78.0f, baseHz * 2.0f), 1.5f, 4.5f);
-    clickAir.configure(BiquadType::PEAK, 3800.0f, 1.9f, 6.0f + 3.0f * agg);
+    Biquad mudScoop, vocalPocket, tokSnap, clickAir, subLpf, topHpf, topLpf;
+    mudScoop.configure(BiquadType::PEAK, 290.0f, 1.35f, -7.0f);
+    vocalPocket.configure(BiquadType::PEAK, 1700.0f, 1.10f, -6.2f);
+    tokSnap.configure(BiquadType::PEAK, 680.0f, 2.4f, 5.5f + 2.5f * agg);
+    clickAir.configure(BiquadType::PEAK, 3900.0f, 1.8f, 5.0f + 2.5f * agg);
     subLpf.configure(BiquadType::LPF, 128.0f, 0.707f);
-    topHpf.configure(BiquadType::HPF, 140.0f, 0.707f);
+    topHpf.configure(BiquadType::HPF, 155.0f, 0.707f);
+    topLpf.configure(BiquadType::LPF, 7600.0f, 0.80f);
 
-    double phase = 0.0, harmPhase = 0.0, tokPhase = 0.0;
+    double punchPh = 0.0, tailPh = 0.0, tokPh = 0.0;
 
     for (size_t i = 0; i < nFrames; ++i) {
         const float t = static_cast<float>(i) / kSampleRate;
         const float u = t / std::max(durSec, 0.01f);
 
-        // Tight Sefa/Peacock pitch drop locking rapidly onto musical bass note!
-        const float freq = baseHz + 820.0f * std::exp(-t * 150.0f);
-        phase += kTwoPi * freq / kSampleRate;
-        harmPhase += kTwoPi * (freq * 2.0f) / kSampleRate;
+        // Stage 1: Crisp woody Peacock punch (0..32% of beat)
+        const float punchFreq = baseHz + 920.0f * std::exp(-t * 165.0f);
+        punchPh += kTwoPi * punchFreq / kSampleRate;
+        const float punchEnv = std::min(1.0f, t / 0.0015f) * std::exp(-u * 6.8f);
+        const float punchBody = std::sin(punchPh) * punchEnv;
 
-        // Iconic woody Frenchcore tok transient (0..22 ms)
-        const float tokHz = 280.0f + 2400.0f * std::exp(-t * 155.0f);
-        tokPhase += kTwoPi * tokHz / kSampleRate;
-        const float tok = std::sin(tokPhase) * std::exp(-t * 88.0f) * 0.85f;
+        const float tokHz = 320.0f + 2300.0f * std::exp(-t * 170.0f);
+        tokPh += kTwoPi * tokHz / kSampleRate;
+        const float tok = std::sin(tokPh) * std::exp(-t * 98.0f) * 0.90f;
 
-        // Bouncy Frenchcore tail envelope (tight dip right after tok -> huge offbeat musical swell!)
-        const float attackPunch = std::exp(-u * 5.2f);
-        const float offbeatSwell = std::sin(kPi * clampf((u - 0.14f) / 0.84f, 0.0f, 1.0f)) * 0.92f;
-        const float env = std::min(1.0f, t / 0.002f) * std::max(attackPunch, offbeatSwell);
+        // Stage 2: Clean harmonic offbeat reverse-tail (34..96% of beat -> iconic Peacock bounce!)
+        tailPh += kTwoPi * baseHz / kSampleRate;
+        const float revGate = clampf((u - 0.24f) / 0.16f, 0.0f, 1.0f) * clampf((0.97f - u) / 0.09f, 0.0f, 1.0f);
+        const float revCurve = std::sin(kPi * clampf((u - 0.24f) / 0.73f, 0.0f, 1.0f));
+        const float tailEnv = revGate * (0.45f + 0.55f * revCurve);
+        const float tailFund = std::sin(tailPh) * tailEnv;
+        const float tailHarm = (std::sin(tailPh * 2.0) * 0.36f + std::sin(tailPh * 3.0) * 0.16f) * tailEnv;
 
-        const float cleanSub = subLpf.process(shapeCleanControlledSub(std::sin(phase) * env, bSat)) * 0.90f;
-        const float rawMid = (std::sin(phase) * 0.72f + std::sin(harmPhase) * 0.34f) * env + tok;
-        float top = softClipTanh(rawMid * (2.0f + 1.8f * drv) + 0.05f) - 0.04f;
-        top = topHpf.process(clickAir.process(vocalPocket.process(tokBody.process(lowPunch.process(top)))));
+        const float cleanSub = subLpf.process(shapeCleanControlledSub(punchBody * 0.92f + tailFund * 0.88f, bSat)) * 0.92f;
 
-        const float y = std::tanh((cleanSub * 0.78f + top * 0.68f) * 1.05f);
+        float rawTop = (punchBody * 0.55f + tok * 0.95f) + (tailFund * 0.42f + tailHarm * 0.85f);
+        float top = fastTanh(rawTop * (1.85f + 1.55f * drv) + 0.04f) - 0.03f;
+        top = topLpf.process(topHpf.process(clickAir.process(vocalPocket.process(mudScoop.process(tokSnap.process(top))))));
+
+        const float y = fastTanh((cleanSub * 0.80f + top * 0.64f) * 1.04f);
         out[i * 2] = y;
         out[i * 2 + 1] = y;
     }
@@ -706,12 +708,193 @@ std::vector<float> synthAcid303Techno(const KickParams& p, size_t nFrames, float
         const float sub = subLpf.process(shapeCleanControlledSub(raw, bSat * 0.85f)) * 0.92f;
         const float top = clickPeak.process(midScoop.process(softClipTanh((raw + click) * (1.6f + 1.1f * drv)))) * 0.55f;
 
-        const float y = std::tanh((sub * 0.84f + top) * 1.04f);
+        const float y = fastTanh((sub * 0.84f + top) * 1.04f);
         out[i * 2] = y;
         out[i * 2 + 1] = y;
     }
 
     sanitizeAndFinalizeKick(out, 0.93f);
+    return out;
+}
+
+// ============================================================================
+// 13. HARDTEK_BOUNCE (Darktek / Maissouille — Tribecore Kick + Elastic Offbeat Bass!)
+// Beats 0..42%: Ultra-tight snappy Hardtek punch kick (clean woody click + tight sub)
+// Beats 46..96%: FAT elastic offbeat bounce bass with resonant low-pass squelch pluck!
+// ============================================================================
+std::vector<float> synthHardtekBounce(const KickParams& p, size_t nFrames, float baseHz) {
+    std::vector<float> out(nFrames * 2, 0.0f);
+    const float drv = clampf(p.drive, 0.1f, 1.0f);
+    const float agg = clampf(p.aggression, 0.1f, 1.0f);
+    const float bSat = clampf(p.bassSaturation, 0.0f, 1.0f);
+    const float durSec = static_cast<float>(nFrames) / kSampleRate;
+
+    Biquad kickSubLpf, clickPeak, bounceLpf, bounceHpf, mudNotch;
+    kickSubLpf.configure(BiquadType::LPF, 138.0f, 0.707f);
+    clickPeak.configure(BiquadType::PEAK, 2100.0f, 2.2f, 6.5f + 2.5f * drv);
+    bounceHpf.configure(BiquadType::HPF, 38.0f, 0.707f);
+    mudNotch.configure(BiquadType::PEAK, 310.0f, 1.5f, -5.0f);
+
+    double kickPh = 0.0, clickPh = 0.0, bassPh = 0.0, bassSawPh = 0.0;
+
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float u = t / std::max(durSec, 0.01f);
+
+        // PART 1 (0..44%): Razor-tight Darktek / Maissouille Tribecore Punch Kick!
+        const float kFreq = baseHz + 580.0f * std::exp(-t * 140.0f);
+        kickPh += kTwoPi * kFreq / kSampleRate;
+        const float kGate = (u < 0.44f) ? 1.0f : clampf(1.0f - (u - 0.44f) / 0.05f, 0.0f, 1.0f);
+        const float kEnv = std::min(1.0f, t / 0.0014f) * std::exp(-u * 6.2f) * kGate;
+        const float kRaw = std::sin(kickPh) * kEnv;
+        const float kSub = kickSubLpf.process(shapeCleanControlledSub(kRaw, bSat * 0.85f)) * 0.96f;
+
+        clickPh += kTwoPi * (360.0f + 2200.0f * std::exp(-t * 165.0f)) / kSampleRate;
+        const float kClick = clickPeak.process(std::sin(clickPh) * std::exp(-t * 125.0f)) * (0.58f + 0.24f * drv);
+
+        // PART 2 (45..96%): Fat Elastic Offbeat Bounce Bass (the unmistakable Hardtek BOOM-BA!)
+        float bounceBass = 0.0f;
+        if (u >= 0.44f && u <= 0.98f) {
+            const float bu = (u - 0.44f) / 0.54f; // 0..1 inside offbeat half!
+            const float bEnv = std::min(1.0f, bu / 0.09f) * std::sin(kPi * clampf(bu, 0.0f, 1.0f));
+            const float bPitch = baseHz * (1.0f + 0.14f * std::exp(-bu * 9.0f));
+            bassPh += kTwoPi * bPitch / kSampleRate;
+            bassSawPh = std::fmod(bassSawPh + (bPitch * 2.0f) / kSampleRate, 1.0);
+
+            // Dynamic squelchy rubber filter pluck (820 Hz -> 170 Hz)
+            if ((i & 15u) == 0u) {
+                const float pluckCut = 155.0f + (580.0f + 420.0f * agg) * std::exp(-bu * 5.2f);
+                bounceLpf.configure(BiquadType::LPF, pluckCut, 1.65f + 1.15f * agg);
+            }
+            const float subSine = shapeCleanControlledSub(std::sin(bassPh) * bEnv, bSat * 0.70f);
+            const float sawHarm = (2.0f * static_cast<float>(bassSawPh) - 1.0f) * bEnv;
+            const float rubber = bounceLpf.process(sawHarm * 0.72f + subSine * 0.45f);
+            bounceBass = bounceHpf.process(mudNotch.process(subSine * 0.78f + fastTanh(rubber * (1.6f + 1.1f * drv)) * 0.58f));
+        }
+
+        const float y = fastTanh((kSub * 0.88f + kClick * 0.50f + bounceBass * 0.90f) * 1.04f);
+        out[i * 2] = y;
+        out[i * 2 + 1] = y;
+    }
+
+    sanitizeAndFinalizeKick(out, 0.94f);
+    return out;
+}
+
+// ============================================================================
+// 14. REBELION_PVC_ZAAG (Rebelion Overdose — Hollow PVC Klaplong -> Scooped Zaag!)
+// Iconic hollow PVC pipe resonance tok + razor-sharp scooped metallic Overdose tail!
+// ============================================================================
+std::vector<float> synthRebelionPvcZaag(const KickParams& p, size_t nFrames, float baseHz) {
+    std::vector<float> out(nFrames * 2, 0.0f);
+    const float drv = clampf(p.drive, 0.1f, 1.0f);
+    const float agg = clampf(p.aggression, 0.1f, 1.0f);
+    const float bSat = clampf(p.bassSaturation, 0.0f, 1.0f);
+    const float durSec = static_cast<float>(nFrames) / kSampleRate;
+
+    Biquad pvc1, pvc2, mudNotch, subLpf, tailHpfL, tailHpfR, presenceL, presenceR;
+    pvc1.configure(BiquadType::BPF_PEAK, 780.0f, 7.5f);
+    pvc2.configure(BiquadType::BPF_PEAK, 1520.0f, 6.2f);
+    mudNotch.configure(BiquadType::PEAK, 265.0f, 1.5f, -8.5f); // razor-clean Rebelion scoop!
+    subLpf.configure(BiquadType::LPF, 120.0f, 0.707f);
+    tailHpfL.configure(BiquadType::HPF, 340.0f, 0.85f);
+    tailHpfR.configure(BiquadType::HPF, 340.0f, 0.85f);
+    presenceL.configure(BiquadType::PEAK, 2500.0f, 2.0f, 6.0f + 3.0f * agg);
+    presenceR.configure(BiquadType::PEAK, 2500.0f, 2.0f, 6.0f + 3.0f * agg);
+
+    CombResonator pvcTube(512);
+    OversampledClipper2x clipL, clipR;
+    double subPh = 0.0, tokPh = 0.0, saw1 = 0.0, saw2 = 0.0;
+
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float u = t / std::max(durSec, 0.01f);
+
+        // Stage 1 (0..32%): Hollow resonant PVC pipe klaplong tok!
+        const float tokHz = 290.0f + 2100.0f * std::exp(-t * 145.0f);
+        tokPh += kTwoPi * tokHz / kSampleRate;
+        const float tokRaw = std::sin(tokPh) * std::exp(-t * 78.0f);
+        const float pvcPipe = (pvc1.process(tokRaw) * 2.4f + pvc2.process(tokRaw) * 1.9f + pvcTube.process(tokRaw, 56.0f, 0.62f, 0.25f) * 1.1f)
+                            * (0.72f + 0.35f * agg);
+
+        // Stage 2 (12..98%): Wide scooped Rebelion Zaag/Overdose tail + clean stadium sub!
+        const float subFreq = baseHz + (baseHz * 1.1f) * std::exp(-t * 88.0f);
+        subPh += kTwoPi * subFreq / kSampleRate;
+        const float tailGate = clampf((u - 0.08f) / 0.08f, 0.0f, 1.0f) * clampf((0.98f - u) / 0.06f, 0.0f, 1.0f);
+        const float subEnv = std::min(1.0f, t / 0.0020f) * std::max(std::exp(-u * 3.6f), tailGate * 0.98f);
+        const float cleanSub = subLpf.process(shapeCleanControlledSub(std::sin(subPh) * subEnv, bSat)) * 0.98f;
+
+        const float sawHz = baseHz * 2.0f;
+        saw1 = std::fmod(saw1 + (sawHz * 0.994f) / kSampleRate, 1.0);
+        saw2 = std::fmod(saw2 + (sawHz * 1.006f) / kSampleRate, 1.0);
+        const float rawBuzzL = (2.0f * static_cast<float>(saw1) - 1.0f) * tailGate;
+        const float rawBuzzR = (2.0f * static_cast<float>(saw2) - 1.0f) * tailGate;
+
+        float topL = tailHpfL.process(presenceL.process(clipL.process(rawBuzzL, 2.8f + 2.6f * drv, 0.90f, 0.05f)));
+        float topR = tailHpfR.process(presenceR.process(clipR.process(rawBuzzR, 2.8f + 2.6f * drv, 0.90f, 0.05f)));
+        const float pvcClean = mudNotch.process(fastTanh(pvcPipe * 1.25f));
+
+        out[i * 2] = fastTanh((cleanSub * 0.98f + pvcClean * 0.62f + topL * (0.76f + 0.24f * agg)) * 1.26f);
+        out[i * 2 + 1] = fastTanh((cleanSub * 0.98f + pvcClean * 0.62f + topR * (0.76f + 0.24f * agg)) * 1.26f);
+    }
+
+    sanitizeAndFinalizeKick(out, 0.94f);
+    return out;
+}
+
+// ============================================================================
+// 15. COSY_UPTEMPO (Cosy Nightmare — Dark Euphoric Melodic Uptempo Kick!)
+// Silky glassy hollow tok + elastic pitched sub-bounce + zero harsh static fizz!
+// Engineered to make emotional vocals & dark euphoric leads sound MASSIVE!
+// ============================================================================
+std::vector<float> synthCosyUptempo(const KickParams& p, size_t nFrames, float baseHz) {
+    std::vector<float> out(nFrames * 2, 0.0f);
+    const float drv = clampf(p.drive, 0.1f, 1.0f);
+    const float agg = clampf(p.aggression, 0.1f, 1.0f);
+    const float bSat = clampf(p.bassSaturation, 0.0f, 1.0f);
+    const float durSec = static_cast<float>(nFrames) / kSampleRate;
+
+    Biquad hollowRing, mudScoop, vocalPocket, airSheen, subLpf, topHpf, topLpf;
+    hollowRing.configure(BiquadType::PEAK, 980.0f, 3.6f, 8.0f + 3.2f * agg);
+    mudScoop.configure(BiquadType::PEAK, 275.0f, 1.4f, -7.2f);
+    vocalPocket.configure(BiquadType::PEAK, 1850.0f, 1.15f, -5.0f);
+    airSheen.configure(BiquadType::PEAK, 3600.0f, 2.0f, 4.5f + 2.5f * agg);
+    subLpf.configure(BiquadType::LPF, 125.0f, 0.707f);
+    topHpf.configure(BiquadType::HPF, 175.0f, 0.707f);
+    topLpf.configure(BiquadType::LPF, 7800.0f, 0.85f);
+
+    OversampledClipper2x topClip;
+    double bodyPh = 0.0, tokPh = 0.0;
+
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float u = t / std::max(durSec, 0.01f);
+
+        // Smooth melodic pitch-bounce contour (punches down to root -> elastic lift on offbeat!)
+        const float bounceBump = (u > 0.26f)
+            ? std::sin(kPi * clampf((u - 0.26f) / 0.72f, 0.0f, 1.0f)) * 0.42f * agg
+            : 0.0f;
+        const float freq = baseHz * (1.0f + bounceBump) + 640.0f * std::exp(-t * 145.0f);
+        bodyPh += kTwoPi * freq / kSampleRate;
+
+        // Glassy hollow Cosy Nightmare tok (0..20 ms)
+        const float tokHz = 340.0f + 1650.0f * std::exp(-t * 148.0f);
+        tokPh += kTwoPi * tokHz / kSampleRate;
+        const float tok = hollowRing.process(std::sin(tokPh) * std::exp(-t * 82.0f)) * 0.88f;
+
+        const float env = std::min(1.0f, t / 0.002f) * (1.0f - 0.14f * u) * std::exp(-u * 0.95f);
+        const float rawBody = std::sin(bodyPh) * env;
+        const float cleanSub = subLpf.process(shapeCleanControlledSub(rawBody, bSat * 0.85f)) * 0.95f;
+
+        float top = topClip.process(rawBody * 0.62f + tok * 0.92f, 1.85f + 1.50f * drv, 0.88f, 0.03f);
+        top = topLpf.process(topHpf.process(airSheen.process(vocalPocket.process(mudScoop.process(top)))));
+
+        const float y = fastTanh((cleanSub * 0.88f + top * 0.66f) * 1.12f);
+        out[i * 2] = y;
+        out[i * 2 + 1] = y;
+    }
+
+    sanitizeAndFinalizeKick(out, 0.94f);
     return out;
 }
 
@@ -742,6 +925,9 @@ std::vector<float> HardcoreSynth::renderKick(const KickParams& params) {
         case KickType::HARD_TECHNO_RAVE: return synthHardTechnoRave(params, nFrames, pitchedHz);
         case KickType::GABBER_MILLENNIUM: return synthGabberMillennium(params, nFrames, pitchedHz);
         case KickType::ACID_303_TECHNO: return synthAcid303Techno(params, nFrames, pitchedHz);
+        case KickType::HARDTEK_BOUNCE: return synthHardtekBounce(params, nFrames, pitchedHz);
+        case KickType::REBELION_PVC_ZAAG: return synthRebelionPvcZaag(params, nFrames, pitchedHz);
+        case KickType::COSY_UPTEMPO: return synthCosyUptempo(params, nFrames, pitchedHz);
     }
     return synthZaagChainsaw(params, nFrames, pitchedHz);
 }
@@ -830,7 +1016,7 @@ std::vector<float> HardcoreSynth::render909Ride(float durationSec, uint32_t seed
 }
 
 // ============================================================================
-// Key-Locked TB-303 Acid Rave 16th-Note Riff (Sara Landry / 999999999 / Nico Moreno)
+// Harmony-Safe TB-303 Acid Rave 16th-Note Riff (Root / Fifth / Octave -> ZERO clash!)
 // ============================================================================
 std::vector<float> HardcoreSynth::renderAcid303Riff(
     float rootHz,
@@ -846,22 +1032,22 @@ std::vector<float> HardcoreSynth::renderAcid303Riff(
     const size_t totalFrames = static_cast<size_t>(std::llround(totalSteps * stepSec * kSampleRate));
     std::vector<float> out(totalFrames * 2, 0.0f);
 
-    // Acid minor/phrygian 16-step hypnotic pattern (semitones from root + octave jumps)
+    // Strictly consonant Root/Fifth/Octave hypnotic 303 groove -> NEVER clashes with song chords!
     static constexpr std::array<int, 16> kPattern = {
-        0, 0, 12, 0,  3, 0, 7, 12,  0, 1, 0, 12,  7, 3, 12, 10
+        0, 0, 12, 0,  7, 0, 12, 7,  0, 0, 12, 0,  7, 12, 7, 0
     };
     static constexpr std::array<int, 16> kAccent = {
-        1, 0, 1, 0,   0, 0, 1, 1,   0, 1, 0, 1,   0, 0, 1, 0
+        1, 0, 1, 0,   0, 0, 1, 0,   1, 0, 1, 0,   0, 1, 0, 0
     };
 
     const float acidBaseHz = clampf(rootHz * 2.0f, 75.0f, 155.0f);
     const float agg = clampf(aggression, 0.15f, 1.0f);
 
     Biquad resLpfL, resLpfR, hpfL, hpfR, vocalDipL, vocalDipR;
-    hpfL.configure(BiquadType::HPF, 210.0f, 0.8f); // stay strictly above sub kick!
-    hpfR.configure(BiquadType::HPF, 210.0f, 0.8f);
-    vocalDipL.configure(BiquadType::PEAK, 2100.0f, 1.2f, -4.0f); // leave clean space for vocals!
-    vocalDipR.configure(BiquadType::PEAK, 2100.0f, 1.2f, -4.0f);
+    hpfL.configure(BiquadType::HPF, 220.0f, 0.8f);
+    hpfR.configure(BiquadType::HPF, 220.0f, 0.8f);
+    vocalDipL.configure(BiquadType::PEAK, 2000.0f, 1.15f, -5.5f);
+    vocalDipR.configure(BiquadType::PEAK, 2000.0f, 1.15f, -5.5f);
 
     double phL = 0.0, phR = 0.0;
     float curHz = acidBaseHz;
@@ -874,7 +1060,6 @@ std::vector<float> HardcoreSynth::renderAcid303Riff(
         const float barProg = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, totalFrames));
 
         const float targetHz = acidBaseHz * std::pow(2.0f, static_cast<float>(kPattern[stepIdx]) / 12.0f);
-        // Smooth 303 slide glide on accented notes
         curHz += (targetHz - curHz) * 0.008f;
 
         phL = std::fmod(phL + curHz / kSampleRate, 1.0);
@@ -883,26 +1068,25 @@ std::vector<float> HardcoreSynth::renderAcid303Riff(
         const float sawR = 2.0f * static_cast<float>(phR) - 1.0f;
 
         const bool accented = (kAccent[stepIdx] != 0);
-        const float env = std::min(1.0f, stepFrac * 16.0f) * std::exp(-stepFrac * (accented ? 2.4f : 4.2f));
+        const float env = std::min(1.0f, stepFrac * 18.0f) * std::exp(-stepFrac * (accented ? 2.6f : 4.6f));
 
         if (i % 24 == 0) {
             const float macroSweep = 0.35f + 0.65f * std::sin(kPi * barProg);
             const float cut = clampf(
-                360.0f + (1650.0f + 1900.0f * agg) * env * (accented ? 1.25f : 0.72f) * macroSweep,
+                360.0f + (1550.0f + 1750.0f * agg) * env * (accented ? 1.25f : 0.72f) * macroSweep,
                 280.0f,
-                5800.0f
+                5400.0f
             );
-            const float q = 3.8f + 3.8f * agg + (accented ? 1.4f : 0.0f);
+            const float q = 3.6f + 3.4f * agg + (accented ? 1.2f : 0.0f);
             resLpfL.configure(BiquadType::LPF, cut, q);
             resLpfR.configure(BiquadType::LPF, cut * 1.03f, q);
         }
 
-        // Duck gently on beat 1/2/3/4 kicks so groove pumps cleanly
         const float beatFrac = std::fmod(t / beatSec, 1.0f);
-        const float pump = 0.25f + 0.75f * clampf(beatFrac * 2.5f, 0.0f, 1.0f);
+        const float pump = 0.18f + 0.82f * clampf(beatFrac * 2.4f, 0.0f, 1.0f);
 
-        const float yL = vocalDipL.process(hpfL.process(std::tanh(resLpfL.process(sawL) * (1.6f + 1.4f * agg)))) * env * pump * 0.42f;
-        const float yR = vocalDipR.process(hpfR.process(std::tanh(resLpfR.process(sawR) * (1.6f + 1.4f * agg)))) * env * pump * 0.42f;
+        const float yL = vocalDipL.process(hpfL.process(fastTanh(resLpfL.process(sawL) * (1.5f + 1.2f * agg)))) * env * pump * 0.38f;
+        const float yR = vocalDipR.process(hpfR.process(fastTanh(resLpfR.process(sawR) * (1.5f + 1.2f * agg)))) * env * pump * 0.38f;
         out[i * 2] = yL;
         out[i * 2 + 1] = yR;
     }
@@ -910,13 +1094,66 @@ std::vector<float> HardcoreSynth::renderAcid303Riff(
 }
 
 // ============================================================================
-// Euphoric Supersaw Frenchcore Chord Layer (Sefa / Dr. Peacock)
-// Wide stereo orchestral supersaw pads locked to the song's key with a surgical
-// center vocal pocket so epic drops soar while lyrics stay 100% upfront!
+// Iconic Darktek / Maissouille Consonant Offbeat Hardtek Rave Organ/Brass Stab
+// Strictly Root + Fifth + Octave -> bouncy, punchy, 100% harmonic!
+// ============================================================================
+std::vector<float> HardcoreSynth::renderHardtekOffbeatStab(
+    float rootHz,
+    float durationSec,
+    float aggression
+) {
+    const float dur = clampf(durationSec, 0.07f, 0.35f);
+    const size_t nFrames = static_cast<size_t>(dur * kSampleRate);
+    std::vector<float> out(nFrames * 2, 0.0f);
+    const float baseFreq = clampf(rootHz * 4.0f, 175.0f, 350.0f);
+    const float agg = clampf(aggression, 0.15f, 1.0f);
+
+    Biquad hpfL, hpfR, lpfL, lpfR, vocDipL, vocDipR;
+    hpfL.configure(BiquadType::HPF, 340.0f, 0.8f);
+    hpfR.configure(BiquadType::HPF, 340.0f, 0.8f);
+    vocDipL.configure(BiquadType::PEAK, 1950.0f, 1.2f, -4.5f);
+    vocDipR.configure(BiquadType::PEAK, 1950.0f, 1.2f, -4.5f);
+
+    double ph1 = 0.0, ph2 = 0.0, ph3 = 0.0, ph4 = 0.0;
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float u = t / dur;
+
+        ph1 = std::fmod(ph1 + (baseFreq * 0.996f) / kSampleRate, 1.0);
+        ph2 = std::fmod(ph2 + (baseFreq * 1.004f) / kSampleRate, 1.0);
+        ph3 = std::fmod(ph3 + (baseFreq * 1.498f) / kSampleRate, 1.0); // perfect fifth
+        ph4 = std::fmod(ph4 + (baseFreq * 2.002f) / kSampleRate, 1.0); // octave
+
+        if ((i & 15u) == 0u) {
+            const float cut = clampf(850.0f + (2600.0f + 1600.0f * agg) * std::exp(-u * 6.5f), 600.0f, 5600.0f);
+            lpfL.configure(BiquadType::LPF, cut, 1.8f);
+            lpfR.configure(BiquadType::LPF, cut * 1.04f, 1.8f);
+        }
+
+        const float env = std::min(1.0f, t / 0.0025f) * std::exp(-u * 4.4f);
+        const float l = ((2.0f * static_cast<float>(ph1) - 1.0f) * 0.55f
+                       + (2.0f * static_cast<float>(ph3) - 1.0f) * 0.42f
+                       + (2.0f * static_cast<float>(ph4) - 1.0f) * 0.36f);
+        const float r = ((2.0f * static_cast<float>(ph2) - 1.0f) * 0.55f
+                       + (2.0f * static_cast<float>(ph3) - 1.0f) * 0.42f
+                       + (2.0f * static_cast<float>(ph4) - 1.0f) * 0.36f);
+
+        const float m = 0.5f * (l + r) * 0.65f;
+        const float s = 0.5f * (l - r) * 1.40f;
+        out[i * 2] = vocDipL.process(hpfL.process(lpfL.process(fastTanh((m + s) * 1.35f)))) * env * 0.48f;
+        out[i * 2 + 1] = vocDipR.process(hpfR.process(lpfR.process(fastTanh((m - s) * 1.35f)))) * env * 0.48f;
+    }
+    return out;
+}
+
+// ============================================================================
+// Harmony-Safe Euphoric Stereo Supersaw Shimmer (Dr. Peacock / Sefa / Cosy)
+// Uses pure consonant Root + Fifth + Octave wide-stereo shimmer so it SOARS
+// effortlessly over ANY song progression without EVER clashing with vocals/chords!
 // ============================================================================
 std::vector<float> HardcoreSynth::renderEuphoricChordLayer(
     float rootHz,
-    bool isMinor,
+    bool /*isMinor*/,
     float bpm,
     int bars
 ) {
@@ -927,51 +1164,48 @@ std::vector<float> HardcoreSynth::renderEuphoricChordLayer(
     const size_t totalFrames = static_cast<size_t>(std::llround(nBars * barSec * kSampleRate));
     std::vector<float> out(totalFrames * 2, 0.0f);
 
-    // Classic euphoric 4-bar progression (i - VI - III - VII in minor, I - V - vi - IV in major)
-    const std::array<std::array<int, 3>, 4> prog = isMinor
-        ? std::array<std::array<int, 3>, 4>{{
-            {0, 3, 7}, {-4, 0, 3}, {3, 7, 10}, {-2, 2, 5}
-        }}
-        : std::array<std::array<int, 3>, 4>{{
-            {0, 4, 7}, {7, 11, 14}, {9, 12, 16}, {5, 9, 12}
-        }};
+    // Pure open-fifth + double-octave wide stereo shimmer (universally consonant in major & minor!)
+    static constexpr std::array<int, 3> kOpenNotes = {0, 7, 12};
 
     const float padBaseHz = clampf(rootHz * 4.0f, 165.0f, 310.0f);
     Biquad hpfL, hpfR, lpfL, lpfR, vocPocketL, vocPocketR;
-    hpfL.configure(BiquadType::HPF, 260.0f, 0.707f);
-    hpfR.configure(BiquadType::HPF, 260.0f, 0.707f);
-    lpfL.configure(BiquadType::LPF, 5200.0f, 0.8f);
-    lpfR.configure(BiquadType::LPF, 5200.0f, 0.8f);
-    // Carve clean 1.6 kHz pocket so vocals float effortlessly above the euphoric chords!
-    vocPocketL.configure(BiquadType::PEAK, 1650.0f, 1.1f, -5.0f);
-    vocPocketR.configure(BiquadType::PEAK, 1650.0f, 1.1f, -5.0f);
+    hpfL.configure(BiquadType::HPF, 310.0f, 0.707f);
+    hpfR.configure(BiquadType::HPF, 310.0f, 0.707f);
+    lpfL.configure(BiquadType::LPF, 4800.0f, 0.75f);
+    lpfR.configure(BiquadType::LPF, 4800.0f, 0.75f);
+    vocPocketL.configure(BiquadType::PEAK, 1750.0f, 1.05f, -6.5f);
+    vocPocketR.configure(BiquadType::PEAK, 1750.0f, 1.05f, -6.5f);
 
     std::array<double, 12> ph{};
     static constexpr std::array<float, 4> kDetune = {0.992f, 0.997f, 1.003f, 1.008f};
+    std::array<float, 3> noteFreqs{};
+    for (int n = 0; n < 3; ++n) {
+        noteFreqs[n] = padBaseHz * std::pow(2.0f, static_cast<float>(kOpenNotes[n]) / 12.0f);
+    }
 
     for (size_t i = 0; i < totalFrames; ++i) {
         const float t = static_cast<float>(i) / kSampleRate;
-        const int barIdx = static_cast<int>(std::floor(t / barSec)) % 4;
         const float beatFrac = std::fmod(t / beatSec, 1.0f);
-        const float sc = 0.28f + 0.72f * clampf(beatFrac * 2.2f, 0.0f, 1.0f);
+        // Deep pumping offbeat Frenchcore sidechain breath!
+        const float sc = 0.14f + 0.86f * clampf((beatFrac - 0.12f) * 2.4f, 0.0f, 1.0f);
 
         float sL = 0.0f, sR = 0.0f;
         for (int n = 0; n < 3; ++n) {
-            const float fNote = padBaseHz * std::pow(2.0f, static_cast<float>(prog[barIdx][n]) / 12.0f);
+            const float fNote = noteFreqs[n];
             for (int v = 0; v < 4; ++v) {
                 const int idx = n * 4 + v;
                 ph[idx] = std::fmod(ph[idx] + (fNote * kDetune[v]) / kSampleRate, 1.0);
                 const float saw = 2.0f * static_cast<float>(ph[idx]) - 1.0f;
-                if (v % 2 == 0) sL += saw * 0.075f;
-                else sR += saw * 0.075f;
+                if (v % 2 == 0) sL += saw * 0.07f;
+                else sR += saw * 0.07f;
             }
         }
 
-        // Wide stereo euphoric shimmer (pushes chords to the sides so center vocals own the middle!)
-        const float m = 0.5f * (sL + sR) * 0.65f;
-        const float s = 0.5f * (sL - sR) * 1.45f;
-        out[i * 2] = vocPocketL.process(lpfL.process(hpfL.process(m + s))) * sc * 0.52f;
-        out[i * 2 + 1] = vocPocketR.process(lpfR.process(hpfR.process(m - s))) * sc * 0.52f;
+        // Push supersaw wide to the stereo sides so center vocals own 100% of the middle!
+        const float m = 0.5f * (sL + sR) * 0.42f;
+        const float s = 0.5f * (sL - sR) * 1.55f;
+        out[i * 2] = vocPocketL.process(lpfL.process(hpfL.process(m + s))) * sc * 0.46f;
+        out[i * 2 + 1] = vocPocketR.process(lpfR.process(hpfR.process(m - s))) * sc * 0.46f;
     }
     return out;
 }
@@ -991,29 +1225,55 @@ std::vector<float> HardcoreSynth::renderRaveHooverStab(
     const float agg = clampf(aggression, 0.1f, 1.0f);
 
     Biquad hpfL, hpfR, lpfL, lpfR;
-    hpfL.configure(BiquadType::HPF, 260.0f, 0.8f);
-    hpfR.configure(BiquadType::HPF, 260.0f, 0.8f);
-    lpfL.configure(BiquadType::LPF, 4800.0f, 1.6f);
-    lpfR.configure(BiquadType::LPF, 4800.0f, 1.6f);
+    hpfL.configure(BiquadType::HPF, 280.0f, 0.8f);
+    hpfR.configure(BiquadType::HPF, 280.0f, 0.8f);
+    lpfL.configure(BiquadType::LPF, 4600.0f, 1.5f);
+    lpfR.configure(BiquadType::LPF, 4600.0f, 1.5f);
 
     double ph1 = 0.0, ph2 = 0.0, ph3 = 0.0, ph4 = 0.0;
     for (size_t i = 0; i < nFrames; ++i) {
         const float t = static_cast<float>(i) / kSampleRate;
         const float u = t / dur;
-        // Classic PWM Hoover pitch swoop
         const float bend = 1.0f + 0.42f * std::exp(-u * 6.5f) - 0.12f * u;
         const float f = baseFreq * bend;
         ph1 = std::fmod(ph1 + (f * 0.991f) / kSampleRate, 1.0);
         ph2 = std::fmod(ph2 + (f * 1.009f) / kSampleRate, 1.0);
-        ph3 = std::fmod(ph3 + (f * 1.498f) / kSampleRate, 1.0); // fifth
-        ph4 = std::fmod(ph4 + (f * 2.004f) / kSampleRate, 1.0); // octave
+        ph3 = std::fmod(ph3 + (f * 1.498f) / kSampleRate, 1.0);
+        ph4 = std::fmod(ph4 + (f * 2.004f) / kSampleRate, 1.0);
 
-        const float env = std::min(1.0f, u * 30.0f) * std::exp(-u * 2.6f);
+        const float env = std::min(1.0f, u * 30.0f) * std::exp(-u * 2.8f);
         const float l = ((2.0f * static_cast<float>(ph1) - 1.0f) + (2.0f * static_cast<float>(ph3) - 1.0f) * 0.65f + (2.0f * static_cast<float>(ph4) - 1.0f) * 0.45f) * 0.35f;
         const float r = ((2.0f * static_cast<float>(ph2) - 1.0f) + (2.0f * static_cast<float>(ph3) - 1.0f) * 0.65f + (2.0f * static_cast<float>(ph4) - 1.0f) * 0.45f) * 0.35f;
 
-        out[i * 2] = std::tanh(lpfL.process(hpfL.process(l)) * (1.8f + 1.4f * agg)) * env * 0.56f;
-        out[i * 2 + 1] = std::tanh(lpfR.process(hpfR.process(r)) * (1.8f + 1.4f * agg)) * env * 0.56f;
+        out[i * 2] = fastTanh(lpfL.process(hpfL.process(l)) * (1.7f + 1.3f * agg)) * env * 0.52f;
+        out[i * 2 + 1] = fastTanh(lpfR.process(hpfR.process(r)) * (1.7f + 1.3f * agg)) * env * 0.52f;
+    }
+    return out;
+}
+
+// ============================================================================
+// Festival Reverse-Crash Suck-In (leading straight into Beat 1 of Drops/Switches!)
+// ============================================================================
+std::vector<float> HardcoreSynth::renderReverseCrash(float durationSec, uint32_t seed) {
+    const float dur = clampf(durationSec, 0.25f, 2.0f);
+    const size_t nFrames = static_cast<size_t>(dur * kSampleRate);
+    std::vector<float> out(nFrames * 2, 0.0f);
+    XorShift32 rngL(seed), rngR(seed ^ 0xA7C3u);
+
+    Biquad hpfL, hpfR, airL, airR;
+    hpfL.configure(BiquadType::HPF, 2800.0f, 0.85f);
+    hpfR.configure(BiquadType::HPF, 2950.0f, 0.85f);
+    airL.configure(BiquadType::PEAK, 7800.0f, 1.8f, 5.5f);
+    airR.configure(BiquadType::PEAK, 8200.0f, 1.8f, 5.5f);
+
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float u = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, nFrames));
+        // Steep exponential suck-in peaking right at the final millisecond before Beat 1!
+        const float env = std::pow(u, 3.2f) * clampf((1.0f - u) * 70.0f, 0.0f, 1.0f);
+        const float l = airL.process(hpfL.process(rngL.nextBipolar())) * env * 0.48f;
+        const float r = airR.process(hpfR.process(rngR.nextBipolar())) * env * 0.48f;
+        out[i * 2] = clampf(l, -0.82f, 0.82f);
+        out[i * 2 + 1] = clampf(r, -0.82f, 0.82f);
     }
     return out;
 }
@@ -1026,7 +1286,7 @@ std::vector<float> HardcoreSynth::renderKickPreviewLoop(
     float aggression,
     float bassSaturation
 ) {
-    const float clampedBpm = clampf(bpm, 125.0f, 240.0f);
+    const float clampedBpm = clampf(bpm, 124.0f, 240.0f);
     const float beatSec = 60.0f / clampedBpm;
     const size_t beatFrames = static_cast<size_t>(std::round(beatSec * kSampleRate));
     const size_t totalFrames = beatFrames * 4;
@@ -1065,7 +1325,9 @@ std::vector<float> HardcoreSynth::renderKickPreviewLoop(
             out[(hatStart + i) * 2 + 1] += hat[i * 2 + 1] * 0.42f;
         }
 
-        if ((b == 1 || b == 3) && (type == KickType::TECHNO_ROLLING || type == KickType::HARD_TECHNO_RAVE || type == KickType::ACID_303_TECHNO || type == KickType::GABBER_MILLENNIUM)) {
+        if ((b == 1 || b == 3) && (type == KickType::TECHNO_ROLLING || type == KickType::HARD_TECHNO_RAVE ||
+                                   type == KickType::ACID_303_TECHNO || type == KickType::GABBER_MILLENNIUM ||
+                                   type == KickType::HARDTEK_BOUNCE)) {
             const size_t cFrames = clap.size() / 2;
             for (size_t i = 0; i < cFrames && (start + i) < totalFrames; ++i) {
                 out[(start + i) * 2] += clap[i * 2] * 0.55f;
@@ -1075,8 +1337,8 @@ std::vector<float> HardcoreSynth::renderKickPreviewLoop(
     }
 
     for (size_t i = 0; i < totalFrames; ++i) {
-        out[i * 2] = clampf(std::tanh(out[i * 2] * 1.02f), -0.96f, 0.96f);
-        out[i * 2 + 1] = clampf(std::tanh(out[i * 2 + 1] * 1.02f), -0.96f, 0.96f);
+        out[i * 2] = clampf(fastTanh(out[i * 2] * 1.02f), -0.96f, 0.96f);
+        out[i * 2 + 1] = clampf(fastTanh(out[i * 2 + 1] * 1.02f), -0.96f, 0.96f);
     }
     return out;
 }
@@ -1095,8 +1357,8 @@ std::vector<float> HardcoreSynth::renderIndustrialScreech(
     const float baseFreq = clampf(rootHz * 8.0f, 330.0f, 660.0f);
 
     Biquad bpfL, bpfR, hpfL, hpfR;
-    hpfL.configure(BiquadType::HPF, 360.0f, 0.8f);
-    hpfR.configure(BiquadType::HPF, 360.0f, 0.8f);
+    hpfL.configure(BiquadType::HPF, 420.0f, 0.8f);
+    hpfR.configure(BiquadType::HPF, 420.0f, 0.8f);
     OversampledClipper2x clipL, clipR;
 
     double ph1 = 0.0, ph2 = 0.0, ph3 = 0.0;
@@ -1105,11 +1367,11 @@ std::vector<float> HardcoreSynth::renderIndustrialScreech(
         const float u = t / dur;
 
         const float bend = (variant % 2 == 0)
-            ? (1.0f + 1.85f * std::exp(-u * 5.2f) - 0.25f * u)
-            : (0.85f + 0.95f * u * u + 0.08f * std::sin(kTwoPi * 18.0f * t));
+            ? (1.0f + 1.65f * std::exp(-u * 5.8f) - 0.22f * u)
+            : (0.88f + 0.92f * u * u + 0.06f * std::sin(kTwoPi * 16.0f * t));
 
         const float f1 = baseFreq * bend;
-        const float f2 = f1 * 1.018f;
+        const float f2 = f1 * 1.016f;
         const float f3 = f1 * 1.498f;
 
         ph1 = std::fmod(ph1 + f1 / kSampleRate, 1.0);
@@ -1122,18 +1384,18 @@ std::vector<float> HardcoreSynth::renderIndustrialScreech(
                        + (ph3 < 0.68 ? 1.0f : -1.0f) * 0.45f;
 
         if (i % 32 == 0) {
-            const float cutL = clampf(900.0f + 3600.0f * (1.0f - u) + 600.0f * std::sin(kTwoPi * 7.0f * t), 500.0f, 7000.0f);
-            const float cutR = clampf(cutL * 1.08f, 500.0f, 7500.0f);
-            bpfL.configure(BiquadType::BPF_PEAK, cutL, 4.8f + 3.2f * agg);
-            bpfR.configure(BiquadType::BPF_PEAK, cutR, 4.8f + 3.2f * agg);
+            const float cutL = clampf(950.0f + 3200.0f * (1.0f - u) + 520.0f * std::sin(kTwoPi * 7.0f * t), 550.0f, 6400.0f);
+            const float cutR = clampf(cutL * 1.07f, 550.0f, 6800.0f);
+            bpfL.configure(BiquadType::BPF_PEAK, cutL, 4.4f + 2.8f * agg);
+            bpfR.configure(BiquadType::BPF_PEAK, cutR, 4.4f + 2.8f * agg);
         }
 
-        const float env = std::min(1.0f, u * 22.0f) * clampf(1.0f - (u - 0.72f) / 0.28f, 0.0f, 1.0f);
-        float yL = hpfL.process(wavefold(bpfL.process(sL) * 2.4f + sL * 0.35f, 2.2f + 2.4f * agg));
-        float yR = hpfR.process(wavefold(bpfR.process(sR) * 2.4f + sR * 0.35f, 2.2f + 2.4f * agg));
+        const float env = std::min(1.0f, u * 24.0f) * clampf(1.0f - (u - 0.72f) / 0.28f, 0.0f, 1.0f);
+        float yL = hpfL.process(wavefold(bpfL.process(sL) * 2.2f + sL * 0.30f, 2.0f + 2.0f * agg));
+        float yR = hpfR.process(wavefold(bpfR.process(sR) * 2.2f + sR * 0.30f, 2.0f + 2.0f * agg));
 
-        out[i * 2] = clipL.process(yL * env, 1.65f, 0.88f, 0.04f);
-        out[i * 2 + 1] = clipR.process(yR * env, 1.65f, 0.88f, 0.04f);
+        out[i * 2] = clipL.process(yL * env, 1.55f, 0.86f, 0.03f);
+        out[i * 2 + 1] = clipR.process(yR * env, 1.55f, 0.86f, 0.03f);
     }
     return out;
 }
@@ -1142,84 +1404,104 @@ std::vector<float> HardcoreSynth::renderSnareBuildupRoll(
     float bpm,
     float durationSec,
     float rootHz,
-    float aggression
+    float aggression,
+    float preDropBreathBeats
 ) {
     const float clampedBpm = clampf(bpm, 120.0f, 240.0f);
     const float dur = clampf(durationSec, 0.5f, 24.0f);
     const size_t nFrames = static_cast<size_t>(dur * kSampleRate);
     std::vector<float> out(nFrames * 2, 0.0f);
     const float beatSec = 60.0f / clampedBpm;
-    XorShift32 rng(0xB01D0001u);
+
+    // Leave exact Pre-Drop Vocal Solo Breath (0..2 beats of dead drum silence right before Beat 1!)
+    const float breathSec = std::min(dur * 0.28f, std::max(0.0f, preDropBreathBeats) * beatSec);
+    const float activeDur = std::max(0.25f, dur - breathSec);
+
+    XorShift32 rngL(0xB01D0001u), rngR(0xB01D0002u);
 
     float tCursor = 0.0f;
-    while (tCursor < dur - 0.02f) {
-        const float progress = tCursor / dur;
+    while (tCursor < activeDur - 0.015f) {
+        const float progress = clampf(tCursor / activeDur, 0.0f, 1.0f);
         float stepBeats = 1.0f;
-        if (progress > 0.82f) stepBeats = 0.125f;
-        else if (progress > 0.56f) stepBeats = 0.25f;
+        if (progress > 0.84f) stepBeats = 0.125f;
+        else if (progress > 0.58f) stepBeats = 0.25f;
         else if (progress > 0.28f) stepBeats = 0.5f;
 
         const size_t hitStart = static_cast<size_t>(tCursor * kSampleRate);
-        const float hitDur = std::min(0.14f, stepBeats * beatSec * 0.92f);
+        const float hitDur = std::min(0.11f, stepBeats * beatSec * 0.88f);
         const size_t hitFrames = static_cast<size_t>(hitDur * kSampleRate);
 
-        const float pitchMul = std::pow(2.0f, (progress * 14.0f) / 12.0f);
-        const float bodyHz = clampf(rootHz * 3.0f * pitchMul, 140.0f, 920.0f);
-        const float amp = 0.38f + 0.48f * progress;
+        const float pitchMul = std::pow(2.0f, (progress * 12.0f) / 12.0f);
+        const float bodyHz = clampf(rootHz * 3.0f * pitchMul, 155.0f, 820.0f);
+        const float amp = 0.34f + 0.44f * progress;
 
         double ph = 0.0;
         for (size_t j = 0; j < hitFrames && (hitStart + j) < nFrames; ++j) {
             const float lt = static_cast<float>(j) / kSampleRate;
-            const float f = bodyHz + 380.0f * std::exp(-lt * 80.0f);
+            const float f = bodyHz + 320.0f * std::exp(-lt * 95.0f);
             ph += kTwoPi * f / kSampleRate;
-            const float env = std::exp(-lt * (24.0f + 22.0f * progress));
-            const float tone = std::sin(ph) * 0.62f;
-            const float snap = rng.nextBipolar() * (0.42f + 0.32f * aggression);
-            const float s = std::tanh((tone + snap) * (1.8f + 1.4f * progress)) * env * amp;
-            out[(hitStart + j) * 2] += s;
-            out[(hitStart + j) * 2 + 1] += s;
+            const float env = std::exp(-lt * (30.0f + 26.0f * progress));
+            const float tone = std::sin(ph) * 0.58f;
+            const float snapL = rngL.nextBipolar() * (0.36f + 0.24f * aggression);
+            const float snapR = rngR.nextBipolar() * (0.36f + 0.24f * aggression);
+            out[(hitStart + j) * 2] += fastTanh((tone + snapL) * (1.45f + 0.85f * progress)) * env * amp;
+            out[(hitStart + j) * 2 + 1] += fastTanh((tone + snapR) * (1.45f + 0.85f * progress)) * env * amp;
         }
         tCursor += stepBeats * beatSec;
     }
 
-    Biquad hpfL, hpfR;
+    // Crisp studio bandpass + hard cutoff right at the Pre-Drop Vocal Solo Breath!
+    Biquad hpfL, hpfR, lpfL, lpfR;
+    lpfL.configure(BiquadType::LPF, 8500.0f, 0.75f);
+    lpfR.configure(BiquadType::LPF, 8500.0f, 0.75f);
+    const size_t cutoffFrame = static_cast<size_t>(activeDur * kSampleRate);
     for (size_t i = 0; i < nFrames; ++i) {
         if (i % 64 == 0) {
-            const float p = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, nFrames));
-            const float cut = 150.0f + 1150.0f * p * p;
-            hpfL.configure(BiquadType::HPF, cut, 1.25f);
-            hpfR.configure(BiquadType::HPF, cut, 1.25f);
+            const float p = clampf(static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, cutoffFrame)), 0.0f, 1.0f);
+            const float cut = 220.0f + 1350.0f * p * p;
+            hpfL.configure(BiquadType::HPF, cut, 1.15f);
+            hpfR.configure(BiquadType::HPF, cut, 1.15f);
         }
-        out[i * 2] = clampf(std::tanh(hpfL.process(out[i * 2]) * 1.15f), -0.92f, 0.92f);
-        out[i * 2 + 1] = clampf(std::tanh(hpfR.process(out[i * 2 + 1]) * 1.15f), -0.92f, 0.92f);
+        const float gate = (i < cutoffFrame) ? 1.0f : clampf(1.0f - static_cast<float>(i - cutoffFrame) / 440.0f, 0.0f, 1.0f);
+        out[i * 2] = clampf(lpfL.process(hpfL.process(out[i * 2])) * gate, -0.88f, 0.88f);
+        out[i * 2 + 1] = clampf(lpfR.process(hpfR.process(out[i * 2 + 1])) * gate, -0.88f, 0.88f);
     }
     return out;
 }
 
-std::vector<float> HardcoreSynth::renderNoiseRiser(float durationSec, float rootHz, float aggression) {
+std::vector<float> HardcoreSynth::renderNoiseRiser(
+    float durationSec,
+    float rootHz,
+    float aggression,
+    float preDropBreathSec
+) {
     const float dur = clampf(durationSec, 0.5f, 24.0f);
     const size_t nFrames = static_cast<size_t>(dur * kSampleRate);
     std::vector<float> out(nFrames * 2, 0.0f);
     XorShift32 rngL(0x52495345u), rngR(0x52495346u);
 
+    const float breathSec = std::min(dur * 0.28f, std::max(0.0f, preDropBreathSec));
+    const size_t activeFrames = std::max<size_t>(441, static_cast<size_t>((dur - breathSec) * kSampleRate));
+
     Biquad bpfL, bpfR;
     double tonePh = 0.0;
-    for (size_t i = 0; i < nFrames; ++i) {
-        const float u = static_cast<float>(i) / static_cast<float>(std::max<size_t>(1, nFrames));
+    for (size_t i = 0; i < activeFrames && i < nFrames; ++i) {
+        const float u = static_cast<float>(i) / static_cast<float>(activeFrames);
         if (i % 64 == 0) {
-            const float cut = 320.0f * std::pow(26.0f, u);
-            bpfL.configure(BiquadType::BPF_PEAK, cut, 2.8f + 1.8f * aggression);
-            bpfR.configure(BiquadType::BPF_PEAK, cut * 1.04f, 2.8f + 1.8f * aggression);
+            const float cut = 400.0f * std::pow(18.0f, u);
+            bpfL.configure(BiquadType::BPF_PEAK, cut, 2.2f + 1.2f * aggression);
+            bpfR.configure(BiquadType::BPF_PEAK, cut * 1.05f, 2.2f + 1.2f * aggression);
         }
-        const float toneHz = clampf(rootHz * 4.0f * std::pow(2.0f, u * 2.0f), 160.0f, 2800.0f);
-        tonePh = std::fmod(tonePh + toneHz / kSampleRate, 1.0);
-        const float siren = (2.0f * static_cast<float>(tonePh) - 1.0f) * 0.22f;
+        // Subtle harmonic octave shimmer (clean sine — zero harsh buzzing saw!)
+        const float toneHz = clampf(rootHz * 4.0f * std::pow(2.0f, u * 2.0f), 175.0f, 2400.0f);
+        tonePh += kTwoPi * toneHz / kSampleRate;
+        const float shimmer = std::sin(tonePh) * 0.14f;
 
-        const float env = u * u * clampf((1.0f - u) * 35.0f, 0.0f, 1.0f);
-        const float nL = bpfL.process(rngL.nextBipolar() + siren) * env * 0.65f;
-        const float nR = bpfR.process(rngR.nextBipolar() + siren) * env * 0.65f;
-        out[i * 2] = clampf(std::tanh(nL * 1.45f), -0.88f, 0.88f);
-        out[i * 2 + 1] = clampf(std::tanh(nR * 1.45f), -0.88f, 0.88f);
+        const float env = u * u * clampf((1.0f - u) * 45.0f, 0.0f, 1.0f);
+        const float nL = bpfL.process(rngL.nextBipolar() * 0.85f + shimmer) * env * 0.52f;
+        const float nR = bpfR.process(rngR.nextBipolar() * 0.85f + shimmer) * env * 0.52f;
+        out[i * 2] = clampf(nL, -0.80f, 0.80f);
+        out[i * 2 + 1] = clampf(nR, -0.80f, 0.80f);
     }
     return out;
 }
@@ -1228,10 +1510,11 @@ std::vector<float> HardcoreSynth::renderSubImpact(float rootHz, float durationSe
     const float dur = clampf(durationSec, 0.35f, 3.0f);
     const size_t nFrames = static_cast<size_t>(dur * kSampleRate);
     std::vector<float> out(nFrames * 2, 0.0f);
-    XorShift32 rng(0x149A0701u);
+    XorShift32 rngL(0x149A0701u), rngR(0x149A0702u);
 
-    Biquad crashHpf;
-    crashHpf.configure(BiquadType::HPF, 3600.0f, 0.9f);
+    Biquad crashHpfL, crashHpfR;
+    crashHpfL.configure(BiquadType::HPF, 4200.0f, 0.9f);
+    crashHpfR.configure(BiquadType::HPF, 4400.0f, 0.9f);
     double ph = 0.0;
 
     for (size_t i = 0; i < nFrames; ++i) {
@@ -1240,10 +1523,11 @@ std::vector<float> HardcoreSynth::renderSubImpact(float rootHz, float durationSe
         const float subHz = clampf(rootHz * (1.7f * std::exp(-u * 4.5f) + 0.65f), 32.0f, 130.0f);
         ph += kTwoPi * subHz / kSampleRate;
 
-        const float sub = std::tanh(std::sin(ph) * 1.45f) * std::exp(-u * 3.5f) * 0.62f;
-        const float crash = crashHpf.process(rng.nextBipolar()) * std::exp(-u * 4.2f) * 0.36f;
-        out[i * 2] = clampf(sub + crash, -0.88f, 0.88f);
-        out[i * 2 + 1] = clampf(sub + crash * 0.92f, -0.88f, 0.88f);
+        const float sub = fastTanh(std::sin(ph) * 1.40f) * std::exp(-u * 3.8f) * 0.58f;
+        const float cL = crashHpfL.process(rngL.nextBipolar()) * std::exp(-u * 4.2f) * 0.38f;
+        const float cR = crashHpfR.process(rngR.nextBipolar()) * std::exp(-u * 4.2f) * 0.38f;
+        out[i * 2] = clampf(sub + cL, -0.88f, 0.88f);
+        out[i * 2 + 1] = clampf(sub + cR, -0.88f, 0.88f);
     }
     return out;
 }

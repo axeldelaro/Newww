@@ -185,15 +185,16 @@ void testBpmAndChorusDetection() {
     EXPECT_NEAR(res.chorus2Bar, 32, 2.0f, "Chorus 2 detected on bar 32");
 }
 
-void testAll12ArtistKicksAndProLayers() {
-    std::cout << "Running testAll12ArtistKicksAndProLayers...\n";
+void testAll15ArtistKicksAndProLayers() {
+    std::cout << "Running testAll15ArtistKicksAndProLayers...\n";
+    EXPECT_TRUE(kNumKickTypes == 15, "15 Studio Artist Kicks registered");
     std::vector<std::vector<float>> kicks(kNumKickTypes);
 
     for (int k = 0; k < kNumKickTypes; ++k) {
         KickParams p;
         p.type = static_cast<KickType>(k);
         p.rootHz = 55.0f;
-        p.bpm = (k == 8) ? 138.0f : ((k == 9 || k == 11) ? 155.0f : ((k == 10) ? 180.0f : 202.0f));
+        p.bpm = (k == 8) ? 138.0f : ((k == 9 || k == 11) ? 155.0f : ((k == 10) ? 180.0f : ((k == 13) ? 162.0f : 200.0f)));
         p.drive = 0.85f;
         p.aggression = 0.85f;
         p.bassSaturation = 0.34f;
@@ -207,17 +208,120 @@ void testAll12ArtistKicksAndProLayers() {
         EXPECT_TRUE(st.rmsDb > -15.5f, "Kick has strong punch");
     }
 
-    // Verify all pro genre layers synthesize cleanly
+    // Verify all v4.0 pro producer layers synthesize cleanly
     auto clap = HardcoreSynth::render909Clap();
     auto ride = HardcoreSynth::render909Ride();
+    auto revCrash = HardcoreSynth::renderReverseCrash(0.65f);
+    auto htekStab = HardcoreSynth::renderHardtekOffbeatStab(55.0f, 0.16f, 0.80f);
     auto acid = HardcoreSynth::renderAcid303Riff(55.0f, 152.0f, 4, 0.85f);
     auto euph = HardcoreSynth::renderEuphoricChordLayer(55.0f, true, 200.0f, 4);
     auto hoov = HardcoreSynth::renderRaveHooverStab(55.0f, 0.7f, 0.85f);
+    auto roll = HardcoreSynth::renderSnareBuildupRoll(200.0f, 4.8f, 55.0f, 0.85f, 1.5f);
+    auto riser = HardcoreSynth::renderNoiseRiser(4.8f, 55.0f, 0.85f, 0.45f);
+
     EXPECT_TRUE(measureStereo(clap).allFinite && measureStereo(clap).peak > 0.1f, "909 Clap valid");
     EXPECT_TRUE(measureStereo(ride).allFinite && measureStereo(ride).peak > 0.05f, "909 Ride valid");
+    EXPECT_TRUE(measureStereo(revCrash).allFinite && measureStereo(revCrash).peak > 0.15f, "ReverseCrash valid");
+    EXPECT_TRUE(measureStereo(htekStab).allFinite && measureStereo(htekStab).peak > 0.15f, "Hardtek Offbeat Stab valid");
     EXPECT_TRUE(measureStereo(acid).allFinite && measureStereo(acid).peak > 0.1f, "TB-303 Acid Riff valid");
     EXPECT_TRUE(measureStereo(euph).allFinite && measureStereo(euph).peak > 0.1f, "Euphoric Frenchcore Pad valid");
     EXPECT_TRUE(measureStereo(hoov).allFinite && measureStereo(hoov).peak > 0.1f, "Gabber Hoover Stab valid");
+    EXPECT_TRUE(measureStereo(roll).allFinite && measureStereo(riser).allFinite, "Pre-drop breath buildup valid");
+
+    // Verify Pre-Drop Vocal Solo Breath actually silences the tail of roll & riser!
+    float tailRiserPeak = 0.0f;
+    const size_t tailSamples = static_cast<size_t>(0.25f * kSampleRate) * 2u;
+    for (size_t i = riser.size() - tailSamples; i < riser.size(); ++i) {
+        tailRiserPeak = std::max(tailRiserPeak, std::fabs(riser[i]));
+    }
+    EXPECT_TRUE(tailRiserPeak < 0.01f, "Noise riser cuts cleanly before pre-drop vocal solo breath");
+}
+
+void testBarRootChordTracker() {
+    std::cout << "Running testBarRootChordTracker...\n";
+    // 16 bars at 128 BPM in A minor: bars 0..3 = A (0), 4..7 = F (-4), 8..11 = G (-2), 12..15 = C (+3)
+    const float bpm = 128.0f;
+    const float beatSec = 60.0f / bpm;
+    const float barSec = beatSec * 4.0f;
+    const int totalBars = 16;
+    const size_t nFrames = static_cast<size_t>(totalBars * barSec * kSampleRate);
+    std::vector<float> pcm(nFrames * 2, 0.0f);
+    const int expectedOff[4] = {0, -4, -2, 3};
+
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const int bar = std::min(totalBars - 1, static_cast<int>(t / barSec));
+        const int grp = (bar / 4) % 4;
+        const float bassHz = 110.0f * std::pow(2.0f, static_cast<float>(expectedOff[grp]) / 12.0f);
+        const float beatPos = t / beatSec;
+        const float lt = (beatPos - std::floor(beatPos)) * beatSec;
+        const float kick = (lt < 0.10f) ? std::sin(kTwoPi * (55.0f + 130.0f * std::exp(-lt * 40.0f)) * lt) * std::exp(-lt * 24.0f) * 0.45f : 0.0f;
+        const float bass = (std::sin(kTwoPi * bassHz * t) * 0.55f + std::sin(kTwoPi * bassHz * 1.5f * t) * 0.25f);
+        const float s = clampf(kick + bass * 0.65f, -0.95f, 0.95f);
+        pcm[i * 2] = s;
+        pcm[i * 2 + 1] = s;
+    }
+
+    auto res = MusicAnalyzer::analyze(pcm.data(), nFrames);
+    EXPECT_TRUE(res.barRootOffsets.size() >= 12u, "Bar root offsets populated for every bar");
+    int distinctRoots = 0;
+    for (size_t b = 1; b < res.barRootOffsets.size(); ++b) {
+        if (res.barRootOffsets[b] != res.barRootOffsets[b - 1]) ++distinctRoots;
+    }
+    std::cout << "  Detected key=" << res.keyName << " bars=" << res.barRootOffsets.size()
+              << " chord transitions=" << distinctRoots << "\n";
+    EXPECT_TRUE(distinctRoots >= 2, "Per-bar chord tracker detects real chord progression transitions");
+}
+
+void testCenterVocalIsolatorAntiMud() {
+    std::cout << "Running testCenterVocalIsolatorAntiMud...\n";
+    // Build a 12s stereo track: centered lead vocal (1200 Hz, L==R) + loud wide stereo clutter (300 Hz & 2100 Hz, L=-R)
+    const size_t nFrames = static_cast<size_t>(12.0f * kSampleRate);
+    std::vector<float> pcm(nFrames * 2, 0.0f);
+    const float beatSec = 60.0f / 140.0f;
+    for (size_t i = 0; i < nFrames; ++i) {
+        const float t = static_cast<float>(i) / kSampleRate;
+        const float lt = std::fmod(t, beatSec);
+        const float kick = (lt < 0.10f) ? std::sin(kTwoPi * 60.0f * lt) * std::exp(-lt * 22.0f) * 0.35f : 0.0f;
+        const float centerVocal = std::sin(kTwoPi * 1200.0f * t) * 0.28f;
+        const float wideClutter = (std::sin(kTwoPi * 300.0f * t) * 0.36f + std::sin(kTwoPi * 2100.0f * t) * 0.32f);
+        pcm[i * 2] = clampf(kick + centerVocal + wideClutter, -0.95f, 0.95f);
+        pcm[i * 2 + 1] = clampf(kick + centerVocal - wideClutter, -0.95f, 0.95f);
+    }
+
+    auto analysis = MusicAnalyzer::analyze(pcm.data(), nFrames);
+    RemixConfig cfgOff;
+    cfgOff.genreTheme = RemixGenreTheme::HARDTEK_TRIBECORE;
+    cfgOff.tempoSyncMode = TempoSyncMode::ORIGINAL_SPEED_LOCK;
+    cfgOff.drop1Kick = KickType::HARDTEK_BOUNCE;
+    cfgOff.drop2Kick = KickType::HARDTEK_BOUNCE;
+    cfgOff.dropMode = 1; // DIRECT_DROP
+    cfgOff.kickLevel = 0.40f;
+    cfgOff.synthLayerAmount = 0.0f;
+    cfgOff.percGrooveAmount = 0.0f;
+    cfgOff.vocalIsolation = 0.0f;
+
+    RemixConfig cfgIso = cfgOff;
+    cfgIso.vocalIsolation = 0.90f;
+
+    auto outOff = RemixEngine::renderRemix(pcm.data(), nFrames, analysis, cfgOff);
+    auto outIso = RemixEngine::renderRemix(pcm.data(), nFrames, analysis, cfgIso);
+
+    auto measureSideRms = [](const std::vector<float>& buf) {
+        double s2 = 0.0;
+        const size_t startF = buf.size() / 4;
+        const size_t endF = (buf.size() / 2) - 4096;
+        for (size_t f = startF; f < endF; ++f) {
+            const float side = 0.5f * (buf[f * 2] - buf[f * 2 + 1]);
+            s2 += static_cast<double>(side) * side;
+        }
+        return static_cast<float>(std::sqrt(s2 / static_cast<double>(std::max<size_t>(1, endF - startF))));
+    };
+
+    const float sideOff = measureSideRms(outOff.stereoPcm);
+    const float sideIso = measureSideRms(outIso.stereoPcm);
+    std::cout << "  Drop stereo clutter Side RMS: iso=0 -> " << sideOff << ", iso=0.90 -> " << sideIso << "\n";
+    EXPECT_TRUE(sideIso < sideOff * 0.65f, "CenterVocalIsolator strips >35% of wide stereo clutter in drops!");
 }
 
 void testAllGenresSpeedAndEpicVocals() {
@@ -233,13 +337,15 @@ void testAllGenresSpeedAndEpicVocals() {
         KickType k2;
         TempoSyncMode syncMode;
     };
-    const ThemeSpec specs[6] = {
-        {"Techno Normale (Charlotte)", RemixGenreTheme::TECHNO_CLUB, 138.0f, KickType::TECHNO_ROLLING, KickType::TECHNO_ROLLING, TempoSyncMode::NEVER_SLOW},
+    const ThemeSpec specs[8] = {
+        {"Darktek / Maissouille Hardtek", RemixGenreTheme::HARDTEK_TRIBECORE, 198.0f, KickType::HARDTEK_BOUNCE, KickType::FRENCHCORE_MELODIC, TempoSyncMode::NEVER_SLOW},
+        {"Dr. Peacock Frenchcore", RemixGenreTheme::FRENCHCORE, 200.0f, KickType::FRENCHCORE_MELODIC, KickType::FRENCHCORE_MELODIC, TempoSyncMode::NEVER_SLOW},
+        {"Rebelion Overdose PVC-Zaag", RemixGenreTheme::RAWSTYLE, 162.0f, KickType::REBELION_PVC_ZAAG, KickType::ZAAG_CHAINSAW, TempoSyncMode::NEVER_SLOW},
+        {"Cosy Nightmare Uptempo", RemixGenreTheme::UPTEMPO_ZAAG, 202.0f, KickType::COSY_UPTEMPO, KickType::UPTEMPO_BOUNCE, TempoSyncMode::NEVER_SLOW},
+        {"UOK Piep (Original Speed)", RemixGenreTheme::UPTEMPO_ZAAG, 212.0f, KickType::PIEP_UOK, KickType::ZAAG_PIEP_HYBRID, TempoSyncMode::ORIGINAL_SPEED_LOCK},
+        {"Angerfist Gabber 909", RemixGenreTheme::GABBER, 180.0f, KickType::GABBER_MILLENNIUM, KickType::GABBER_MILLENNIUM, TempoSyncMode::NEVER_SLOW},
         {"Hard Techno (Sara/Nico)", RemixGenreTheme::HARD_TECHNO, 156.0f, KickType::HARD_TECHNO_RAVE, KickType::ACID_303_TECHNO, TempoSyncMode::NEVER_SLOW},
-        {"Frenchcore (Sefa/Peacock)", RemixGenreTheme::FRENCHCORE, 200.0f, KickType::FRENCHCORE_MELODIC, KickType::FRENCHCORE_MELODIC, TempoSyncMode::NEVER_SLOW},
-        {"Gabber 909 (Angerfist)", RemixGenreTheme::GABBER, 180.0f, KickType::GABBER_MILLENNIUM, KickType::GABBER_MILLENNIUM, TempoSyncMode::NEVER_SLOW},
-        {"UOK Piep (Original Speed)", RemixGenreTheme::UPTEMPO_ZAAG, 210.0f, KickType::PIEP_UOK, KickType::ZAAG_PIEP_HYBRID, TempoSyncMode::ORIGINAL_SPEED_LOCK},
-        {"Noiseflow Krach", RemixGenreTheme::UPTEMPO_ZAAG, 205.0f, KickType::KRACH_NOISEFLOW, KickType::ZAAG_CHAINSAW, TempoSyncMode::NEVER_SLOW}
+        {"Techno Normale (Charlotte)", RemixGenreTheme::TECHNO_CLUB, 138.0f, KickType::TECHNO_ROLLING, KickType::TECHNO_ROLLING, TempoSyncMode::NEVER_SLOW}
     };
 
     for (const auto& sp : specs) {
@@ -251,6 +357,7 @@ void testAllGenresSpeedAndEpicVocals() {
         cfg.drop2Kick = sp.k2;
         cfg.epicVocalBoost = 0.85f;
         cfg.vocalClarity = 0.85f;
+        cfg.vocalIsolation = 0.78f;
         cfg.bassSaturation = 0.34f;
         cfg.originalMix = 0.86f;
         cfg.vocalSidechain = 0.24f;
@@ -293,11 +400,11 @@ void testProgressCancelAndSeamlessBoundaries() {
     auto analysis = MusicAnalyzer::analyze(demo.data(), demo.size() / 2);
 
     RemixConfig cfg;
-    cfg.genreTheme = RemixGenreTheme::TECHNO_CLUB;
+    cfg.genreTheme = RemixGenreTheme::HARDTEK_TRIBECORE;
     cfg.tempoSyncMode = TempoSyncMode::ORIGINAL_SPEED_LOCK;
-    cfg.targetBpm = 138.0f;
-    cfg.drop1Kick = KickType::TECHNO_ROLLING;
-    cfg.drop2Kick = KickType::TECHNO_ROLLING;
+    cfg.targetBpm = 198.0f;
+    cfg.drop1Kick = KickType::HARDTEK_BOUNCE;
+    cfg.drop2Kick = KickType::FRENCHCORE_MELODIC;
 
     // 1. Verify live progress atomic reaches 100%
     std::atomic<int> prog{0};
@@ -329,10 +436,12 @@ void testProgressCancelAndSeamlessBoundaries() {
 }  // namespace
 
 int main() {
-    std::cout << "=== ZAAGFORGE v3.5 Ultra-Turbo C++20 DSP Test Suite ===\n";
+    std::cout << "=== ZAAGFORGE v4.0 Mainstage Banger Pro C++20 DSP Test Suite ===\n";
     testNeverSlowTempoSyncInvariant();
     testBpmAndChorusDetection();
-    testAll12ArtistKicksAndProLayers();
+    testAll15ArtistKicksAndProLayers();
+    testBarRootChordTracker();
+    testCenterVocalIsolatorAntiMud();
     testAllGenresSpeedAndEpicVocals();
     testProgressCancelAndSeamlessBoundaries();
 

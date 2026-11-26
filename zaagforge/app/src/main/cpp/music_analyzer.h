@@ -60,6 +60,7 @@ struct AnalysisResult {
     std::vector<float> barRms;
     std::vector<float> barVocalEnergy;
     std::vector<float> barNovelty;
+    std::vector<int> barRootOffsets; // Detected per-bar diatonic bass/chord root semitone offset (-5..+7)
 };
 
 class MusicAnalyzer {

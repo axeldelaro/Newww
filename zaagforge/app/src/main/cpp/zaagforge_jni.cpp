@@ -398,6 +398,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     jfloat originalMix,
     jfloat vocalClarity,
     jfloat epicVocalBoost,
+    jfloat vocalIsolation,
     jfloat vocalSidechain,
     jfloat kickLevel,
     jfloat bassCutHz,
@@ -432,7 +433,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
 
     zaagforge::RemixConfig cfg;
     cfg.targetBpm = targetBpm;
-    cfg.genreTheme = static_cast<zaagforge::RemixGenreTheme>(std::max(0, std::min(5, static_cast<int>(genreTheme))));
+    cfg.genreTheme = static_cast<zaagforge::RemixGenreTheme>(std::max(0, std::min(6, static_cast<int>(genreTheme))));
     cfg.tempoSyncMode = static_cast<zaagforge::TempoSyncMode>(std::max(0, std::min(2, static_cast<int>(tempoSyncMode))));
     cfg.drop1Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(zaagforge::kNumKickTypes - 1, static_cast<int>(drop1Kick))));
     cfg.drop2Kick = static_cast<zaagforge::KickType>(std::max(0, std::min(zaagforge::kNumKickTypes - 1, static_cast<int>(drop2Kick))));
@@ -442,6 +443,7 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     cfg.originalMix = originalMix;
     cfg.vocalClarity = vocalClarity;
     cfg.epicVocalBoost = epicVocalBoost;
+    cfg.vocalIsolation = vocalIsolation;
     cfg.vocalSidechain = vocalSidechain;
     cfg.kickLevel = kickLevel;
     cfg.bassCutHz = bassCutHz;
@@ -526,8 +528,8 @@ Java_com_zaagforge_studio_dsp_NativeDspBridge_nativeSessionRenderRemix(
     gSession.remixPcm = std::move(out.stereoPcm);
     gProgressPercent.store(100, std::memory_order_relaxed);
 
-    LOGI("Rendered v3.5 ultra-turbo remix in %.0f ms (speed=%.2fx, bpm=%.1f, theme=%d, frames=%zu)",
-         totalMs, out.tempoStretchRatio, out.effectiveTargetBpm, genreTheme, remixFrames);
+    LOGI("Rendered v4.0 mainstage remix in %.0f ms (speed=%.2fx, bpm=%.1f, theme=%d, iso=%.2f, frames=%zu)",
+         totalMs, out.tempoStretchRatio, out.effectiveTargetBpm, genreTheme, vocalIsolation, remixFrames);
 
     std::ostringstream json;
     json.imbue(std::locale::classic());

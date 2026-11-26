@@ -52,9 +52,9 @@ data class ZaagForgeUiState(
     val loadedTrack: AudioTrackItem? = null,
     val analysis: TrackAnalysis? = null,
     val selectedGenreFilter: RemixGenreTheme? = null, // null = TOUS
-    val selectedPreset: RemixPreset = StudioPresets.byId("uok_piep_madness"),
+    val selectedPreset: RemixPreset = StudioPresets.byId("darktek_bounce"),
     val customPresets: List<RemixPreset> = emptyList(),
-    val params: RemixParams = StudioPresets.byId("uok_piep_madness").params,
+    val params: RemixParams = StudioPresets.byId("darktek_bounce").params,
     val remixResult: RemixRenderResult? = null,
     val waveformPeaks: FloatArray = FloatArray(0),
     val sectionMarkers: List<SectionMarker> = emptyList(),

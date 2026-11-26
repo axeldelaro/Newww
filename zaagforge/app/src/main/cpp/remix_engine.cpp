@@ -75,6 +75,7 @@ struct FrameSection {
     std::string label;
     int startBar = 0;
     int endBar = 0;
+    size_t preDropBreathFrames = 0;
 };
 
 struct MixEvent {
@@ -591,7 +592,7 @@ RemixOutput RemixEngine::renderRemix(
                 : std::min(outFrames, static_cast<size_t>(std::llround(s.endFrac * outFrames))));
         if (!frameSections.empty()) sf = frameSections.back().endFrame;
         if (ef < sf) ef = sf;
-        frameSections.push_back({sf, ef, s.type, s.label, s.startBar, s.endBar});
+        frameSections.push_back({sf, ef, s.type, s.label, s.startBar, s.endBar, 0});
     }
     if (!frameSections.empty()) {
         frameSections.front().startFrame = 0;
@@ -610,15 +611,29 @@ RemixOutput RemixEngine::renderRemix(
         });
     }
 
-    // 5. Synthesize Immutable Studio Kick, Percussion & Genre Synth Assets ONCE (~15 ms!)
+    // 5. Synthesize 7-Note Diatonic Chord-Tracked Kicks & Studio Genre Layers (~18 ms!)
     const int switchBars = (config.kickSwitchBars == 8 || config.kickSwitchBars == 16) ? config.kickSwitchBars : 4;
-    const std::array<float, 4> melodyOffsets = (config.genreTheme == RemixGenreTheme::FRENCHCORE)
-        ? (analysis.isMinor ? std::array<float, 4>{0.0f, -4.0f, 3.0f, -2.0f} : std::array<float, 4>{0.0f, 7.0f, 9.0f, 5.0f})
-        : std::array<float, 4>{0.0f, 3.0f, 5.0f, 7.0f};
+    static constexpr std::array<int, 7> kMinorRoots = {-5, -4, -2, 0, 3, 5, 7};
+    static constexpr std::array<int, 7> kMajorRoots = {-5, -3, -1, 0, 2, 4, 5};
+    const auto& diatonicRoots = analysis.isMinor ? kMinorRoots : kMajorRoots;
+    constexpr int kTonicSlot = 3; // diatonicRoots[3] == 0 in both minor and major!
+    constexpr int kTripletSlot = 7;
+    constexpr int kHalfBeatSlot = 8;
 
+    auto rootOffsetToSlot = [&](int offset) -> int {
+        for (int s = 0; s < 7; ++s) {
+            if (diatonicRoots[s] == offset) return s;
+        }
+        return kTonicSlot;
+    };
+
+    const bool usePitchedPool = config.enablePitchKickMelody && (config.genreTheme != RemixGenreTheme::TECHNO_CLUB);
+
+    using KickSet = std::array<std::vector<float>, 9>;
     auto buildKickSet = [&](KickType kt, float driveBoost, float aggBoost) {
-        std::array<std::vector<float>, 5> set;
-        for (int m = 0; m < 4; ++m) {
+        KickSet set;
+        for (int m = 0; m < 7; ++m) {
+            if (!usePitchedPool && m != kTonicSlot) continue;
             KickParams kp;
             kp.type = kt;
             kp.rootHz = effectiveRootHz;
@@ -626,23 +641,45 @@ RemixOutput RemixEngine::renderRemix(
             kp.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
             kp.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
             kp.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
-            kp.pitchSemitoneOffset = melodyOffsets[m];
+            kp.pitchSemitoneOffset = static_cast<float>(diatonicRoots[m]);
             kp.lengthBeats = 1.0f;
             kp.seed = 2026u + static_cast<uint32_t>(kt) * 31u + static_cast<uint32_t>(m);
             set[m] = HardcoreSynth::renderKick(kp);
         }
-        KickParams tripP;
-        tripP.type = kt;
-        tripP.rootHz = effectiveRootHz;
-        tripP.bpm = targetBpm;
-        tripP.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
-        tripP.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
-        tripP.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
-        tripP.pitchSemitoneOffset = 3.0f;
-        tripP.lengthBeats = 0.3333f;
-        tripP.seed = 7777u + static_cast<uint32_t>(kt) * 17u;
-        set[4] = HardcoreSynth::renderKick(tripP);
+        // Triplet roll kick (1/3 beat)
+        {
+            KickParams tripP;
+            tripP.type = kt;
+            tripP.rootHz = effectiveRootHz;
+            tripP.bpm = targetBpm;
+            tripP.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
+            tripP.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
+            tripP.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
+            tripP.pitchSemitoneOffset = static_cast<float>(diatonicRoots[5]); // IV/III energetic turnaround lift
+            tripP.lengthBeats = 0.3333f;
+            tripP.seed = 7777u + static_cast<uint32_t>(kt) * 17u;
+            set[kTripletSlot] = HardcoreSynth::renderKick(tripP);
+        }
+        // Snappy 1/2-beat bounce pickup kick (Darktek / Maissouille / Dr. Peacock fill!)
+        {
+            KickParams halfP;
+            halfP.type = kt;
+            halfP.rootHz = effectiveRootHz;
+            halfP.bpm = targetBpm;
+            halfP.drive = clampf(config.drive + driveBoost, 0.1f, 1.0f);
+            halfP.aggression = clampf(config.zaagAggression + aggBoost, 0.1f, 1.0f);
+            halfP.bassSaturation = clampf(config.bassSaturation, 0.0f, 1.0f);
+            halfP.pitchSemitoneOffset = 0.0f;
+            halfP.lengthBeats = 0.50f;
+            halfP.seed = 8888u + static_cast<uint32_t>(kt) * 19u;
+            set[kHalfBeatSlot] = HardcoreSynth::renderKick(halfP);
+        }
         return set;
+    };
+
+    auto kickAt = [&](const KickSet& set, int slot) -> const std::vector<float>& {
+        if (slot >= 0 && slot < static_cast<int>(set.size()) && !set[slot].empty()) return set[slot];
+        return set[kTonicSlot];
     };
 
     const auto kickSet1 = buildKickSet(config.drop1Kick, 0.0f, 0.0f);
@@ -652,16 +689,22 @@ RemixOutput RemixEngine::renderRemix(
     const float percAmt = clampf(config.percGrooveAmount, 0.0f, 1.0f);
     const float synthAmt = clampf(config.synthLayerAmount, 0.0f, 1.0f);
 
-    const auto openHat = HardcoreSynth::renderHardcoreHat(beatSec * 0.45f, true, 909u);
-    const auto closedHat = HardcoreSynth::renderHardcoreHat(beatSec * 0.14f, false, 908u);
-    const auto clap909 = HardcoreSynth::render909Clap(0.16f, 9091u);
-    const auto ride909 = HardcoreSynth::render909Ride(beatSec * 0.50f, 9092u);
-    const auto subImpact = HardcoreSynth::renderSubImpact(effectiveRootHz, std::min(1.5f, beatSec * 4.0f));
+    const auto openHat = HardcoreSynth::renderHardcoreHat(beatSec * 0.42f, true, 909u);
+    const auto closedHat = HardcoreSynth::renderHardcoreHat(beatSec * 0.13f, false, 908u);
+    const auto clap909 = HardcoreSynth::render909Clap(0.15f, 9091u);
+    const auto ride909 = HardcoreSynth::render909Ride(beatSec * 0.48f, 9092u);
+    const auto subImpact = HardcoreSynth::renderSubImpact(effectiveRootHz, std::min(1.4f, beatSec * 4.0f));
+    const auto reverseCrash = HardcoreSynth::renderReverseCrash(std::min(1.10f, beatSec * 2.0f), 4040u);
 
     std::vector<float> screechA, screechB, hooverStab, acid303Loop, euphoricPadLoop;
-    if (config.enableScreeches && config.genreTheme != RemixGenreTheme::TECHNO_CLUB && config.genreTheme != RemixGenreTheme::FRENCHCORE) {
-        screechA = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.35f, config.zaagAggression, 0);
-        screechB = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.15f, config.zaagAggression, 1);
+    std::array<std::vector<float>, 7> hardtekStabs;
+
+    if (config.enableScreeches &&
+        config.genreTheme != RemixGenreTheme::TECHNO_CLUB &&
+        config.genreTheme != RemixGenreTheme::FRENCHCORE &&
+        config.genreTheme != RemixGenreTheme::HARDTEK_TRIBECORE) {
+        screechA = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 1.25f, config.zaagAggression, 0);
+        screechB = HardcoreSynth::renderIndustrialScreech(effectiveRootHz, beatSec * 0.95f, config.zaagAggression, 1);
     }
     if (synthAmt > 0.05f) {
         if (config.genreTheme == RemixGenreTheme::HARD_TECHNO ||
@@ -671,7 +714,14 @@ RemixOutput RemixEngine::renderRemix(
         } else if (config.genreTheme == RemixGenreTheme::FRENCHCORE) {
             euphoricPadLoop = HardcoreSynth::renderEuphoricChordLayer(effectiveRootHz, analysis.isMinor, targetBpm, 4);
         } else if (config.genreTheme == RemixGenreTheme::GABBER) {
-            hooverStab = HardcoreSynth::renderRaveHooverStab(effectiveRootHz, beatSec * 1.6f, config.zaagAggression);
+            hooverStab = HardcoreSynth::renderRaveHooverStab(effectiveRootHz, beatSec * 1.45f, config.zaagAggression);
+        } else if (config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE) {
+            // 7-note chord-tracked Darktek / Maissouille consonant offbeat rave organ/brass stabs!
+            const float stabDur = clampf(beatSec * 0.46f, 0.11f, 0.22f);
+            for (int m = 0; m < 7; ++m) {
+                const float stabHz = effectiveRootHz * std::pow(2.0f, static_cast<float>(diatonicRoots[m]) / 12.0f);
+                hardtekStabs[m] = HardcoreSynth::renderHardtekOffbeatStab(stabHz, stabDur, config.zaagAggression);
+            }
         }
     }
 
@@ -680,11 +730,11 @@ RemixOutput RemixEngine::renderRemix(
         return result;
     }
 
-    // 6. Build Flat Timeline Event Schedule (< 1 ms, ~100 KB, zero 85 MB kickBus allocation!)
+    // 6. Build Mainstage Festival Arrangement Timeline (< 1 ms, zero big buffers!)
     std::vector<std::vector<float>> ownedBuildups;
     ownedBuildups.reserve(frameSections.size() * 2 + 2);
     std::vector<MixEvent> oneShotEvents;
-    std::vector<MixEvent> longEvents; // buildups & looped genre layers
+    std::vector<MixEvent> longEvents;
     oneShotEvents.reserve(4096);
 
     auto pushOneShot = [&](const std::vector<float>& asset, size_t startF, size_t secEndF, float gL, float gR) {
@@ -693,39 +743,77 @@ RemixOutput RemixEngine::renderRemix(
         oneShotEvents.push_back({&asset, startF, eF, gL, gR, false, 0});
     };
 
-    for (const auto& sec : frameSections) {
+    auto pushReverseEndingAt = [&](const std::vector<float>& revAsset, size_t targetEndF, size_t minStartF, float gain) {
+        if (revAsset.empty() || targetEndF <= minStartF) return;
+        const size_t lenF = revAsset.size() / 2;
+        if (targetEndF < lenF) return;
+        const size_t startF = targetEndF - lenF;
+        if (startF >= minStartF) {
+            oneShotEvents.push_back({&revAsset, startF, targetEndF, gain, gain, false, 0});
+        }
+    };
+
+    auto isHeavyKick = [](KickType kt) -> bool {
+        return kt == KickType::PIEP_UOK || kt == KickType::KRACH_NOISEFLOW ||
+               kt == KickType::ZAAG_CHAINSAW || kt == KickType::ZAAG_PIEP_HYBRID ||
+               kt == KickType::REBELION_PVC_ZAAG || kt == KickType::RAWSTYLE_GATED ||
+               kt == KickType::SCHRANZ_INDUSTRIAL || kt == KickType::HARD_TECHNO_RAVE;
+    };
+
+    for (auto& sec : frameSections) {
         if (sec.endFrame <= sec.startFrame) continue;
         const float secDurSec = static_cast<float>(sec.endFrame - sec.startFrame) / kSampleRate;
 
         if (sec.type == SectionType::BUILDUP && secDurSec >= 0.45f) {
-            ownedBuildups.push_back(HardcoreSynth::renderSnareBuildupRoll(targetBpm, secDurSec, effectiveRootHz, config.zaagAggression));
+            // Mainstage Pre-Drop Vocal Solo Breath: drums & risers cut cleanly 1..2 beats BEFORE Beat 1!
+            float breathBeats = 1.0f;
+            if (config.genreTheme == RemixGenreTheme::TECHNO_CLUB) {
+                breathBeats = 0.5f;
+            } else if (secDurSec >= beatSec * 10.0f &&
+                       (config.genreTheme == RemixGenreTheme::RAWSTYLE ||
+                        config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE ||
+                        config.genreTheme == RemixGenreTheme::UPTEMPO_ZAAG)) {
+                breathBeats = 1.5f;
+            }
+            const float breathSec = std::min(secDurSec * 0.25f, breathBeats * beatSec);
+            sec.preDropBreathFrames = static_cast<size_t>(breathSec * kSampleRate);
+
+            ownedBuildups.push_back(HardcoreSynth::renderSnareBuildupRoll(
+                targetBpm, secDurSec, effectiveRootHz, config.zaagAggression, breathSec / beatSec
+            ));
             const auto& rollRef = ownedBuildups.back();
-            ownedBuildups.push_back(HardcoreSynth::renderNoiseRiser(secDurSec, effectiveRootHz, config.zaagAggression));
+            ownedBuildups.push_back(HardcoreSynth::renderNoiseRiser(
+                secDurSec, effectiveRootHz, config.zaagAggression, breathSec
+            ));
             const auto& riserRef = ownedBuildups.back();
 
-            const float rollGain = (config.genreTheme == RemixGenreTheme::TECHNO_CLUB) ? 0.46f : 0.64f;
+            const float rollGain = (config.genreTheme == RemixGenreTheme::TECHNO_CLUB) ? 0.44f : 0.62f;
             longEvents.push_back({&rollRef, sec.startFrame, std::min(sec.endFrame, sec.startFrame + rollRef.size() / 2), rollGain, rollGain, false, 0});
-            longEvents.push_back({&riserRef, sec.startFrame, std::min(sec.endFrame, sec.startFrame + riserRef.size() / 2), 0.44f, 0.44f, false, 0});
+            longEvents.push_back({&riserRef, sec.startFrame, std::min(sec.endFrame, sec.startFrame + riserRef.size() / 2), 0.40f, 0.40f, false, 0});
+
+            // Festival Reverse-Crash suck-in swelling right under the vocal solo into Beat 1!
+            pushReverseEndingAt(reverseCrash, sec.endFrame, sec.startFrame, 0.44f);
         } else if (sec.type == SectionType::FAKE_DROP) {
-            const size_t silenceCutoff = sec.startFrame + static_cast<size_t>((sec.endFrame - sec.startFrame) * 0.78f);
-            pushOneShot(kickSet1[0], sec.startFrame, silenceCutoff, 0.86f, 0.86f);
+            const size_t silenceCutoff = sec.startFrame + static_cast<size_t>((sec.endFrame - sec.startFrame) * 0.72f);
+            pushOneShot(kickAt(kickSet1, kTonicSlot), sec.startFrame, silenceCutoff, 0.88f, 0.88f);
             if (!screechA.empty() && secDurSec >= 0.25f) {
                 const size_t stabPos = sec.startFrame + static_cast<size_t>(std::min(beatFramesF * 0.5f, (silenceCutoff - sec.startFrame) * 0.35f));
-                pushOneShot(screechA, stabPos, silenceCutoff, 0.50f, 0.50f);
+                pushOneShot(screechA, stabPos, silenceCutoff, 0.44f, 0.44f);
             }
+            pushReverseEndingAt(reverseCrash, sec.endFrame, sec.startFrame, 0.38f);
         } else if (sec.type == SectionType::DROP_1 || sec.type == SectionType::DROP_2) {
             const bool isDrop2 = (sec.type == SectionType::DROP_2);
-            pushOneShot(subImpact, sec.startFrame, sec.endFrame, 0.46f, 0.46f);
+            pushOneShot(subImpact, sec.startFrame, sec.endFrame, 0.48f, 0.48f);
 
             const size_t fadeF = std::min<size_t>(2205, (sec.endFrame - sec.startFrame) / 4);
             if (!acid303Loop.empty()) {
                 const float acidGain = (config.genreTheme == RemixGenreTheme::TECHNO_CLUB)
-                    ? (isDrop2 ? 0.52f : 0.32f) * synthAmt
-                    : (isDrop2 ? 0.68f : 0.48f) * synthAmt;
+                    ? (isDrop2 ? 0.44f : 0.28f) * synthAmt
+                    : (isDrop2 ? 0.56f : 0.40f) * synthAmt;
                 longEvents.push_back({&acid303Loop, sec.startFrame, sec.endFrame, acidGain, acidGain, true, fadeF});
             }
             if (!euphoricPadLoop.empty()) {
-                const float padGain = (isDrop2 ? 0.62f : 0.46f) * synthAmt;
+                const float padGain = (isDrop2 ? 0.48f : 0.36f) * synthAmt;
                 longEvents.push_back({&euphoricPadLoop, sec.startFrame, sec.endFrame, padGain, padGain, true, fadeF});
             }
 
@@ -741,36 +829,109 @@ RemixOutput RemixEngine::renderRemix(
                 const int switchPhase = (dropBarIdx / switchBars) % 2;
                 const bool useSet2 = isDrop2 ? (switchPhase == 0) : (switchPhase == 1);
                 const auto& activeSet = useSet2 ? (isDrop2 ? kickSet2Finale : kickSet2) : kickSet1;
+                const KickType activeKt = useSet2 ? config.drop2Kick : config.drop1Kick;
 
                 const bool isTurnaroundBar = (dropBarNum % 4 == 0);
                 const bool isSwitchBoundaryBar = (dropBarNum % switchBars == 0);
+                const bool isSwitchLandingBeat = (dropBarIdx > 0 && (dropBarIdx % switchBars == 0) && beatInBar == 0);
 
-                if (config.enableTripletRolls && isTurnaroundBar && beatInBar == 3 &&
-                    config.genreTheme != RemixGenreTheme::TECHNO_CLUB) {
-                    const float tripStep = beatFramesF / 3.0f;
-                    for (int t = 0; t < 3; ++t) {
-                        const size_t tStart = beatStart + static_cast<size_t>(std::llround(t * tripStep));
-                        const float accent = 0.85f + 0.06f * static_cast<float>(t);
-                        pushOneShot(activeSet[4], tStart, sec.endFrame, accent, accent);
-                    }
-                } else {
-                    int pitchIdx = 0;
-                    if (config.genreTheme == RemixGenreTheme::FRENCHCORE && config.enablePitchKickMelody) {
-                        pitchIdx = dropBarIdx % 4;
-                    } else if (config.enablePitchKickMelody && isTurnaroundBar && config.genreTheme != RemixGenreTheme::TECHNO_CLUB) {
-                        static constexpr std::array<int, 4> kTurnaround = {0, 1, 2, 3};
-                        pitchIdx = kTurnaround[beatInBar];
-                    } else if (config.enablePitchKickMelody && (dropBarNum % 2 == 0) && beatInBar == 3 && config.genreTheme != RemixGenreTheme::TECHNO_CLUB) {
-                        pitchIdx = 1;
-                    }
-                    const float kGain = isDrop2 ? 1.02f : 0.98f;
-                    pushOneShot(activeSet[pitchIdx], beatStart, sec.endFrame, kGain, kGain);
+                // Look up the REAL chord/bass root of the user's song at this exact bar!
+                int trackedSlot = kTonicSlot;
+                if (usePitchedPool && !analysis.barRootOffsets.empty() && warpedSrcBarFrames > 1.0) {
+                    const int srcBar = (beatStart >= downbeatFrame)
+                        ? static_cast<int>(std::floor(static_cast<double>(beatStart - downbeatFrame) / warpedSrcBarFrames))
+                        : 0;
+                    const int clampedBar = std::max(0, std::min(static_cast<int>(analysis.barRootOffsets.size()) - 1, srcBar));
+                    trackedSlot = rootOffsetToSlot(analysis.barRootOffsets[clampedBar]);
                 }
 
-                if (percAmt > 0.05f) {
+                // Subtle SubImpact punch right on Beat 1 of every Kick-Switch!
+                if (isSwitchLandingBeat) {
+                    pushOneShot(subImpact, beatStart, sec.endFrame, 0.26f, 0.26f);
+                }
+
+                // Festival Reverse-Crash 2 beats before every Kick-Switch!
+                if (isSwitchBoundaryBar && beatInBar == 2 && config.genreTheme != RemixGenreTheme::TECHNO_CLUB) {
+                    const size_t nextBarStart = sec.startFrame + static_cast<size_t>(std::llround(static_cast<double>(lb + 2) * static_cast<double>(beatFramesF)));
+                    if (nextBarStart <= sec.endFrame) {
+                        pushReverseEndingAt(reverseCrash, nextBarStart, sec.startFrame, 0.34f);
+                    }
+                }
+
+                // Mainstage Phrasing: Beat-4 Kick-Cuts (Breath!) vs Switch-Boundary Triplet / Bounce Pickups!
+                const bool isMidPhraseKickCut = isTurnaroundBar && !isSwitchBoundaryBar && beatInBar == 3 &&
+                    config.genreTheme != RemixGenreTheme::TECHNO_CLUB &&
+                    config.genreTheme != RemixGenreTheme::HARD_TECHNO;
+
+                if (isMidPhraseKickCut) {
+                    // Clean Beat-4 Kick-Cut: drop kick out so vocal blooms + signature artist turnaround cue!
+                    if (config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE) {
+                        // Darktek / Maissouille signature Beat-4 clap + pitched offbeat rave stab!
+                        if (percAmt > 0.05f) {
+                            pushOneShot(clap909, beatStart, sec.endFrame, 0.54f * percAmt, 0.54f * percAmt);
+                        }
+                        const size_t offPos = beatStart + static_cast<size_t>(beatFramesF * 0.5f);
+                        if (!hardtekStabs[trackedSlot].empty() && offPos < sec.endFrame) {
+                            pushOneShot(hardtekStabs[trackedSlot], offPos, sec.endFrame, 0.52f * synthAmt, 0.52f * synthAmt);
+                        }
+                    } else if (config.genreTheme == RemixGenreTheme::FRENCHCORE) {
+                        // Dr. Peacock airy Beat-4 clap lift right before Bar 5 slam!
+                        if (percAmt > 0.05f) {
+                            pushOneShot(clap909, beatStart, sec.endFrame, 0.48f * percAmt, 0.48f * percAmt);
+                        }
+                    } else if (!screechB.empty()) {
+                        // Rebelion / UOK / Cosy Nightmare Beat-4 solo vocal + sharp laser screech!
+                        pushOneShot(screechB, beatStart, sec.endFrame, 0.32f, 0.32f);
+                    }
+                } else if (isSwitchBoundaryBar && beatInBar == 3 && config.genreTheme != RemixGenreTheme::TECHNO_CLUB) {
+                    if (config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE ||
+                        config.genreTheme == RemixGenreTheme::FRENCHCORE) {
+                        // Snappy 1/8 double-kick bounce pickup into the kick-switch!
+                        const size_t halfStep = static_cast<size_t>(beatFramesF * 0.5f);
+                        pushOneShot(kickAt(activeSet, kHalfBeatSlot), beatStart, sec.endFrame, 0.94f, 0.94f);
+                        if (beatStart + halfStep < sec.endFrame) {
+                            pushOneShot(kickAt(activeSet, kHalfBeatSlot), beatStart + halfStep, sec.endFrame, 1.00f, 1.00f);
+                        }
+                    } else if (config.enableTripletRolls) {
+                        const float tripStep = beatFramesF / 3.0f;
+                        for (int t = 0; t < 3; ++t) {
+                            const size_t tStart = beatStart + static_cast<size_t>(std::llround(t * tripStep));
+                            const float accent = 0.86f + 0.06f * static_cast<float>(t);
+                            pushOneShot(kickAt(activeSet, kTripletSlot), tStart, sec.endFrame, accent, accent);
+                        }
+                    } else {
+                        pushOneShot(kickAt(activeSet, trackedSlot), beatStart, sec.endFrame, isDrop2 ? 1.02f : 0.98f, isDrop2 ? 1.02f : 0.98f);
+                    }
+                } else {
+                    int pitchSlot = kTonicSlot;
+                    if (usePitchedPool) {
+                        if (config.genreTheme == RemixGenreTheme::FRENCHCORE ||
+                            config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE ||
+                            !isHeavyKick(activeKt)) {
+                            // Melodic Frenchcore (Dr. Peacock), Hardtek (Darktek/Maissouille), Cosy Nightmare, Bounce:
+                            // Follow the song's REAL detected bar chord roots bar-by-bar!
+                            pitchSlot = trackedSlot;
+                        } else {
+                            // Heavy Zaag / Piep / Rebelion PVC / Krach: anchor solid sub on tonic + harmonic lifts on bar changes
+                            pitchSlot = (trackedSlot == 1 || trackedSlot == 2 || trackedSlot == 3 || trackedSlot == 4 || trackedSlot == 5)
+                                ? trackedSlot
+                                : kTonicSlot;
+                        }
+                        // Crisp harmonic turnaround lift on beat 4 of even bars (unless kick-cut)
+                        if (!isTurnaroundBar && (dropBarNum % 2 == 0) && beatInBar == 3 && pitchSlot == kTonicSlot) {
+                            pitchSlot = 4; // subtle diatonic third/second bounce
+                        }
+                    }
+                    const float kGain = isDrop2 ? 1.01f : 0.98f;
+                    pushOneShot(kickAt(activeSet, pitchSlot), beatStart, sec.endFrame, kGain, kGain);
+                }
+
+                // Clean, Genre-Authentic Percussion Groove (skipped on Beat-4 kick-cuts so breath stays crisp!)
+                if (percAmt > 0.05f && !isMidPhraseKickCut) {
                     const size_t offbeatPos = beatStart + static_cast<size_t>(beatFramesF * 0.5f);
                     if (offbeatPos < sec.endFrame) {
-                        const float hatGain = (isDrop2 ? 0.34f : 0.27f) * percAmt;
+                        const float hatBase = (config.genreTheme == RemixGenreTheme::UPTEMPO_ZAAG) ? 0.20f : 0.26f;
+                        const float hatGain = (isDrop2 ? (hatBase + 0.06f) : hatBase) * percAmt;
                         pushOneShot(openHat, offbeatPos, sec.endFrame, hatGain, hatGain);
                     }
 
@@ -780,42 +941,63 @@ RemixOutput RemixEngine::renderRemix(
                             if (s16 == 2) continue;
                             const size_t p16 = beatStart + static_cast<size_t>(beatFramesF * (0.25f * s16));
                             if (p16 < sec.endFrame) {
-                                const float g16 = ((s16 == 3) ? 0.28f : 0.20f) * percAmt;
+                                const float g16 = ((s16 == 3) ? 0.25f : 0.18f) * percAmt;
                                 pushOneShot(closedHat, p16, sec.endFrame, g16, g16);
                             }
                         }
                     }
 
-                    if ((beatInBar == 1 || beatInBar == 3) &&
-                        (config.genreTheme == RemixGenreTheme::TECHNO_CLUB ||
-                         config.genreTheme == RemixGenreTheme::HARD_TECHNO ||
-                         config.genreTheme == RemixGenreTheme::GABBER)) {
-                        const float clapGain = (isDrop2 ? 0.56f : 0.45f) * percAmt;
+                    // Crisp 909 Claps on Beats 2 & 4
+                    const bool wantsClap =
+                        config.genreTheme == RemixGenreTheme::TECHNO_CLUB ||
+                        config.genreTheme == RemixGenreTheme::HARD_TECHNO ||
+                        config.genreTheme == RemixGenreTheme::GABBER ||
+                        config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE ||
+                        config.genreTheme == RemixGenreTheme::RAWSTYLE ||
+                        (isDrop2 && (config.genreTheme == RemixGenreTheme::FRENCHCORE || config.genreTheme == RemixGenreTheme::UPTEMPO_ZAAG));
+                    if ((beatInBar == 1 || beatInBar == 3) && wantsClap) {
+                        const float clapBase = (config.genreTheme == RemixGenreTheme::UPTEMPO_ZAAG) ? 0.30f : 0.44f;
+                        const float clapGain = (isDrop2 ? (clapBase + 0.08f) : clapBase) * percAmt;
                         pushOneShot(clap909, beatStart, sec.endFrame, clapGain, clapGain);
                     }
 
+                    // Drop 2 909 Ride Lift for club/festival climax!
                     if (isDrop2 && (config.genreTheme == RemixGenreTheme::TECHNO_CLUB ||
                                     config.genreTheme == RemixGenreTheme::HARD_TECHNO ||
                                     config.genreTheme == RemixGenreTheme::GABBER ||
-                                    config.genreTheme == RemixGenreTheme::FRENCHCORE)) {
-                        const float rideGain = 0.30f * percAmt;
+                                    config.genreTheme == RemixGenreTheme::FRENCHCORE ||
+                                    config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE)) {
+                        const float rideGain = 0.26f * percAmt;
                         pushOneShot(ride909, beatStart, sec.endFrame, rideGain, rideGain);
                         if (offbeatPos < sec.endFrame) {
-                            pushOneShot(ride909, offbeatPos, sec.endFrame, rideGain * 0.72f, rideGain * 0.72f);
+                            pushOneShot(ride909, offbeatPos, sec.endFrame, rideGain * 0.68f, rideGain * 0.68f);
                         }
                     }
                 }
 
-                if (!hooverStab.empty() && (dropBarIdx % 2 == 0) && beatInBar == 0) {
-                    const float hGain = (isDrop2 ? 0.55f : 0.42f) * synthAmt;
+                // Darktek / Maissouille Call-and-Response Chord-Tracked Offbeat Hardtek Stabs (alternating bars!)
+                if (config.genreTheme == RemixGenreTheme::HARDTEK_TRIBECORE &&
+                    synthAmt > 0.05f && !isMidPhraseKickCut &&
+                    (dropBarIdx % 2 == 1) && (beatInBar == 1 || beatInBar == 3)) {
+                    const size_t offPos = beatStart + static_cast<size_t>(beatFramesF * 0.5f);
+                    if (!hardtekStabs[trackedSlot].empty() && offPos < sec.endFrame) {
+                        const float stabGain = (isDrop2 ? 0.44f : 0.34f) * synthAmt;
+                        pushOneShot(hardtekStabs[trackedSlot], offPos, sec.endFrame, stabGain, stabGain);
+                    }
+                }
+
+                // Classic Gabber Hoover Stabs (cleanly spaced every 4 bars on Beat 1!)
+                if (!hooverStab.empty() && (dropBarIdx % 4 == 0) && beatInBar == 0) {
+                    const float hGain = (isDrop2 ? 0.46f : 0.36f) * synthAmt;
                     pushOneShot(hooverStab, beatStart, sec.endFrame, hGain, hGain);
                 }
 
+                // Surgical Rebelion / Uptempo Screeches (ONLY at switch cues — never cluttered!)
                 if (!screechA.empty()) {
-                    if ((isSwitchBoundaryBar && beatInBar == 2) || (isDrop2 && (dropBarNum % 2 == 1) && beatInBar == 0)) {
-                        const auto& sc = (dropBarNum % 2 == 0) ? screechA : screechB;
-                        const float scGain = isDrop2 ? 0.34f : 0.28f;
-                        pushOneShot(sc, beatStart, sec.endFrame, scGain, scGain);
+                    if (isSwitchBoundaryBar && beatInBar == 2) {
+                        pushOneShot(screechA, beatStart, sec.endFrame, isDrop2 ? 0.30f : 0.24f, isDrop2 ? 0.30f : 0.24f);
+                    } else if (isDrop2 && isSwitchLandingBeat) {
+                        pushOneShot(screechB, beatStart, sec.endFrame, 0.26f, 0.26f);
                     }
                 }
             }
@@ -826,8 +1008,8 @@ RemixOutput RemixEngine::renderRemix(
         return a.startFrame < b.startFrame;
     });
 
-    // 7. FUSED L2-CACHE-HOT MULTI-THREADED RENDER + MASTERING ENGINE!
-    //    Single output buffer (50% less peak RAM!), 6-core parallel execution, 97 ms filter+limiter
+    // 7. FUSED L2-CACHE-HOT MULTI-THREADED RENDER + CENTER VOCAL ISOLATOR + MASTERING!
+    //    Single output buffer (50% less RAM!), 6-core parallel execution, 93 ms filter+limiter
     //    warm-up per thread + exact 4 ms lookahead latency compensation (0.00 ms Beat 1 precision!).
     std::vector<float> outPcm(outFrames * 2, 0.0f);
 
@@ -835,18 +1017,22 @@ RemixOutput RemixEngine::renderRemix(
     const float origMixGain = clampf(config.originalMix, 0.15f, 1.0f);
     const float vocalClarity = clampf(config.vocalClarity, 0.0f, 1.0f);
     const float epicVocalBoost = clampf(config.epicVocalBoost, 0.0f, 1.0f);
+    const float isoAmt = clampf(config.vocalIsolation, 0.0f, 1.0f);
     const float vocalScDepth = clampf(config.vocalSidechain, 0.0f, 0.85f);
     const float stutterAmt = clampf(config.stutterAmount, 0.0f, 1.0f);
     const float kickGain = clampf(config.kickLevel, 0.35f, 1.25f);
     const int masterMode = std::max(0, std::min(2, config.masterMode));
-    const float ottDepth = (masterMode == 0) ? 0.22f : ((masterMode == 1) ? 0.36f : 0.52f);
-    const float preGain = (masterMode == 0) ? 1.32f : ((masterMode == 1) ? 1.46f : 1.60f);
-    const float ottMidScale = 1.0f + 0.09f * epicVocalBoost;
+    const float ottDepth = (masterMode == 0) ? 0.24f : ((masterMode == 1) ? 0.36f : 0.50f);
+    const float preGain = (masterMode == 0) ? 1.56f : ((masterMode == 1) ? 1.68f : 1.80f);
+    const float ottMidScale = 1.0f + 0.10f * epicVocalBoost;
     const float sideScale = 1.02f - 0.16f * vocalClarity;
-    const bool isTechnoOrFrenchcore = (config.genreTheme == RemixGenreTheme::TECHNO_CLUB ||
-                                       config.genreTheme == RemixGenreTheme::FRENCHCORE);
+    const bool allowDropStutter = (config.genreTheme == RemixGenreTheme::UPTEMPO_ZAAG ||
+                                   config.genreTheme == RemixGenreTheme::RAWSTYLE);
     const float envSlew = std::exp(-1.0f / (0.012f * kSampleRate));
-    const float dropSlew = std::exp(-1.0f / (0.0022f * kSampleRate)); // crisp 2.2 ms zero-click drop slam
+    const float dropSlew = std::exp(-1.0f / (0.0022f * kSampleRate));
+    const float isoEnvAlpha = 1.0f - std::exp(-1.0f / (0.018f * kSampleRate));
+    const float kAtkCoeff = std::exp(-1.0f / (0.0020f * kSampleRate)); // 2 ms instant sidechain attack
+    const float kRelCoeff = std::exp(-1.0f / (0.0680f * kSampleRate)); // 68 ms snappy mainstage release
 
     constexpr size_t kBlockFrames = 16384; // 128 KB stereo block -> 100% L2-cache resident!
     constexpr size_t kWarmupFrames = 4096; // 93 ms pre-roll settles every filter, OTT & limiter!
@@ -863,7 +1049,7 @@ RemixOutput RemixEngine::renderRemix(
     auto renderSlice = [&](unsigned workerId, size_t sliceStart, size_t sliceEnd) {
         if (sliceStart >= sliceEnd) return;
 
-        // Thread-local DSP state (zero lock contention, 100% in L1 cache!)
+        // Thread-local DSP state (zero lock contention, 100% L1-cache resident!)
         LinkwitzRiley4 bassSplitL, bassSplitR;
         LinkwitzRiley2 vocalSplitL, vocalSplitR;
         bassSplitL.configure(bassCutHz);
@@ -872,11 +1058,11 @@ RemixOutput RemixEngine::renderRemix(
         vocalSplitR.configure(680.0f);
 
         Biquad midDeMud, midPresence, midUpperFocus, midAir, sideVocalDip, buildHpfL, buildHpfR;
-        midDeMud.configure(BiquadType::PEAK, 310.0f, 1.35f, -2.6f * vocalClarity);
-        midPresence.configure(BiquadType::PEAK, 2150.0f, 1.05f, (5.0f + 2.0f * epicVocalBoost) * vocalClarity);
+        midDeMud.configure(BiquadType::PEAK, 310.0f, 1.35f, -3.2f * vocalClarity);
+        midPresence.configure(BiquadType::PEAK, 2150.0f, 1.05f, (5.2f + 2.0f * epicVocalBoost) * vocalClarity);
         midUpperFocus.configure(BiquadType::PEAK, 3550.0f, 1.30f, (2.4f + 1.5f * epicVocalBoost) * vocalClarity);
-        midAir.configure(BiquadType::HIGH_SHELF, 7000.0f, 0.707f, 2.3f * vocalClarity);
-        sideVocalDip.configure(BiquadType::PEAK, 1900.0f, 1.0f, -2.0f * vocalClarity);
+        midAir.configure(BiquadType::HIGH_SHELF, 7000.0f, 0.707f, 2.2f * vocalClarity);
+        sideVocalDip.configure(BiquadType::PEAK, 1900.0f, 1.0f, -2.4f * vocalClarity);
         buildHpfL.configure(BiquadType::HPF, bassCutHz, 1.15f);
         buildHpfR.configure(BiquadType::HPF, bassCutHz, 1.15f);
 
@@ -900,14 +1086,16 @@ RemixOutput RemixEngine::renderRemix(
         float midGainSm = 1.0f;
         float vocGainSm = 1.0f;
         float buildWetSm = 0.0f;
+        float isoWetSm = 0.0f;
+        float midVocEnv = 0.05f;
+        float sideVocEnv = 0.01f;
+        float kickEnvSm = 0.0f;
         float localPeak = 0.0f;
         double localSumSq = 0.0;
 
-        // Input timeline range: start kWarmupFrames early, end limLatency past sliceEnd so output is 0.00ms aligned!
         const size_t warmStart = (sliceStart >= kWarmupFrames) ? (sliceStart - kWarmupFrames) : 0;
-        const size_t feedEnd = sliceEnd + limLatency; // may exceed outFrames by limLatency on last worker (flushes limiter!)
+        const size_t feedEnd = sliceEnd + limLatency;
 
-        // Rolling section & one-shot event cursors -> O(1) lookup!
         size_t secCursor = 0;
         while (secCursor + 1 < frameSections.size() && frameSections[secCursor].endFrame <= warmStart) {
             ++secCursor;
@@ -930,7 +1118,6 @@ RemixOutput RemixEngine::renderRemix(
             if (blkStart < outFrames) {
                 const size_t audioBlkEnd = std::min(blkEnd, outFrames);
 
-                // Advance evCursor past expired one-shot events (max one-shot len <= 2.5s; keep earliest active)
                 while (evCursor < oneShotEvents.size() && oneShotEvents[evCursor].endFrame <= blkStart) {
                     ++evCursor;
                 }
@@ -948,7 +1135,7 @@ RemixOutput RemixEngine::renderRemix(
                 }
             }
 
-            // 2. Fused Vocal Split + Dynamic Vocal-Pocket Carving + Mastering + Zero-Latency Limiter!
+            // 2. Fused CenterVocalIsolator + Waveform Sidechain + Vocal-Pocket Carving + Mastering!
             for (size_t j = 0; j < blkLen; ++j) {
                 const size_t i = blkStart + j;
 
@@ -962,7 +1149,8 @@ RemixOutput RemixEngine::renderRemix(
                     const FrameSection* sec = frameSections.empty() ? nullptr : &frameSections[secCursor];
                     const SectionType sType = sec ? sec->type : SectionType::DROP_1;
                     const size_t secStart = sec ? sec->startFrame : 0;
-                    const size_t secLen = sec ? std::max<size_t>(1, sec->endFrame - sec->startFrame) : outFrames;
+                    const size_t secEnd = sec ? sec->endFrame : outFrames;
+                    const size_t secLen = std::max<size_t>(1, secEnd - secStart);
                     const float secProg = clampf(static_cast<float>(i - secStart) / static_cast<float>(secLen), 0.0f, 1.0f);
 
                     const double localFrames = (sType == SectionType::DROP_1 || sType == SectionType::DROP_2)
@@ -970,7 +1158,6 @@ RemixOutput RemixEngine::renderRemix(
                         : static_cast<double>(i >= downbeatFrame ? (i - downbeatFrame) : 0);
                     const double beatPos = localFrames * invBeatFrames;
                     const int beatIdx = static_cast<int>(beatPos);
-                    const float beatFrac = static_cast<float>(beatPos - static_cast<double>(beatIdx));
                     const int barIdx = beatIdx >> 2;
                     const int beatInBar = beatIdx & 3;
 
@@ -978,12 +1165,12 @@ RemixOutput RemixEngine::renderRemix(
                     float chopEnv = 1.0f;
 
                     if (sType == SectionType::FAKE_DROP) {
-                        if (secProg >= 0.78f) {
-                            chopEnv = clampf((0.83f - secProg) / 0.05f, 0.0f, 1.0f);
+                        if (secProg >= 0.72f) {
+                            chopEnv = clampf((0.78f - secProg) / 0.06f, 0.0f, 1.0f);
                         } else if (secProg >= 0.25f) {
                             const size_t sliceFrames = std::max<size_t>(
                                 512,
-                                static_cast<size_t>((secProg > 0.52f ? 0.25f : 0.50f) * beatFramesF)
+                                static_cast<size_t>((secProg > 0.50f ? 0.25f : 0.50f) * beatFramesF)
                             );
                             const size_t anchor = secStart + static_cast<size_t>(0.25f * secLen);
                             const size_t localIdx = (i >= anchor) ? (i - anchor) : 0;
@@ -996,8 +1183,9 @@ RemixOutput RemixEngine::renderRemix(
                             const float gate = (static_cast<float>(slicePos) / static_cast<float>(sliceFrames) < 0.80f) ? 1.0f : 0.14f;
                             chopEnv = edgeFade * gate;
                         }
-                    } else if ((sType == SectionType::DROP_1 || sType == SectionType::DROP_2) && stutterAmt > 0.22f && !isTechnoOrFrenchcore) {
-                        if ((barIdx & 3) == 3 && beatInBar == 3) {
+                    } else if ((sType == SectionType::DROP_1 || sType == SectionType::DROP_2) && stutterAmt > 0.30f && allowDropStutter) {
+                        // Clean rhythmic stutter ONLY on switch-boundary Beat 4 (never collides with mid-phrase kick-cut vocal!)
+                        if (((barIdx + 1) % switchBars == 0) && beatInBar == 3) {
                             const float div = (stutterAmt > 0.65f) ? 0.25f : 0.50f;
                             const size_t sliceLen = std::max<size_t>(512, static_cast<size_t>(div * beatFramesF));
                             const size_t anchor = (i / (sliceLen * 4)) * (sliceLen * 4);
@@ -1007,7 +1195,7 @@ RemixOutput RemixEngine::renderRemix(
                                 1.0f,
                                 std::min(static_cast<float>(posInSlice) / 120.0f, static_cast<float>(sliceLen - posInSlice) / 120.0f)
                             );
-                            chopEnv = (1.0f - stutterAmt * 0.65f) + (stutterAmt * 0.65f) * fade;
+                            chopEnv = (1.0f - stutterAmt * 0.55f) + (stutterAmt * 0.55f) * fade;
                         }
                     }
 
@@ -1021,22 +1209,43 @@ RemixOutput RemixEngine::renderRemix(
                     vocalSplitL.split(hiAllL, lmL, vhL);
                     vocalSplitR.split(hiAllR, lmR, vhR);
 
-                    // Mid/Side clean vocal clarity & de-mud
+                    const bool isDrop = (sType == SectionType::DROP_1 || sType == SectionType::DROP_2);
+                    const bool isPreDropBreath = (sType == SectionType::BUILDUP) && sec &&
+                        (sec->preDropBreathFrames > 0) && ((secEnd - i) <= sec->preDropBreathFrames);
+
+                    // Real-time CenterVocalIsolator in Drops (strips wide stereo instruments & original drums!)
+                    const float targetIsoWet = (isDrop || sType == SectionType::FAKE_DROP) ? 1.0f : 0.0f;
+                    isoWetSm = isoWetSm * dropSlew + targetIsoWet * (1.0f - dropSlew);
+
                     const float lmMid = midDeMud.process(0.5f * (lmL + lmR));
-                    const float lmSide = 0.5f * (lmL - lmR);
+                    const float lmSide = 0.5f * (lmL - lmR) * (1.0f - isoWetSm * (0.76f * isoAmt));
                     lmL = lmMid + lmSide;
                     lmR = lmMid - lmSide;
 
                     const float rawVhMid = 0.5f * (vhL + vhR);
+                    const float rawVhSide = 0.5f * (vhL - vhR);
+                    midVocEnv += isoEnvAlpha * (std::fabs(rawVhMid) - midVocEnv);
+                    sideVocEnv += isoEnvAlpha * (std::fabs(rawVhSide) - sideVocEnv);
+
                     const float vhMidSculpted = midAir.process(midUpperFocus.process(midPresence.process(rawVhMid)));
-                    const float vhSideSculpted = sideVocalDip.process(0.5f * (vhL - vhR));
+                    const float vhSideSculpted = sideVocalDip.process(rawVhSide);
 
-                    const bool isDrop = (sType == SectionType::DROP_1 || sType == SectionType::DROP_2);
+                    const float centerRatio = clampf((midVocEnv - 0.65f * sideVocEnv) / (midVocEnv + sideVocEnv + 1e-4f), 0.25f, 1.0f);
+                    const float dropCenterGate = (1.0f - 0.52f * isoAmt) + (0.52f * isoAmt) * centerRatio;
+                    const float effCenterGate = 1.0f + isoWetSm * (dropCenterGate - 1.0f);
+                    const float effSideScale = sideScale * (1.0f - isoWetSm * (0.70f * isoAmt));
+
                     const float levelLift = vocalLeveller.process(vhMidSculpted, isDrop ? epicVocalBoost : (epicVocalBoost * 0.35f));
-                    const float vhMidFinal = vhMidSculpted * levelLift;
+                    const float vhMidFinal = vhMidSculpted * levelLift * effCenterGate;
 
-                    vhL = vhMidFinal + vhSideSculpted * sideScale;
-                    vhR = vhMidFinal - vhSideSculpted * sideScale;
+                    vhL = vhMidFinal + vhSideSculpted * effSideScale;
+                    vhR = vhMidFinal - vhSideSculpted * effSideScale;
+
+                    // Real-time waveform-driven kick sidechain envelope (auto-opens on Beat-4 Kick-Cuts!)
+                    const float kickPeakAbs = std::max(std::fabs(blkKick[j * 2]), std::fabs(blkKick[j * 2 + 1]));
+                    const float kCoeff = (kickPeakAbs > kickEnvSm) ? kAtkCoeff : kRelCoeff;
+                    kickEnvSm = kickEnvSm * kCoeff + kickPeakAbs * (1.0f - kCoeff);
+                    const float kickPulse = clampf((kickEnvSm - 0.12f) * 1.55f, 0.0f, 1.0f);
 
                     float targetLow = 0.82f;
                     float targetMid = 0.96f;
@@ -1044,39 +1253,44 @@ RemixOutput RemixEngine::renderRemix(
                     float targetBuildWet = 0.0f;
 
                     if (sType == SectionType::INTRO || sType == SectionType::VOCAL_BREAK || sType == SectionType::MID_BREAK) {
-                        const float g = 0.78f + 0.22f * origMixGain;
-                        targetLow = 0.76f * g;
-                        targetMid = 0.96f * g;
-                        targetVoc = (1.02f + 0.12f * vocalClarity) * g;
+                        const float g = 0.84f + 0.22f * origMixGain;
+                        targetLow = 0.78f * g;
+                        targetMid = 0.98f * g;
+                        targetVoc = (1.06f + 0.14f * vocalClarity) * g;
                     } else if (sType == SectionType::BUILDUP) {
-                        targetBuildWet = 1.0f;
-                        const float g = 0.76f + 0.24f * origMixGain;
-                        targetLow = (1.0f - secProg) * 0.38f * g;
-                        targetMid = 0.92f * g;
-                        targetVoc = (1.06f + 0.16f * epicVocalBoost) * g;
+                        const float g = 0.82f + 0.24f * origMixGain;
+                        if (isPreDropBreath) {
+                            // Pre-Drop Vocal Solo Breath: disengage HPF & pop vocal upfront right before Beat 1!
+                            targetBuildWet = 0.0f;
+                            targetLow = 0.0f;
+                            targetMid = 0.72f * g;
+                            targetVoc = (1.28f + 0.20f * epicVocalBoost) * g;
+                        } else {
+                            targetBuildWet = 1.0f;
+                            targetLow = (1.0f - secProg) * 0.34f * g;
+                            targetMid = 0.90f * g;
+                            targetVoc = (1.06f + 0.16f * epicVocalBoost) * g;
+                        }
                     } else if (sType == SectionType::FAKE_DROP) {
                         targetLow = 0.0f;
-                        targetMid = 0.84f * (0.60f + 0.40f * origMixGain);
-                        targetVoc = 1.14f * (0.60f + 0.40f * origMixGain);
+                        targetMid = 0.62f * (0.60f + 0.40f * origMixGain);
+                        targetVoc = 1.18f * (0.60f + 0.40f * origMixGain);
                     } else {
                         targetLow = 0.0f;
-                        const float dLin = clampf((beatFrac - 0.04f) * (1.0f / 0.48f), 0.0f, 1.0f);
-                        const float duckShape = (beatFrac < 0.04f)
-                            ? (beatFrac * 25.0f)
-                            : (1.0f - (0.60f * std::sqrt(dLin) + 0.40f * dLin));
-                        const float lowMidDuck = 1.0f - 0.76f * duckShape;
-                        const float vocalDuck = 1.0f - vocalScDepth * duckShape;
+                        const float lowMidDuck = 1.0f - (0.76f + 0.12f * isoAmt) * kickPulse;
+                        const float vocalDuck = 1.0f - vocalScDepth * kickPulse;
+                        const float antiMudFloor = 0.72f - 0.44f * isoAmt; // -8.5 dB cleaner low-mid mud at default iso=0.78!
 
                         const float dropOrigBase = 0.58f + 0.74f * origMixGain;
-                        targetMid = dropOrigBase * 0.74f * lowMidDuck;
-                        targetVoc = dropOrigBase * (1.18f + 0.50f * vocalClarity + 0.24f * epicVocalBoost) * vocalDuck;
+                        targetMid = dropOrigBase * antiMudFloor * lowMidDuck;
+                        targetVoc = dropOrigBase * (1.20f + 0.50f * vocalClarity + 0.24f * epicVocalBoost) * vocalDuck;
                     }
 
-                    const float slew = isDrop ? dropSlew : envSlew;
+                    const float slew = (isDrop || isPreDropBreath) ? dropSlew : envSlew;
                     lowGainSm = lowGainSm * envSlew + targetLow * (1.0f - envSlew);
                     midGainSm = midGainSm * slew + targetMid * (1.0f - slew);
                     vocGainSm = vocGainSm * slew + targetVoc * (1.0f - slew);
-                    buildWetSm = buildWetSm * envSlew + targetBuildWet * (1.0f - envSlew);
+                    buildWetSm = buildWetSm * slew + targetBuildWet * (1.0f - slew);
 
                     float vL = (loL * lowGainSm + lmL * midGainSm + vhL * vocGainSm) * chopEnv;
                     float vR = (loR * lowGainSm + lmR * midGainSm + vhR * vocGainSm) * chopEnv;
@@ -1093,11 +1307,11 @@ RemixOutput RemixEngine::renderRemix(
                         vR = vR * (1.0f - buildWetSm) + filtR * buildWetSm;
                     }
 
-                    // Dynamic Kick Vocal-Pocket Carving (-5.8 dB at 1.85 kHz ONLY when vocals sing!)
+                    // Dynamic Kick Vocal-Pocket Carving (-6.0 dB at 1.85 kHz ONLY when vocals sing!)
                     if ((i & 63u) == 0u && epicVocalBoost > 0.05f) {
                         const float vEnv = vocalLeveller.currentEnvelope();
                         const float activeFrac = clampf((vEnv - 0.022f) * (1.0f / 0.21f), 0.0f, 1.0f);
-                        const float carveDb = -5.8f * epicVocalBoost * activeFrac;
+                        const float carveDb = -6.0f * epicVocalBoost * activeFrac;
                         if (std::fabs(carveDb - lastCarveDb) > 0.12f) {
                             lastCarveDb = carveDb;
                             kickVocCarveL.configure(BiquadType::PEAK, 1850.0f, 1.05f, carveDb);

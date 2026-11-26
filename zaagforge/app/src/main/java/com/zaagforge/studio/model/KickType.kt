@@ -52,8 +52,8 @@ enum class KickType(
     FRENCHCORE_MELODIC(
         nativeId = 6,
         code = "FRNC",
-        displayName = "Frenchcore Sefa",
-        subtitle = "Sefa / Peacock Pitched Punch",
+        displayName = "Peacock Frenchcore",
+        subtitle = "Dr. Peacock / Sefa 2-Stage Woody Punch + Tail",
         accentHex = 0xFF1ED760
     ),
     SCHRANZ_INDUSTRIAL(
@@ -90,6 +90,27 @@ enum class KickType(
         displayName = "Acid 303 Kick",
         subtitle = "999999999 / Alignment 303 Pocket",
         accentHex = 0xFF76FF03
+    ),
+    HARDTEK_BOUNCE(
+        nativeId = 12,
+        code = "HTEK",
+        displayName = "Hardtek Darktek",
+        subtitle = "Darktek / Maissouille Tribecore + Bounce Bass",
+        accentHex = 0xFFD500F9
+    ),
+    REBELION_PVC_ZAAG(
+        nativeId = 13,
+        code = "PVCZ",
+        displayName = "Rebelion PVC",
+        subtitle = "Rebelion Overdose Hollow PVC -> Scooped Zaag",
+        accentHex = 0xFFFFD600
+    ),
+    COSY_UPTEMPO(
+        nativeId = 14,
+        code = "COSY",
+        displayName = "Cosy Nightmare",
+        subtitle = "Cosy Nightmare Glassy Tok + Melodic Sub",
+        accentHex = 0xFFFF4081
     );
 
     companion object {

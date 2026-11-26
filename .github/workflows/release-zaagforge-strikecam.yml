@@ -161,17 +161,19 @@ jobs:
           ## 2 Nouvelles Applications Android Natives Prêtes à Installer — ${TAG} (ARM64 / Android 10+)
 
           ### 1. ZAAGFORGE ${VER} (\`ZaagForge-${VER}-arm64.apk\`)
-          **Studio Automatique de Remix Ultra-Turbo — Techno Normale / Hard Techno / Vrai Frenchcore / Vrai Gabber / Rawstyle / Uptempo / Piep / Krach / Zaag — Moteur Multi-Cœurs C++20 v3.5**
-          - **Rendu ×15 à ×60 Plus Rapide sur les Morceaux Longs (2m30 – 8m00)** :
-            - **Correction du bug critique \`O(N²)\` de réallocation au décodage MP3** (\`> 60 s\`) : pré-allocation native unique exacte dès l'ouverture (\`KEY_DURATION\`) + boucle \`MediaCodec\` 100 % non-bloquante (\`timeout 0 ms\`) -> un MP3 de 4 minutes se décode désormais en une fraction de seconde au lieu de 30–90 s !
-            - **Moteur Fused Multi-Cœurs (jusqu'à 6 cœurs ARM64)** en blocs L2-cache de \`16 K\` frames avec pré-chauffe \`93 ms\`, compensation exacte \`0,00 ms\` de latence du limiter Lookahead \`O(1)\`, biquads \`float32 FMA\`, \`fastTanh\` Padé, crossovers \`Linkwitz-Riley 2\` transparents, analyse BPM/refrains parallélisée et **50 % de RAM crête en moins**.
-          - **Écran de Chargement Blindé + Barre de Progression Live \`0–100 %\` + Bouton \`ANNULER\`** :
-            - **Fini les clics à travers l'écran de chargement** : superposition plein écran au-dessus de la barre de navigation qui absorbe 100 % des touches, sérialisation single-flight des tâches (zéro empilement de rendus sur le mutex C++), pourcentage réel en direct et annulation coopérative instantanée (\`< 15 ms\`).
-          - **Vitesse Jamais Ralentie (\`speedRatio >= 1.00×\`) & Paroles Ultra-Claires dans les Drops Épiques** :
-            - 3 modes vitesse (\`JAMAIS RALENTI ≥1×\`, \`VITESSE 100% ORIG.\`, \`FORCER BPM CIBLE\`), \`VocalAutoLeveller\` + **Dynamic Kick Vocal-Pocket Carving** (\`-5,8 dB\` dynamiques à \`1,85 kHz\` sur le kick uniquement quand la voix chante, sub \`< 150 Hz\` intact) + curseur **\`BOOST PAROLES ÉPIQUES\`**.
-          - **6 Vrais Thèmes Artistes, 12 Presets Studio, 12 Kicks C++20 & Sauvegarde de Presets Perso** :
-            - **Techno Normale** (*Charlotte de Witte / Amelie Lens / 999999999*), **Hard Techno** (*Sara Landry / Nico Moreno / Klangkuenstler*), **Vrai Frenchcore** (*Sefa / Dr. Peacock* avec kicks mélodiques 4 mesures & nappes supersaw), **Vrai Gabber 909** (*Angerfist / Neophyte* + Hoover stabs), **Xtra Rawstyle** (*Dual Damage*) et **Uptempo / Piep / Krach / Zaag** (*UOK / Noiseflow / Dimitri K / GPF*).
-          - **Tests** : \`334/334\` assertions C++20 (dont continuité zéro-clic inter-threads & annulation) + \`8/8\` tests JVM.
+          **Studio Automatique de Remix Mainstage Pro — Hardtek Darktek/Maissouille / Dr. Peacock Frenchcore / Rebelion Overdose / Cosy Nightmare / UOK Piep / Hard Techno / Techno Normale / Gabber 909 — Moteur Multi-Cœurs C++20 v4.0**
+          - **Zéro « Brouillon » — Qualité Mainstage Festival Automatisée** :
+            - **\`CenterVocalIsolator\` Anti-Brouillon en Drop** (nouveau curseur \`ISOLATION VOIX EN DROP\`) : isole la voix centrale, atténue jusqu'à \`-10 dB\` d'instruments stéréo latéraux et \`-8,5 dB\` de bas-médiums (\`bassCut..680 Hz\`) pendant les drops (fini la double-batterie et la bouillie sonore !), tout en laissant l'Intro et les Breaks en stéréo pleine largeur.
+            - **Suivi d'Accords Mesure par Mesure (\`barRootOffsets\`) & 7 Kicks Diatoniques en Cache** : analyse FFT harmonique de la ligne de basse de votre MP3 pour que les kicks **Dr. Peacock / Sefa**, **Darktek / Maissouille** et **Cosy Nightmare** ainsi que les stabs rave Hardtek suivent exactement les vrais accords du morceau (zéro fausse note).
+            - **Vraie Dynamique Festival (Tension & Respiration)** : **Pre-Drop Vocal Solo Breath** (coupure nette du build-up 1 à 1,5 temps avant le Drop 1 + \`ReverseCrash\` + voix sèche au 1er plan), **Beat-4 Kick-Cuts** avec réouverture instantanée du sidechain temps réel calé sur l'enveloppe réelle du kick, et transitions \`ReverseCrash\` + \`SubImpact\` sur chaque Kick-Switch.
+          - **7 Vrais Thèmes Artistes, 16 Presets Têtes d'Affiche, 15 Kicks C++20 & Customisation Totale** :
+            - **Hardtek / Tribecore** (*Darktek Bounce 196*, *Maissouille 200* — nouveau kick \`HARDTEK_BOUNCE\` Tribecore + basse élastique offbeat & stabs orgue/rave suivis par accords).
+            - **Vrai Frenchcore** (*Dr. Peacock / Sefa 200* — kick 2-stage boisé + tail harmonique offbeat + nappes supersaw consonantes).
+            - **Overdose Rawstyle** (*Rebelion Overdose 162*, *Dual Damage Raw* — nouveau kick \`REBELION_PVC_ZAAG\` PVC klaplong -> Zaag métallique sculpté).
+            - **Uptempo Mainstage** (*Cosy Nightmare 202* nouveau kick \`COSY_UPTEMPO\`, *UOK Piep Madness 212* chirp chirurgical sans souffle, *Noiseflow Krach*, *Pure Zaag*, *Dimitri K Bounce*, *GPF Terror*).
+            - **Vrai Gabber 909** (*Angerfist*), **Hard Techno** (*Sara Landry*, *Klangkuenstler*) et **Techno Normale** (*Charlotte de Witte*, *999999999 Acid 303*).
+          - **Moteur Multi-Cœurs Ultra-Turbo (< 2 s sur 4 min) & Vitesse Jamais Ralentie (\`>= 1.00×\`)** : décodage \`MediaCodec\` non-bloquant, rendu fusionné 6 cœurs L2-cache-hot, overlay anti-clic-à-travers + barre live \`0–100 %\` + bouton \`ANNULER\` instantané.
+          - **Tests** : \`361/361\` assertions C++20 (15 kicks, suivi d'accords, \`CenterVocalIsolator\`, 8 genres, continuité inter-threads & annulation) + \`8/8\` tests JVM.
           - **SHA-256** : \`$SHA_Z\`
 
           ### 2. StrikeCam Arcade ${VER} (\`StrikeCam-Arcade-${VER}-arm64.apk\`)
@@ -186,5 +188,5 @@ jobs:
             "$APK_Z" \
             "$APK_S" \
             --repo "${{ github.repository }}" \
-            --title "${TAG} — ZAAGFORGE ${VER} Ultra-Turbo Pro & StrikeCam Arcade ${VER}" \
+            --title "${TAG} — ZAAGFORGE ${VER} Mainstage Banger Pro & StrikeCam Arcade ${VER}" \
             --notes-file /tmp/release-notes.md

@@ -423,18 +423,21 @@ struct BarStructureAnalysis {
     std::vector<float> barRms;
     std::vector<float> barVocal;
     std::vector<float> barNovelty;
+    std::vector<int> barRootOffsets;
 };
 
 /**
  * Computes bar-by-bar RMS, center vocal-band energy (300..3400 Hz Mid minus Side),
- * and 4-bar phrase novelty in parallel across CPU cores!
+ * per-bar diatonic bass/chord root tracking, and 4-bar phrase novelty in parallel!
  */
 BarStructureAnalysis analyzeMusicalStructure(
     const float* stereoPcm,
     size_t totalFrames,
     float sr,
     float bpm,
-    float downbeatSec
+    float downbeatSec,
+    int keyIndex,
+    bool isMinor
 ) {
     BarStructureAnalysis st;
     const float durationSec = static_cast<float>(totalFrames) / sr;
@@ -444,14 +447,26 @@ BarStructureAnalysis analyzeMusicalStructure(
     st.barRms.assign(st.totalBars, 0.0f);
     st.barVocal.assign(st.totalBars, 0.0f);
     st.barNovelty.assign(st.totalBars, 0.0f);
+    st.barRootOffsets.assign(st.totalBars, 0);
+
+    // Diatonic chord-root candidates in [-5..+7] semitones around song tonic!
+    static constexpr std::array<int, 7> kMinorRoots = {-5, -4, -2, 0, 3, 5, 7}; // v, VI, VII, i, III, iv, v
+    static constexpr std::array<int, 7> kMajorRoots = {-5, -3, -1, 0, 2, 4, 5}; // V, vi, vii, I, ii, iii, IV
+    const auto& allowedRoots = isMinor ? kMinorRoots : kMajorRoots;
 
     constexpr size_t kStride = 4;
-    const float effSr = sr / static_cast<float>(kStride); // Exact 11,025 Hz filter tuning!
+    const float effSr = sr / static_cast<float>(kStride);
+    constexpr size_t kRootFft = 2048; // at stride 2 (22.05 kHz) -> 10.76 Hz bin resolution!
+    const auto rootHann = makeHannWindow(kRootFft);
+    const float rootBinHz = (sr * 0.5f) / static_cast<float>(kRootFft);
+    const size_t rMinBin = std::max<size_t>(2, static_cast<size_t>(48.0f / rootBinHz));
+    const size_t rMaxBin = std::min<size_t>(kRootFft / 2 - 1, static_cast<size_t>(460.0f / rootBinHz));
 
     auto scanBars = [&](int bStart, int bEnd) {
         Biquad vocalHpf, vocalLpf;
         vocalHpf.configure(BiquadType::HPF, 300.0f, 0.707f, 0.0f, effSr);
         vocalLpf.configure(BiquadType::LPF, 3400.0f, 0.707f, 0.0f, effSr);
+        std::vector<std::complex<float>> rFft(kRootFft);
 
         for (int b = bStart; b < bEnd; ++b) {
             const size_t s0 = static_cast<size_t>(std::max(0.0f, (downbeatSec + b * barSec) * sr));
@@ -476,6 +491,46 @@ BarStructureAnalysis analyzeMusicalStructure(
             if (count > 0) {
                 st.barRms[b] = static_cast<float>(std::sqrt(eAll / static_cast<double>(count)));
                 st.barVocal[b] = static_cast<float>(std::sqrt(eVoc / static_cast<double>(count)));
+            }
+
+            // Fast diatonic bass/chord root detection for bar b (window at 30% into bar, after beat-1 kick transient)
+            const size_t barLen = s1 - s0;
+            const size_t wStart = s0 + (barLen / 4);
+            if (wStart + kRootFft * 2 <= totalFrames) {
+                for (size_t k = 0; k < kRootFft; ++k) {
+                    const size_t idx = (wStart + k * 2) * 2;
+                    const float m = 0.5f * (stereoPcm[idx] + stereoPcm[idx + 1]);
+                    rFft[k] = std::complex<float>(m * rootHann[k], 0.0f);
+                }
+                fftInPlace(rFft, false);
+
+                std::array<float, 12> pcEnergy{};
+                pcEnergy.fill(0.0f);
+                for (size_t k = rMinBin; k <= rMaxBin; ++k) {
+                    const float mag2 = std::norm(rFft[k]);
+                    if (mag2 < 1e-8f) continue;
+                    const float freq = static_cast<float>(k) * rootBinHz;
+                    const float midi = hzToMidi(freq);
+                    const int nearest = static_cast<int>(std::round(midi));
+                    const int pc = ((nearest % 12) + 12) % 12;
+                    const float bassWt = (freq < 210.0f) ? 1.85f : 1.0f;
+                    pcEnergy[pc] += mag2 * bassWt;
+                }
+
+                // Pick strongest diatonic chord root (tonic + fifth support weighted)
+                int bestOff = 0;
+                float bestRootSc = -1.0f;
+                for (int off : allowedRoots) {
+                    const int rootPc = ((keyIndex + off) % 12 + 12) % 12;
+                    const int fifthPc = (rootPc + 7) % 12;
+                    const float tonicBias = (off == 0) ? 1.18f : 1.0f;
+                    const float sc = (pcEnergy[rootPc] + 0.35f * pcEnergy[fifthPc]) * tonicBias;
+                    if (sc > bestRootSc) {
+                        bestRootSc = sc;
+                        bestOff = off;
+                    }
+                }
+                st.barRootOffsets[b] = bestOff;
             }
         }
     };
@@ -759,8 +814,8 @@ AnalysisResult MusicAnalyzer::analyze(
     res.rootHz = keyEst.rootHz;
     res.keyName = keyEst.keyName;
 
-    // 3. Structural Chorus / Vocal-Hook Detection
-    const auto st = analyzeMusicalStructure(stereoPcm, totalFrames, sr, res.bpm, res.downbeatSec);
+    // 3. Structural Chorus / Vocal-Hook + Per-Bar Chord Root Detection
+    const auto st = analyzeMusicalStructure(stereoPcm, totalFrames, sr, res.bpm, res.downbeatSec, res.keyIndex, res.isMinor);
     res.totalBars = st.totalBars;
     res.chorus1Bar = st.chorus1Bar;
     res.chorus2Bar = st.chorus2Bar;
@@ -770,6 +825,7 @@ AnalysisResult MusicAnalyzer::analyze(
     res.barRms = st.barRms;
     res.barVocalEnergy = st.barVocal;
     res.barNovelty = st.barNovelty;
+    res.barRootOffsets = st.barRootOffsets;
 
     // 4. Bar-Quantized Arrangement Sections aligned to real Chorus 1 & 2!
     ArrangementOptions defOpts;

@@ -16,12 +16,13 @@ enum class TempoSyncMode : int {
 };
 
 enum class RemixGenreTheme : int {
-    UPTEMPO_ZAAG = 0, // Unicorn On Ketamine / Noiseflow / Dimitri K / Krowdexx
-    TECHNO_CLUB = 1,  // Charlotte de Witte / Amelie Lens / Adam Beyer (True Normal Techno)
-    HARD_TECHNO = 2,  // Sara Landry / Nico Moreno / I Hate Models / 999999999 / Klangkuenstler
-    FRENCHCORE = 3,   // Sefa / Dr. Peacock / Billx (True Euphoric Frenchcore)
-    GABBER = 4,       // Angerfist / Neophyte / Tha Playah (True 909 Millennium Gabber)
-    RAWSTYLE = 5      // Dual Damage / Warface / Kruelty
+    UPTEMPO_ZAAG = 0,     // Unicorn On Ketamine / Cosy Nightmare / Noiseflow / Dimitri K
+    TECHNO_CLUB = 1,      // Charlotte de Witte / Amelie Lens / Adam Beyer (True Normal Techno)
+    HARD_TECHNO = 2,      // Sara Landry / Nico Moreno / I Hate Models / 999999999 / Klangkuenstler
+    FRENCHCORE = 3,       // Dr. Peacock / Sefa (True Euphoric Melodic Frenchcore)
+    GABBER = 4,           // Angerfist / Neophyte / Tha Playah (True 909 Millennium Gabber)
+    RAWSTYLE = 5,         // Rebelion Overdose / Dual Damage / Warface / Kruelty
+    HARDTEK_TRIBECORE = 6 // Darktek / Maissouille / Billx (True Hardtek / Tribecore Bounce!)
 };
 
 struct RemixConfig {
@@ -36,6 +37,7 @@ struct RemixConfig {
     float originalMix = 0.86f;          // 0..1 original track vocal/melody level in drops
     float vocalClarity = 0.84f;         // 0..1 Mid/Side vocal focus & de-mud presence boost
     float epicVocalBoost = 0.84f;       // 0..1 dynamic vocal auto-leveller + kick vocal-pocket carving!
+    float vocalIsolation = 0.78f;       // 0..1 real-time CenterVocalIsolator & anti-mud drop stem cleaning!
     float vocalSidechain = 0.24f;       // 0..1 gentle sidechain ducking on vocal band (> 680 Hz)
     float kickLevel = 0.80f;            // 0.35..1.25 kick bus level relative to song
     float bassCutHz = 195.0f;           // 110..340 Hz surgical LR4 crossover for original track

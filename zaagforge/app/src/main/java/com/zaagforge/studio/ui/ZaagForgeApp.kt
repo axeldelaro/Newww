@@ -407,7 +407,7 @@ private fun StudioScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "ZAAGFORGE // v3.5 TURBO",
+                    text = "ZAAGFORGE // v4 MAINSTAGE",
                     style = MaterialTheme.typography.headlineMedium,
                     color = CrispWhite
                 )
@@ -596,7 +596,7 @@ private fun StudioScreen(
                     Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(5.dp))
                     Text(
-                        text = if (state.hasPendingChanges) "RE-CALCULER ●" else "AUTO REMIX TURBO",
+                        text = if (state.hasPendingChanges) "RE-CALCULER ●" else "AUTO REMIX PRO",
                         style = MaterialTheme.typography.labelLarge
                     )
                 }
@@ -612,14 +612,14 @@ private fun StudioScreen(
             }
         }
 
-        // RACK 1: THÈMES & 12 PRESETS PRO ARTISTES + MES PRESETS PERSO
+        // RACK 1: THÈMES & 16 PRESETS PRO ARTISTES + MES PRESETS PERSO
         RackCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("THÈMES & PRESETS PRO (12)", style = MaterialTheme.typography.labelLarge, color = themeAccent)
+                Text("THÈMES & PRESETS PRO (${StudioPresets.all.size})", style = MaterialTheme.typography.labelLarge, color = themeAccent)
                 Surface(
                     shape = RoundedCornerShape(6.dp),
                     color = themeDimBg,
@@ -802,7 +802,7 @@ private fun StudioScreen(
                     Column {
                         Text("VITESSE, PAROLES ÉPIQUES & MIX", style = MaterialTheme.typography.labelLarge, color = CrispWhite)
                         Text(
-                            text = "${p.tempoSyncMode.label} · Voix Épiques ${(p.epicVocalBoost * 100).roundToInt()}% · Sub ${(p.bassSaturation * 100).roundToInt()}%",
+                            text = "${p.tempoSyncMode.label} · Iso ${(p.vocalIsolation * 100).roundToInt()}% · Voix ${(p.epicVocalBoost * 100).roundToInt()}%",
                             style = MaterialTheme.typography.labelSmall,
                             color = MeterGreen,
                             maxLines = 1,
@@ -890,6 +890,14 @@ private fun StudioScreen(
                 Spacer(Modifier.height(10.dp))
 
                 StudioSlider(
+                    label = "ISOLATION VOIX EN DROP (ANTI-BROUILLON)",
+                    valueText = "${(p.vocalIsolation * 100).roundToInt()}%",
+                    value = p.vocalIsolation,
+                    range = 0f..1f,
+                    accent = MeterGreen,
+                    onChange = { v -> onUpdateParams { it.copy(vocalIsolation = v) } }
+                )
+                StudioSlider(
                     label = "BOOST PAROLES ÉPIQUES (DROP / BASSE)",
                     valueText = "${(p.epicVocalBoost * 100).roundToInt()}%",
                     value = p.epicVocalBoost,
@@ -930,7 +938,7 @@ private fun StudioScreen(
                     onChange = { v -> onUpdateParams { it.copy(kickLevel = v) } }
                 )
                 StudioSlider(
-                    label = "COUCHES SYNTHÉ (303 / EUPHORIC / HOOVER)",
+                    label = "COUCHES SYNTHÉ (HARDTEK STAB / 303 / EUPHORIC)",
                     valueText = "${(p.synthLayerAmount * 100).roundToInt()}%",
                     value = p.synthLayerAmount,
                     range = 0f..1f,
@@ -968,7 +976,7 @@ private fun StudioScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = MeterGreen, contentColor = RackObsidian),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("APPLIQUER LE MIX TURBO C++", style = MaterialTheme.typography.labelLarge)
+                    Text("APPLIQUER LE MIX MAINSTAGE C++", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -1152,19 +1160,19 @@ private fun StudioScreen(
             }
         }
 
-        // RACK 4: 12-Pad Live Kick Audition Rack (3 rows x 4 pads)
+        // RACK 4: 15-Pad Live Kick Audition Rack (5 rows x 3 pads)
         RackCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("RACK D'ÉCOUTE 12 KICKS (DIRECT)", style = MaterialTheme.typography.labelLarge, color = PeakAmber)
+                Text("RACK D'ÉCOUTE ${KickType.entries.size} KICKS (DIRECT)", style = MaterialTheme.typography.labelLarge, color = PeakAmber)
                 Text("TAP POUR TESTER", style = MaterialTheme.typography.labelSmall, color = SteelGray)
             }
             Spacer(Modifier.height(8.dp))
 
-            KickType.entries.chunked(4).forEach { row ->
+            KickType.entries.chunked(3).forEach { row ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1193,7 +1201,7 @@ private fun StudioScreen(
                                 )
                                 Spacer(Modifier.height(2.dp))
                                 Text(
-                                    text = kick.displayName.substringBefore(' '),
+                                    text = kick.displayName,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = CrispWhite,
                                     maxLines = 1,
@@ -1270,13 +1278,13 @@ private fun StudioScreen(
                 )
 
                 KickSelectorRow(
-                    title = "DROP 1 KICK (12 SIGNATURES)",
+                    title = "DROP 1 KICK (${KickType.entries.size} SIGNATURES)",
                     selected = p.drop1Kick,
                     onSelect = { k -> onUpdateParams { it.copy(drop1Kick = k) } }
                 )
                 Spacer(Modifier.height(6.dp))
                 KickSelectorRow(
-                    title = "DROP 2 KICK-SWITCH (12 SIGNATURES)",
+                    title = "DROP 2 KICK-SWITCH (${KickType.entries.size} SIGNATURES)",
                     selected = p.drop2Kick,
                     onSelect = { k -> onUpdateParams { it.copy(drop2Kick = k) } }
                 )
@@ -1321,7 +1329,7 @@ private fun StudioScreen(
                 ToggleRow("SCREECHES & LASERS INDUSTRIELS", p.enableScreeches, themeAccent) { on ->
                     onUpdateParams { it.copy(enableScreeches = on) }
                 }
-                ToggleRow("MÉLODIE KICK EN CLÉ (FRENCHCORE / RAW)", p.enablePitchKickMelody, themeAccent) { on ->
+                ToggleRow("KICKS SUIVIS PAR ACCORDS (PEACOCK / DARKTEK / COSY)", p.enablePitchKickMelody, themeAccent) { on ->
                     onUpdateParams { it.copy(enablePitchKickMelody = on) }
                 }
                 ToggleRow("TRIPLET KICK ROLLS", p.enableTripletRolls, themeAccent) { on ->
