@@ -125,13 +125,14 @@ public sealed class ShortcutAndEmptyFolderScanner
         if (ct.IsCancellationRequested) return false;
         if (!SafetyGuard.CanTraverseDirectory(dirPath)) return false;
 
+        string dirName = Path.GetFileName(dirPath);
         string normLower = SafetyGuard.NormalizeForComparison(dirPath).ToLowerInvariant();
         string driveRel = (normLower.Length >= 2 && normLower[1] == ':') ? normLower[2..] : normLower;
         if (driveRel.StartsWith(@"\windows", StringComparison.Ordinal)
             || driveRel.StartsWith(@"\program files", StringComparison.Ordinal)
             || driveRel.StartsWith(@"\programdata", StringComparison.Ordinal)
-            || normLower.Contains(@"\appdata\")
-            || Path.GetFileName(dirPath).Equals(".git", StringComparison.OrdinalIgnoreCase))
+            || (!isRoot && dirName.Equals("AppData", StringComparison.OrdinalIgnoreCase))
+            || dirName.Equals(".git", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }

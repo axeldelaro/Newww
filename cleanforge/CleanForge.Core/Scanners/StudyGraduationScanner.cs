@@ -69,17 +69,19 @@ public sealed class StudyGraduationScanner
                 string dir = stack.Pop();
                 if (!SafetyGuard.CanTraverseDirectory(dir)) continue;
 
+                string dirName = Path.GetFileName(dir);
+                bool isScanRoot = string.Equals(dir, root, StringComparison.OrdinalIgnoreCase);
+
                 string normLower = SafetyGuard.NormalizeForComparison(dir).ToLowerInvariant();
                 string driveRel = (normLower.Length >= 2 && normLower[1] == ':') ? normLower[2..] : normLower;
                 if (driveRel.StartsWith(@"\windows", StringComparison.Ordinal)
                     || driveRel.StartsWith(@"\program files", StringComparison.Ordinal)
                     || driveRel.StartsWith(@"\programdata", StringComparison.Ordinal)
-                    || normLower.Contains(@"\appdata\"))
+                    || (!isScanRoot && dirName.Equals("AppData", StringComparison.OrdinalIgnoreCase)))
                 {
                     continue;
                 }
 
-                string dirName = Path.GetFileName(dir);
                 if (dirName.Equals(".git", StringComparison.OrdinalIgnoreCase))
                     continue; // Never traverse or touch Git history!
 
